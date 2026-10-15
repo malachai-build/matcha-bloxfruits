@@ -341,6 +341,20 @@ function buildBerryEspLabels(force)
 end
 
 TWEEN_STEP_TIME=FRAME_TIME -- one CFrame write per frame (was 0.01 before the stability pass); safe mode doubles it
+-- Server movement limit (measured live Oct 15 2026, Upper Skylands): a
+-- 2,600-3,400 stud flight at 320 studs/s was refused after ~1.5 s (the server
+-- kept the character far behind, snapped the root back to it every few frames
+-- and rejected every hit meanwhile); the same flight at 250 was accepted,
+-- and short hops (<= ~150 studs) at 320 always were. So a flight longer than
+-- TWEEN_BURST_DIST runs at most TWEEN_SERVER_CAP studs/s, and a server
+-- snap-back (root found more than TWEEN_SNAP_DIST off the last written point)
+-- re-bases the flight from where the server put the root and lowers the cap
+-- (x TWEEN_SNAP_SLOWDOWN, not below TWEEN_SERVER_FLOOR) for the session.
+TWEEN_BURST_DIST=300
+TWEEN_SERVER_CAP=250
+TWEEN_SERVER_FLOOR=150
+TWEEN_SNAP_DIST=60
+TWEEN_SNAP_SLOWDOWN=0.85
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
 -- target was reached, false when stopped (checkFn false, part gone, unload,
@@ -409,6 +423,7 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     end
     local moveSpeed=tonumber(speed) or 320
     if moveSpeed<=0 then moveSpeed=320 end
+    if isLocalRoot and distance>TWEEN_BURST_DIST then moveSpeed=math.min(moveSpeed,TWEEN_SERVER_CAP) end
     local token=isLocalRoot and claimRoot() or nil
     local function finish(result)
         if token then releaseRoot(token) end
@@ -424,6 +439,8 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local baseX,baseY,baseZ=startPos.X,startPos.Y,startPos.Z
     local duration=distance/moveSpeed
     local baseTime=clock()
+    -- Last point written (snap-back check); nil right after a (re)base.
+    local wroteX,wroteY,wroteZ=nil,nil,nil
     local function rebase()
         local part=currentPart()
         local okPos,pos=pcall(function() return part and part.Position end)
@@ -431,6 +448,16 @@ function tweenTo(hrp, targetPos, speed, checkFn)
         dx=targetPos.X-baseX; dy=targetPos.Y-baseY; dz=targetPos.Z-baseZ
         duration=math.max(math.sqrt(dx*dx+dy*dy+dz*dz)/moveSpeed,FRAME_TIME)
         baseTime=clock()
+        wroteX=nil
+    end
+    -- True when the root is far off the point this flight last wrote: the
+    -- server refused the movement and put the root back (see TWEEN_SERVER_CAP).
+    local function snappedBack(part)
+        if not isLocalRoot or wroteX==nil then return false end
+        local okPos,pos=pcall(function() return part.Position end)
+        if not okPos or not pos or not pos.X then return false end
+        local ex,ey,ez=pos.X-wroteX,pos.Y-wroteY,pos.Z-wroteZ
+        return ex*ex+ey*ey+ez*ez>TWEEN_SNAP_DIST*TWEEN_SNAP_DIST
     end
     local lastWrite=-1e9
     while keepGoing() do
@@ -454,8 +481,19 @@ function tweenTo(hrp, targetPos, speed, checkFn)
         else
             local part=currentPart()
             if not part then return finish(false) end
+            if snappedBack(part) then
+                -- Follow the server instead of writing on along the old line
+                -- (it refuses every write that far ahead): slow down and
+                -- re-base from where it put the root.
+                moveSpeed=math.max(TWEEN_SERVER_FLOOR,moveSpeed*TWEEN_SNAP_SLOWDOWN)
+                TWEEN_SERVER_CAP=math.max(TWEEN_SERVER_FLOOR,math.min(TWEEN_SERVER_CAP,moveSpeed))
+                rebase()
+                now=clock()
+            end
             local alpha=math.min((now-baseTime)/duration,1)
-            if placeRoot(part,baseX+dx*alpha,baseY+dy*alpha,baseZ+dz*alpha,rotationCF) then
+            local wx,wy,wz=baseX+dx*alpha,baseY+dy*alpha,baseZ+dz*alpha
+            if placeRoot(part,wx,wy,wz,rotationCF) then
+                wroteX,wroteY,wroteZ=wx,wy,wz
                 lastWrite=now
                 if alpha>=1 then
                     -- Arrival: final CFrame with zero velocity for three

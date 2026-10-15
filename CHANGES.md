@@ -620,3 +620,34 @@ Fixes:
 ### Checks
 
 `bash build.sh`; `bash check.sh`: see the output pasted in the report of this pass (0 SyntaxError in every chunk, `dist/test.full.lua`, `loader.lua` and the loader harness; no unknown globals beyond `dist/ug_baseline.txt`; 12/12 static stability rules). Line counts: 00_core 1,081, 10_ui 1,092, 20_ui2 1,228, 30_esp 844, 40_combat 701, 50_farms 796, 60_afq 1,759, 70_misc 1,149, 80_misc2 1,169, 90_main 25; `dist/test.full.lua` 9,844. Every src chunk is still CRLF; no control ID, config format field or `QUEST_LEVELS` row changed.
+
+## Auto Farm Quest: server snap-back, far wait spots, no-damage hovering (Oct 15 2026)
+
+### What was measured live (Upper Skylands, Royal Squad, Lv 534-538)
+
+- **The "fly out hundreds of studs" and the "hover with no damage" were the same desync.** A frame-by-frame trace showed the root alternating every few frames between the hover spot over the enemy and a point 300-2,500 studs away, while the enemy's HP never moved for the whole 50 s fight. That far point is the server's position for the character: it stops accepting the movement, keeps the character behind, lets it creep forward at ~20-40 studs/s and snaps the client back to it. Every RegisterHit is rejected meanwhile (the server sees the character thousands of studs from the enemy).
+- **Cause: long flights at 320 studs/s.** Controlled flights over the same path: 3,384 studs at 320 were refused after ~1.5 s (104 snap-backs; when the writes stopped the character was ~735 studs behind); 735 studs at 200 and 2,641 studs at 250 were accepted. Fight hops of 120-150 studs at 320 were always accepted.
+- **Why the flights were that long:** with the quest's `_WorldOrigin.EnemySpawns` markers streamed out, the stale-map guard in `afq_goToWait` could not run, so "waiting for spawn" flew to the static `sky5Wait1` (-7638, 5637, -1422), ~2,600 studs from where Royal Squads spawn; and the giver trip is the same distance.
+- **A second no-damage cause:** after a respawn no weapon is held, and with Roblox unfocused the equip loop cannot press the hotbar key; Remote M1 needs a held tool, so the fight hovered until the 50 s cap.
+
+### Changes
+
+- **`tweenTo` (30_esp):** a flight longer than `TWEEN_BURST_DIST` (300) runs at most `TWEEN_SERVER_CAP` (250) studs/s; short hops keep the speed setting. Each frame the root is compared with the point written last; more than `TWEEN_SNAP_DIST` (60) off means the server put it back: the flight re-bases from there instead of writing on along the old line, slows by `TWEEN_SNAP_SLOWDOWN` (x0.85, floor `TWEEN_SERVER_FLOOR` 150) and lowers the session cap the same way.
+- **`afq_fight` (60_afq):** a root more than `AFQ_RELOCK_DIST` (40) off the hover spot (server snap-back, a fall in a CommF_ quiet window, a knocked-away enemy) re-tweens from where it is instead of the hard lock snapping it back in one frame. `AFQ_NO_DAMAGE_SECS` (6) with at least `AFQ_NO_DAMAGE_SWINGS` (15) swings sent and no HP loss re-approaches once, then skips the enemy for `AFQ_NO_DAMAGE_BLOCK` (30) s (was: 50 s, then 60 s). Swings that were not sent (unfocused, quiet window, no tool) do not count. With no weapon held and Roblox unfocused the status line says so.
+- **Wait spot:** `afq_questAnchor` remembers the quest's spawn centroid once it was readable, and otherwise the spot of the last kill (`afq_noteKill`); the stale-map guard uses it when the markers are streamed out.
+- **Target pick:** `afq_nearestEnemy` prefers models named exactly the quest enemy (optionally followed by " [Lv. n]"). The contains match (which let a "Bandit" quest fly to the nearest "Snow Bandit"/"Sky Bandit") is only the fallback when no exact-named model exists at all.
+
+### Intentional behaviour changes
+
+- Long flights (giver trips, wait spots, re-approach from far) are at most 250 studs/s, lower for the session after a server snap-back, for every feature that uses `tweenTo`; the "Farm/Level Tween Speed" sliders still apply below that and to short hops.
+- An enemy that takes no damage is left after ~12 s instead of 50 s.
+
+### Live result after the fix
+
+Hot patch of `tweenTo`, `afq_goToWait` and helpers, `afq_nearestEnemy` and `afq_fight` into the running script, weapon held, Roblox focused, 2-minute trace: 38/38 fights killed (1.4-2.2 s each), 0 server snap-backs, 0 three-second no-damage stretches, Lv 538 -> 546 (was ~2 levels in a similar window before). The five quest completions in that window flew to the remembered spawn-centroid anchor a few hundred studs away instead of `sky5Wait1`.
+
+### Not done / remaining risks
+
+- The live test was a hot patch, not a fresh load; the "no weapon held" status note was not part of it.
+- That run used Remote quest accept, so the long giver trips of the dialogue path (the flights that triggered the snap-backs) were not exercised after the fix; they rely on the 250 studs/s cap and the snap-back re-base.
+- 250 studs/s was measured on one route in one server; the snap-back handling lowers it further where needed but never raises it again in a session.
