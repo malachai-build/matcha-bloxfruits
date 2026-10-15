@@ -1,8 +1,13 @@
 -- @chunk 20_ui2  (lines 1822-2950 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["20_ui2"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
 BOSS_OPTIONS={"The Gorilla King","Bobby","The Saw","Yeti","Mob Leader","Vice Admiral","Saber Expert","Warden","Chief Warden","Swan","Magma Admiral","Fishman Lord","Wysper","Thunder God","Cyborg","Ice Admiral","Greybeard","Diamond","Jeremy","Orbitus","Don Swan","Smoke Admiral","Awakened Ice Admiral","Tide Keeper","Darkbeard","Cursed Captain","Order","Stone","Hydra Leader","Kilo Admiral","Captain Elephant","Beautiful Pirate","Cake Queen","Dough King","Longma","Soul Reaper","rip_indra True Form","Tyrant of the Skies"}
 MATERIAL_OPTIONS={"Leather + Scrap Metal","Angel Wings","Magma Ore","Fish Tail","Radioactive Material","Ectoplasm","Mystic Droplet","Vampire Fang","Demonic Wisp","Conjured Cocoa","Dragon Scale","Gunpowder","Mini Tusk"}
 SEA_EVENT_OPTIONS={"Shark","Terrorshark","Piranha","Fish Crew Member","Haunted Crew Member"}
@@ -67,7 +72,9 @@ automationTab:AddToggle("auto_sea_event",{
 miscTab:AddSection("Mirage",{Column=2})
 miscTab:AddToggle("mirage_esp",{
     Text="Mirage ESP",Description="Shows the Mirage Island location",Default=false,Column=2,
-    Callback=function(v) S.mirageEsp=v; if not v then clearMirageEsp() end end
+    -- clearMirageEsp is defined by 80_misc2: guarded in case UE applies a
+    -- config while the later chunks are still loading.
+    Callback=function(v) S.mirageEsp=v; if not v and type(clearMirageEsp)=="function" then clearMirageEsp() end end
 })
 miscTab:AddToggle("auto_mirage_tween",{
     Text="Tween to Mirage",Description="Tweens above Mirage Island when it exists",Default=false,Column=2,
@@ -79,9 +86,9 @@ miscTab:AddToggle("auto_mirage_gear",{
 })
 
 miscTab:AddSection("World Status",{Column=2})
-miscTab:AddButton("check_events",{Text="Check Event Islands",Column=2,Callback=function() showEventStatus() end})
-miscTab:AddButton("check_bosses",{Text="Check Important Bosses",Column=2,Callback=function() showBossStatus() end})
-miscTab:AddButton("check_swords",{Text="Check Legendary Sword Dealer",Column=2,Callback=function() task.spawn(function() showLegendarySwordStatus() end) end})
+miscTab:AddButton("check_events",{Text="Check Event Islands",Column=2,Callback=function() if type(showEventStatus)=="function" then showEventStatus() end end})
+miscTab:AddButton("check_bosses",{Text="Check Important Bosses",Column=2,Callback=function() if type(showBossStatus)=="function" then showBossStatus() end end})
+miscTab:AddButton("check_swords",{Text="Check Legendary Sword Dealer",Column=2,Callback=function() task.spawn(function() if type(showLegendarySwordStatus)=="function" then showLegendarySwordStatus() end end) end})
 
 task.spawn(function()
     task.wait(0.2)
@@ -213,7 +220,15 @@ AFQ = {
     -- scans at the boss spot, and until when a parked model is ignored.
     bossMode=nil, bossQuest=nil, bossFallback=nil, bossAlive=false, bossPolledFor=nil,
     bossPollAt=-1e9, bossUpAt=nil, bossMisses=0, bossRsIgnoreUntil=0,
+    -- stability pass (Oct 15 2026): gen is bumped by the toggle callback and a
+    -- running step stops when it no longer matches stepGen (quick off/on);
+    -- acceptFails/abandonFails drive the bounded retry backoff (retryAt);
+    -- npcBlock holds enemies that survived a 50 s fight (key -> until);
+    -- trackerMissingSince debounces "tracker gone = quest completed".
+    gen=0, stepGen=0, acceptFails=0, abandonFails=0, retryAt=0, npcBlock={},
+    trackerMissingSince=nil,
 }
+local AFQ = AFQ -- this run's table for the callbacks below
 AFQ_SWITCH_COOLDOWN=6       -- s between two quest switches (stops a flapping selection)
 AFQ_LEVEL_CHECK_INTERVAL=3  -- s between the level reads inside a fight
 AFQ_WAIT_HEIGHT=24          -- studs a derived wait spot sits above the spawn centroid
@@ -231,13 +246,43 @@ AFQ_STATUS_LABEL=nil   -- set when the UI builds the status line below
 -- forceBossAlive (nil in normal use): true/false replaces the boss presence
 -- scan of the boss interleave (afq_bossAlive), so the boss-up/boss-down
 -- transitions can be tested without waiting for a real respawn.
-AFQ_DEBUG={noAccept=false,noFight=false,noHead=false,noLock=false,noClick=false,forceLevel=nil,forceBossAlive=nil,phase="idle"}
+-- safeMode (false in normal use): true doubles every bridge-write / swing
+-- interval (root lock, holdAt, tween step, head expander, BasicM1, clicks)
+-- for A/B crash tests.
+-- quietAccept (true in normal use): every CommF_ invoke (StartQuest,
+-- AbandonQuest, AddPoint) gets the quiet window of quietInvoke (00_core);
+-- false skips the quiet window for A/B tests (the remotes stay serialised).
+-- remoteAcceptOff (false in normal use): true sends no StartQuest and no
+-- AbandonQuest at all: Auto Farm Quest accepts at the giver through the
+-- dialogue (needs Roblox in front), Level Farm clicks its dialogue. A/B test
+-- for the user-reported crash on the remote quest pickup (CHANGES.md).
+AFQ_DEBUG={noAccept=false,noFight=false,noHead=false,noLock=false,noClick=false,forceLevel=nil,forceBossAlive=nil,phase="idle",safeMode=false,
+    quietAccept=true,remoteAcceptOff=false}
+WRITE_BUDGET.debug=AFQ_DEBUG -- writeInterval() (00_core) reads safeMode through this link
 
+AFQ_LABEL_INTERVAL=0.25 -- s between two status label writes (4 Hz)
+AFQ_LABEL={last=nil,at=-1e9,pending=false}
 function afq_updateLabel()
     local label=AFQ_STATUS_LABEL
-    if type(label)=="table" then
-        pcall(function() label.Text="Auto Farm Quest: "..tostring(AFQ.status) end)
+    if type(label)~="table" then return end
+    local text="Auto Farm Quest: "..tostring(AFQ.status)
+    if text==AFQ_LABEL.last then return end
+    local now=clock()
+    local left=AFQ_LABEL_INTERVAL-(now-AFQ_LABEL.at)
+    if left>0 then
+        -- Throttled: one trailing update shows the newest status.
+        if not AFQ_LABEL.pending then
+            AFQ_LABEL.pending=true
+            task.spawn(function()
+                task.wait(left)
+                AFQ_LABEL.pending=false
+                if alive() then pcall(afq_updateLabel) end
+            end)
+        end
+        return
     end
+    AFQ_LABEL.last=text; AFQ_LABEL.at=now
+    pcall(function() label.Text=text end)
 end
 
 mainTab:AddSection("Auto Farm Quest", { Column = 1 })
@@ -247,9 +292,14 @@ mainTab:AddToggle("auto_farm_quest", {
     Default=false, Column=1,
     Callback=function(v)
         S.autoFarmQuest=v
+        -- A step still running from before this toggle stops at its next check.
+        if AFQ then AFQ.gen=(AFQ.gen or 0)+1 end
         if v then
-            RemoteFailures["StartQuest"]=0
-            if AFQ then AFQ.entry=nil; AFQ.kills=0; AFQ.switchPending=false; AFQ.bossUpAt=nil; AFQ.bossMisses=0; AFQ.bossPollAt=-1e9 end
+            RemoteFailures["StartQuest"]=0; RemoteFailures["AbandonQuest"]=0
+            if AFQ then
+                AFQ.entry=nil; AFQ.kills=0; AFQ.switchPending=false; AFQ.bossUpAt=nil; AFQ.bossMisses=0; AFQ.bossPollAt=-1e9
+                AFQ.acceptFails=0; AFQ.abandonFails=0; AFQ.retryAt=0; AFQ.npcBlock={}; AFQ.trackerMissingSince=nil
+            end
         else
             if AFQ then AFQ.entry=nil; AFQ.kills=0; AFQ.switchPending=false; AFQ.bossUpAt=nil; AFQ.bossMisses=0; AFQ.bossMode=nil; AFQ.status="off"; pcall(afq_updateLabel) end
         end
@@ -315,7 +365,10 @@ miscTab:AddToggle("fruit_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.fruitEsp=v; S.chamEsp=v
-        if v then buildEspLabels(); buildChamBoxes() else clearEspLabels(); clearChamBoxes() end
+        if v then
+            if type(buildEspLabels)=="function" then buildEspLabels() end
+            if type(buildChamBoxes)=="function" then buildChamBoxes() end
+        else clearEspLabels(); clearChamBoxes() end
         notify(v and "Fruit ESP On!" or "Fruit ESP Off!","laced.club",2)
     end
 })
@@ -325,7 +378,7 @@ miscTab:AddToggle("chest_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.chestEsp=v
-        if v then buildChestEspLabels() else clearChestEspLabels() end
+        if v then if type(buildChestEspLabels)=="function" then buildChestEspLabels() end else clearChestEspLabels() end
         notify(v and "Chest ESP On!" or "Chest ESP Off!","laced.club",2)
     end
 })
@@ -335,7 +388,7 @@ miscTab:AddToggle("berry_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.berryEsp=v
-        if v then buildBerryEspLabels() else clearBerryEspLabels() end
+        if v then if type(buildBerryEspLabels)=="function" then buildBerryEspLabels(true) end else clearBerryEspLabels() end
         notify(v and "Berry Esp On!" or "Berry Esp Off!","laced.club",2)
     end
 })
@@ -345,7 +398,7 @@ miscTab:AddToggle("boat_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.boatEsp=v
-        if v then buildBoatEsp() else clearBoatEsp() end
+        if v then if type(buildBoatEsp)=="function" then buildBoatEsp() end else clearBoatEsp() end
         notify(v and "Boat ESP On!" or "Boat ESP Off!","laced.club",2)
     end
 })
@@ -355,7 +408,7 @@ miscTab:AddToggle("flower_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.flowerEsp=v
-        if v then buildFlowerEsp() else clearFlowerEsp() end
+        if v then if type(buildFlowerEsp)=="function" then buildFlowerEsp() end else clearFlowerEsp() end
         notify(v and "Flower Esp On!" or "Flower Esp Off!","laced.club",2)
     end
 })
@@ -674,15 +727,19 @@ function findNearestDinoBone(playerRoot)
 end
 
 task.spawn(function()
+    -- A Workspace:GetChildren() rescan at most every 0.5 s while no bone is
+    -- found (it ran every frame), and root writes at 30 Hz.
+    local nextScan=0
     while alive() do
-        frameWait()
+        if S.autoDinoBone then task.wait(1/30) else task.wait(IDLE_POLL) end
         if S.autoDinoBone then
             local okStep=pcall(function()
                 local char=LocalPlayer.Character
                 local hrp=char and char:FindFirstChild("HumanoidRootPart")
                 if hrp then
                     local bonePart=getDinoBonePart(dinoBoneTarget)
-                    if not bonePart then
+                    if not bonePart and clock()>=nextScan then
+                        nextScan=clock()+0.5
                         dinoBoneTarget=findNearestDinoBone(hrp)
                         bonePart=getDinoBonePart(dinoBoneTarget)
                     end
@@ -710,7 +767,7 @@ task.spawn(function()
             local okSeat,seatParent,seatPos=pcall(function()
                 return seat and seat.Parent,seat and seat.Position
             end)
-            if seat and char and hrp and humanoid and okSeat and seatParent and seatPos
+            if seat and char and hrp and humanoid and okSeat and seatParent and seatPos and not writesPaused()
                 and not isUsingSelectedBoatSeat(seat,char,humanoid,hrp) then
                 pcall(function()
                     hrp.Position=Vector3.new(seatPos.X,seatPos.Y+2,seatPos.Z)
@@ -719,7 +776,8 @@ task.spawn(function()
                 end)
             end
         end
-        frameWait()
+        -- 30 Hz while on (three root writes per pass), idle cadence while off.
+        if S.autoBoatSeat then task.wait(1/30) else task.wait(IDLE_POLL) end
     end
 end)
 
@@ -1065,6 +1123,8 @@ function boatTweenTo(targetPos)
     local t0=clock()
     local arrived=false
     while active() do
+        -- CommF_ quiet window: no write; the flight resumes where it stopped.
+        while writesPaused() and active() do local pausedAt=clock(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
         local alpha=math.min((clock()-t0)/duration,1)
         local okMove=pcall(function()
             primary.Position=Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha)
@@ -1072,15 +1132,15 @@ function boatTweenTo(targetPos)
         if not okMove then break end
         zeroVelocity(primary)
         if alpha>=1 then arrived=true; break end
-        task.wait(0.01)
+        frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based, so the speed is unchanged
     end
     finish(arrived)
 end
 
 task.spawn(function()
     while alive() do
-        frameWait()
-        if not S.boatFlyEnabled or S.boatTweening then continue end
+        idleWait(S.boatFlyEnabled)
+        if not S.boatFlyEnabled or S.boatTweening or writesPaused() then continue end
         local boat=getBoat(); if not boat then continue end
         local okPrimary,primary=pcall(function() return boat.PrimaryPart end)
         if not okPrimary or not primary then continue end
@@ -1100,35 +1160,47 @@ task.spawn(function()
 end)
 
 -- ESP clear functions: remove every Drawing object, not just hide it, so the
--- caches cannot grow without bound across toggles.
-function clearEspLabels()
-    clearEspCache(S.espLabelCache)
-    S.espLabels={}
+-- caches cannot grow without bound across toggles. `state` defaults to this
+-- run's S (shutdownScript clears its own run's caches directly).
+function clearEspLabels(state)
+    state=state or S
+    clearEspCache(state.espLabelCache)
+    state.espLabels={}
 end
 
-function clearChestEspLabels()
-    clearEspCache(S.chestEspLabelCache)
-    S.chestEspLabels={}
+function clearChestEspLabels(state)
+    state=state or S
+    clearEspCache(state.chestEspLabelCache)
+    state.chestEspLabels={}
 end
 
-function clearBerryEspLabels()
-    S.berryScanGeneration=S.berryScanGeneration+1
-    clearEspCache(S.berryEspLabelCache)
-    S.berryEspLabels={}
+function clearBerryEspLabels(state)
+    state=state or S
+    state.berryScanGeneration=state.berryScanGeneration+1
+    clearEspCache(state.berryEspLabelCache)
+    state.berryEspLabels={}
+    -- The running scan sees the new generation at its next batch and stops;
+    -- clearing the flag lets a quick off/on start a fresh scan at once.
+    berryScanRunning=false
 end
 
-function clearBoatEsp()
-    clearEspCache(S.boatEspCache)
-    S.boatEspEntries={}
+function clearBoatEsp(state)
+    state=state or S
+    clearEspCache(state.boatEspCache)
+    state.boatEspEntries={}
 end
 
-function clearFlowerEsp()
-    clearEspCache(S.flowerEspCache)
-    S.flowerEspEntries={}
+function clearFlowerEsp(state)
+    state=state or S
+    clearEspCache(state.flowerEspCache)
+    state.flowerEspEntries={}
 end
 
-function clearChamBoxes()
-    clearEspCache(S.chamBoxCache)
-    S.chamBoxes={}
+function clearChamBoxes(state)
+    state=state or S
+    clearEspCache(state.chamBoxCache)
+    state.chamBoxes={}
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["20_ui2"] = true end

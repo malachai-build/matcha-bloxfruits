@@ -1,4 +1,9 @@
 -- @chunk 00_core  (lines 1-783 of the single-file build)
+-- Load marker (loader.lua): proves this chunk started and, at the end of the
+-- file, that it finished. Matcha's loadstring reports a syntax error only by
+-- printing when the chunk is called, so the loader cannot rely on errors.
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["00_core"] = true end
 --[[
     laced.club - Blox Fruits menu for the Matcha LuaVM (bug-fix rewrite).
     Full per-bug list with original line numbers: CHANGES.md.
@@ -52,6 +57,20 @@ clock = (type(os) == "table" and type(os.clock) == "function") and os.clock or t
 -- CFrame/Position) at that rate. frameWait() yields one 60 Hz frame instead.
 FRAME_TIME = 1 / 60
 function frameWait() task.wait(FRAME_TIME) end
+-- Idle cadence for loops whose feature is off: about 30 loops used to wake at
+-- 60 Hz with every toggle off (~1,800 resumes/s). idleWait(active) yields one
+-- frame while the feature is on and IDLE_POLL s while it is off.
+IDLE_POLL = 0.25
+function idleWait(active)
+    if active then task.wait(FRAME_TIME) else task.wait(IDLE_POLL) end
+end
+-- True unless Matcha says Roblox is not the foreground window. Synthetic keys
+-- and clicks go to whatever window has focus, so every input path checks it.
+function robloxFocused()
+    if type(isrbxactive) ~= "function" then return true end
+    local okActive, active = pcall(isrbxactive)
+    return not (okActive and active == false)
+end
 
 Players = game:GetService("Players")
 LocalPlayer = Players.LocalPlayer
@@ -135,10 +154,7 @@ function menuUnderMouse()
     return okOver and over == true
 end
 function farmClick()
-    if type(isrbxactive) == "function" then
-        local okActive, active = pcall(isrbxactive)
-        if okActive and active == false then return false end
-    end
+    if not robloxFocused() then return false end
     if menuUnderMouse() then return false end
     return (pcall(mouse1click))
 end
@@ -166,6 +182,9 @@ RemoteFailures = {}
 REMOTE_FAILURE_LIMIT = 8
 function safeRemote(tag, remote, method, ...)
     if not remote then return false, nil end
+    -- Serialised with CommF_ invokes (see quietInvoke): a FireServer while an
+    -- invoke is pending is skipped, not counted as a failure.
+    if method ~= "InvokeServer" and remoteInvokePending() then return false, "CommF_ invoke pending" end
     local count = select("#", ...)
     local args = { ... }
     local ok, result = pcall(function()
@@ -198,8 +217,53 @@ function rootRotation(part)
     return rotation
 end
 
+-- Bridge write budget (crash mitigation, see CRASH_FINDINGS.md). Every root
+-- CFrame/velocity write goes through Matcha's external memory bridge; the
+-- hard-lock, holdAt and tween loops used to write 180-300 times a second.
+-- AFQ_DEBUG.safeMode = true doubles every interval that uses writeInterval()
+-- (halves those rates) for A/B crash testing.
+ROOT_WRITE_HZ = 30
+ROOT_SKIP_DIST_SQ = 0.05 * 0.05
+-- WRITE_BUDGET.debug is linked to the AFQ_DEBUG table by 20_ui2 (pair P08),
+-- so AFQ_DEBUG.safeMode = true switches safe mode on at runtime.
+WRITE_BUDGET = { debug = nil }
+function safeModeOn()
+    local debug = WRITE_BUDGET.debug
+    return type(debug) == "table" and debug.safeMode == true
+end
+function writeInterval(base)
+    return safeModeOn() and base * 2 or base
+end
+
+-- Remote quiet window (stability pass, Oct 15 2026). The user reports the
+-- client crashing consistently when the remote quest pickup (CommF_
+-- InvokeServer "StartQuest") fires, often at the end of a long AFQ flight.
+-- quietInvoke() below sets S.remoteQuiet for the duration of every CommF_
+-- invoke plus AFQ_REMOTE_QUIET_BEFORE/AFTER around it; while it is set, the
+-- shared write helpers (moveRoot, setPartPosition, zeroVelocity, and through
+-- them tweenTo/afq_holdAt/hardLockNpcCFrame) and the loops that write parts
+-- directly write nothing. S.remoteInvokeBusy serialises the remotes: no
+-- FireServer (RegisterAttack/RegisterHit, auras, Magnet M1) goes out while a
+-- CommF_ invoke is pending. runGate is this run's S (assigned once S exists).
+local runGate = nil
+function writesPaused()
+    return runGate ~= nil and runGate.remoteQuiet == true
+end
+function remoteInvokePending()
+    return runGate ~= nil and runGate.remoteInvokeBusy == true
+end
+
 function moveRoot(part, x, y, z, rotation)
     if not part then return false end
+    if writesPaused() then return false end
+    -- Never write to a root that left the DataModel (died, respawned, streamed
+    -- out); skip the write when it already sits on the target.
+    local okState, parent, current = pcall(function() return part.Parent, part.Position end)
+    if not okState or parent == nil then return false end
+    if current and current.X then
+        local dx, dy, dz = current.X - x, current.Y - y, current.Z - z
+        if dx * dx + dy * dy + dz * dz <= ROOT_SKIP_DIST_SQ then return true end
+    end
     local okCFrame = pcall(function()
         local positionCF = CFrame.new(x, y, z)
         part.CFrame = rotation and (positionCF * rotation) or positionCF
@@ -210,13 +274,26 @@ end
 
 function setPartPosition(part, position)
     if not part or not position then return false end
+    if writesPaused() then return false end
     return (pcall(function() part.Position = position end))
 end
 
+local function nearZeroVector(v)
+    return v ~= nil and v.X ~= nil and math.abs(v.X) + math.abs(v.Y) + math.abs(v.Z) < 0.01
+end
 function zeroVelocity(part)
     if not part then return end
-    pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
-    pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    if writesPaused() then return end
+    local okState, parent, velocity, assembly = pcall(function()
+        return part.Parent, part.Velocity, part.AssemblyLinearVelocity
+    end)
+    if okState and parent == nil then return end
+    if not (okState and nearZeroVector(velocity)) then
+        pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
+    end
+    if not (okState and nearZeroVector(assembly)) then
+        pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    end
 end
 
 -- Drawing helpers: every object is created, updated and removed defensively.
@@ -436,17 +513,129 @@ S = {
     lastRaidIslandCount = 0,
     berryScanGeneration = 0,
     unloaded       = false,
+    remoteQuiet    = false, -- set by quietInvoke: no part writes (see writesPaused)
+    remoteInvokeBusy = false, -- set by quietInvoke: a CommF_ invoke is pending
 }
+runGate = S
 
 -- Every background loop runs while alive(); unloading the UI stops them all.
--- S is a global, so a re-run replaces it. SCRIPT_STATE keeps this execution's
--- table: re-running the script unloads the previous UE copy, and the previous
--- copy's shutdown (and its loops) must act on its own table, not the new one.
--- (Seen live: the old shutdown set the NEW S.unloaded = true, so the fresh copy
--- loaded with every loop already stopped.)
-SCRIPT_STATE = S
-function alive()
-    return not SCRIPT_STATE.unloaded
+-- S is a global, so a re-run replaces it. Each run's own table is bound here,
+-- once: alive(), onShutdown() and shutdownScript() are closures over it, and
+-- every later chunk captures them (and S) as chunk locals at load time
+-- (`local alive = alive`). alive() used to read the GLOBAL SCRIPT_STATE on
+-- every call, so after a re-run the old run's ~60 loops read the new run's
+-- flag and could never be stopped (stability pass, Oct 15 2026). (Seen live
+-- earlier: the old shutdown set the NEW S.unloaded = true.)
+do
+    local state = S
+    local hooks = {}
+    local removeDrawingFn, clearEspCacheFn = removeDrawing, clearEspCache
+    SCRIPT_STATE = state
+    function alive()
+        return not state.unloaded
+    end
+    -- Cleanup hooks registered by the chunks at load time (restore heads and
+    -- collisions, release held input, ...). They run once, newest first.
+    function onShutdown(fn)
+        if type(fn) == "function" then hooks[#hooks + 1] = fn end
+    end
+    local ESP_CACHES = { "espLabelCache", "chamBoxCache", "chestEspLabelCache",
+        "berryEspLabelCache", "boatEspCache", "flowerEspCache" }
+    local ESP_LISTS = { "espLabels", "chamBoxes", "chestEspLabels", "berryEspLabels",
+        "boatEspEntries", "flowerEspEntries" }
+    -- Idempotent; safe before the later chunks exist (it only touches this
+    -- run's own table, its registered hooks and its own UE copy).
+    -- reason: "ui" (UE OnUnload: the menu is already going away), "loader"
+    -- (a later chunk failed to load; the menu is unloaded too), nil (by hand).
+    function shutdownScript(reason)
+        if state.shutdownStarted then return end
+        state.shutdownStarted = true
+        -- Toggles off through their own callbacks (each feature's normal "off"
+        -- path) only while this run is the current one. During a re-run the
+        -- new run is already loading; this run's loops stop on alive().
+        local library = state.library
+        if SCRIPT_STATE == state and type(library) == "table" and type(library.Controls) == "table" then
+            for _, control in pairs(library.Controls) do
+                if type(control) == "table" and control.Type == "Toggle" and control.Value == true then
+                    pcall(function() control:SetValue(false) end)
+                end
+            end
+        end
+        state.unloaded = true
+        state.boatTweening = false
+        state.boatTween = nil
+        for index = #hooks, 1, -1 do pcall(hooks[index], reason) end
+        -- This run's Drawings, straight from its own caches (the global clear
+        -- functions act on whichever run defined them last).
+        state.berryScanGeneration = (tonumber(state.berryScanGeneration) or 0) + 1
+        for _, key in ipairs(ESP_CACHES) do
+            if type(state[key]) == "table" then pcall(clearEspCacheFn, state[key]) end
+        end
+        for _, key in ipairs(ESP_LISTS) do state[key] = {} end
+        if state.mirageEspLabel then
+            pcall(removeDrawingFn, state.mirageEspLabel)
+            state.mirageEspLabel = nil
+        end
+        pcall(mouse1release)
+        if type(setrobloxinput) == "function" then pcall(setrobloxinput, true) end
+        if reason ~= "ui" then
+            local ue = state.ue
+            if type(ue) == "table" and not ue._unloaded and type(ue.Unload) == "function" then
+                pcall(function() ue:Unload() end)
+            end
+        end
+    end
+end
+-- This run's S for every function defined below (as in the single-file build,
+-- where S was a top-level local).
+local S = S
+
+-- One CommF_ InvokeServer with the quiet window around it (see writesPaused
+-- above). Every CommF_ call of the script goes through here: StartQuest,
+-- AbandonQuest (Auto Farm Quest, Level Farm), AddPoint (Auto Stat), the
+-- Legendary Sword Dealer check. Order: wait for any pending invoke (at most
+-- 5 s), raise S.remoteInvokeBusy and S.remoteQuiet, wait
+-- AFQ_REMOTE_QUIET_BEFORE s plus up to 0.5 s more for the root to stop moving
+-- (no writes happen meanwhile, so a falling character keeps falling; it is
+-- not held), invoke, keep the quiet window AFQ_REMOTE_QUIET_AFTER s, clear
+-- both flags. AFQ_DEBUG.quietAccept = false skips the quiet window (A/B
+-- test); the serialisation stays. Returns what safeRemote returns. Call it
+-- from a step thread after its own hold/tween loops have returned, never
+-- from inside a per-frame loop.
+AFQ_REMOTE_QUIET_BEFORE = 0.3
+AFQ_REMOTE_QUIET_AFTER = 0.3
+local function rootSpeed()
+    local okSpeed, speed = pcall(function()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local v = hrp and hrp.AssemblyLinearVelocity
+        return v and v.Magnitude
+    end)
+    return okSpeed and tonumber(speed) or 0
+end
+function quietInvoke(tag, remote, ...)
+    if not remote then return false, nil end
+    local count = select("#", ...)
+    local args = { ... }
+    local waitUntil = clock() + 5
+    while S.remoteInvokeBusy and clock() < waitUntil do task.wait(0.05) end
+    if S.remoteInvokeBusy then return false, "another CommF_ invoke is still pending" end
+    S.remoteInvokeBusy = true
+    local debug = WRITE_BUDGET.debug -- the AFQ_DEBUG table (linked by 20_ui2)
+    local quiet = not (type(debug) == "table" and debug.quietAccept == false)
+    local okCall, ok, result = true, false, nil
+    if quiet then
+        S.remoteQuiet = true
+        task.wait(AFQ_REMOTE_QUIET_BEFORE)
+        local settleUntil = clock() + 0.5
+        while rootSpeed() > 1 and clock() < settleUntil do task.wait(0.05) end
+    end
+    okCall, ok, result = pcall(safeRemote, tag, remote, "InvokeServer", table.unpack(args, 1, count))
+    if quiet then task.wait(AFQ_REMOTE_QUIET_AFTER) end
+    S.remoteQuiet = false
+    S.remoteInvokeBusy = false
+    if not okCall then return false, ok end
+    return ok, result
 end
 
 -- Priority features that every farm yields to (Auto Farm Quest checks this
@@ -783,11 +972,18 @@ islandList = {
 -- ---------------------------------------------------------------------------
 -- UE UI library: download, validate, run, wrap in the adapter
 -- ---------------------------------------------------------------------------
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["00_core"] = true end
 -- @chunk 10_ui  (lines 784-1821 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["10_ui"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local shutdownScript = shutdownScript -- this run's (00_core), for the UE OnUnload hook
 UE_URL = "https://raw.githubusercontent.com/hauntedscripts/Scripts2/refs/heads/main/matcha%20ue"
 
 function ueEnvironments()
@@ -832,9 +1028,17 @@ function validateUESource(body)
     return true, nil
 end
 
+UE_DOWNLOAD_ATTEMPTS = 3 -- bounded retry: 1 s, then 2 s between attempts
+
 function loadUEAdapter()
-    local ueSource = safeHttpGet(UE_URL)
-    local valid, reason = validateUESource(ueSource)
+    local ueSource, valid, reason = "", false, nil
+    for attempt = 1, UE_DOWNLOAD_ATTEMPTS do
+        ueSource = safeHttpGet(UE_URL)
+        valid, reason = validateUESource(ueSource)
+        if valid or attempt == UE_DOWNLOAD_ATTEMPTS then break end
+        warnThrottled("ueDownload", "[laced.club] UE download rejected (" .. tostring(reason) .. "), retrying", 5)
+        task.wait(attempt)
+    end
     assert(valid, "UE download rejected: " .. tostring(reason))
 
     local previousUE = findExposedUE()
@@ -843,9 +1047,19 @@ function loadUEAdapter()
     ueChunk()
 
     local UE = findExposedUE()
-    assert(type(UE) == "table", "UE did not expose UELibrary")
-    assert(UE ~= previousUE, "UE chunk did not run (stale UELibrary from a previous execution)")
-    assert(not UE._unloaded, "UE library is already unloaded")
+    -- A new UE copy that fails the checks below has already created its
+    -- windows (and unloaded the previous copy): unload it, do not leave a
+    -- half-built menu on screen.
+    local function rejectNewUE(message)
+        if type(UE) == "table" and UE ~= previousUE and type(UE.Unload) == "function" and not UE._unloaded then
+            pcall(function() UE:Unload() end)
+        end
+        assert(false, message)
+    end
+    if type(UE) ~= "table" then rejectNewUE("UE did not expose UELibrary") end
+    if UE == previousUE then rejectNewUE("UE chunk did not run (stale UELibrary from a previous execution)") end
+    if UE._unloaded then rejectNewUE("UE library is already unloaded") end
+    if type(UE.CreateWindow) ~= "function" then rejectNewUE("UE library has no CreateWindow") end
 
     local controls = {}
 
@@ -1102,8 +1316,14 @@ function loadUEAdapter()
         return popup
     end
 
+    -- True when the hook was installed (UE builds without OnUnload cannot stop
+    -- the script from the menu's Unload button).
     function Adapter:OnUnload(callback)
-        if type(self.Raw.OnUnload) == "function" then self.Raw:OnUnload(callback) end
+        if type(self.Raw.OnUnload) == "function" then
+            self.Raw:OnUnload(callback)
+            return true
+        end
+        return false
     end
 
     function Adapter:CreateWindow(info)
@@ -1323,9 +1543,13 @@ do
     if okUE and type(ueResult) == "table" then
         Library = ueResult
         menuUE = ueResult.Raw
+        SCRIPT_STATE.ue = ueResult.Raw
     else
+        -- assert, not return: a plain return used to end only this chunk, so
+        -- the loader ran 20_ui2 into a nil index. The loader catches this and
+        -- runs this run's shutdownScript.
         warn("Failed to load UE UI: " .. tostring(ueResult))
-        return
+        assert(false, "[laced.club] UE UI failed to load: " .. tostring(ueResult))
     end
 end
 
@@ -1346,6 +1570,18 @@ Window = Library:CreateWindow({
     Height = 570,
     Theme = { Colors = { Accent = Color3.fromRGB(255,111,0) } }
 })
+
+-- Unload hook, registered as soon as the window exists (it used to be the
+-- last statement of 90_main, so a chunk that failed in between left every
+-- loop already started with no way to stop it from the menu). shutdownScript
+-- is this run's own (captured at the top of this chunk): a re-run unloads
+-- this UE copy from inside the new run, when the global is already the new
+-- run's.
+SCRIPT_STATE.library = Library
+SCRIPT_LIBRARY = Library
+if not Library:OnUnload(function() shutdownScript("ui") end) then
+    warn("[laced.club] this UE build has no OnUnload: the menu's Unload button cannot stop the script")
+end
 
 mainTab=Window:AddTab("Main")
 miscTab=Window:AddTab("Misc")
@@ -1651,7 +1887,8 @@ do
 
             -- One bad frame (target or root destroyed mid-write) must not kill the loop.
             local okStep,stepError=pcall(function()
-            if MagnetSettings.farmMode=="player" or MagnetSettings.farmMode=="enemy" then
+            -- writesPaused: CommF_ quiet window (quietInvoke in 00_core).
+            if (MagnetSettings.farmMode=="player" or MagnetSettings.farmMode=="enemy") and not writesPaused() then
                 local character=LocalPlayer.Character
                 local playerRoot=magnetGetRoot(character)
                 local targetModel,targetRoot=nil,nil
@@ -1739,7 +1976,7 @@ do
             end
             end)
             if not okStep then warnThrottled("magnetFarm","[laced.club] Magnet farm step failed: "..tostring(stepError),10) end
-            frameWait()
+            idleWait(MagnetSettings.farmMode~=nil)
         end
     end)
 
@@ -1777,7 +2014,8 @@ do
                 end
             end
             -- Back off while the remote keeps failing (non-Pro build) instead of firing every frame.
-            if remoteFailing("Magnet M1") then task.wait(1) else frameWait() end
+            if remoteFailing("Magnet M1") then task.wait(1)
+            else idleWait(MagnetSettings.enabled or MagnetSettings.farmMode~=nil) end
         end
     end)
 end
@@ -1826,11 +2064,18 @@ mainTab:AddToggle("dungeon_vent_skills",{
     Callback=function(value) S.dungeonUseMoves=value end
 })
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["10_ui"] = true end
 -- @chunk 20_ui2  (lines 1822-2950 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["20_ui2"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
 BOSS_OPTIONS={"The Gorilla King","Bobby","The Saw","Yeti","Mob Leader","Vice Admiral","Saber Expert","Warden","Chief Warden","Swan","Magma Admiral","Fishman Lord","Wysper","Thunder God","Cyborg","Ice Admiral","Greybeard","Diamond","Jeremy","Orbitus","Don Swan","Smoke Admiral","Awakened Ice Admiral","Tide Keeper","Darkbeard","Cursed Captain","Order","Stone","Hydra Leader","Kilo Admiral","Captain Elephant","Beautiful Pirate","Cake Queen","Dough King","Longma","Soul Reaper","rip_indra True Form","Tyrant of the Skies"}
 MATERIAL_OPTIONS={"Leather + Scrap Metal","Angel Wings","Magma Ore","Fish Tail","Radioactive Material","Ectoplasm","Mystic Droplet","Vampire Fang","Demonic Wisp","Conjured Cocoa","Dragon Scale","Gunpowder","Mini Tusk"}
 SEA_EVENT_OPTIONS={"Shark","Terrorshark","Piranha","Fish Crew Member","Haunted Crew Member"}
@@ -1895,7 +2140,9 @@ automationTab:AddToggle("auto_sea_event",{
 miscTab:AddSection("Mirage",{Column=2})
 miscTab:AddToggle("mirage_esp",{
     Text="Mirage ESP",Description="Shows the Mirage Island location",Default=false,Column=2,
-    Callback=function(v) S.mirageEsp=v; if not v then clearMirageEsp() end end
+    -- clearMirageEsp is defined by 80_misc2: guarded in case UE applies a
+    -- config while the later chunks are still loading.
+    Callback=function(v) S.mirageEsp=v; if not v and type(clearMirageEsp)=="function" then clearMirageEsp() end end
 })
 miscTab:AddToggle("auto_mirage_tween",{
     Text="Tween to Mirage",Description="Tweens above Mirage Island when it exists",Default=false,Column=2,
@@ -1907,9 +2154,9 @@ miscTab:AddToggle("auto_mirage_gear",{
 })
 
 miscTab:AddSection("World Status",{Column=2})
-miscTab:AddButton("check_events",{Text="Check Event Islands",Column=2,Callback=function() showEventStatus() end})
-miscTab:AddButton("check_bosses",{Text="Check Important Bosses",Column=2,Callback=function() showBossStatus() end})
-miscTab:AddButton("check_swords",{Text="Check Legendary Sword Dealer",Column=2,Callback=function() task.spawn(function() showLegendarySwordStatus() end) end})
+miscTab:AddButton("check_events",{Text="Check Event Islands",Column=2,Callback=function() if type(showEventStatus)=="function" then showEventStatus() end end})
+miscTab:AddButton("check_bosses",{Text="Check Important Bosses",Column=2,Callback=function() if type(showBossStatus)=="function" then showBossStatus() end end})
+miscTab:AddButton("check_swords",{Text="Check Legendary Sword Dealer",Column=2,Callback=function() task.spawn(function() if type(showLegendarySwordStatus)=="function" then showLegendarySwordStatus() end end) end})
 
 task.spawn(function()
     task.wait(0.2)
@@ -2041,7 +2288,15 @@ AFQ = {
     -- scans at the boss spot, and until when a parked model is ignored.
     bossMode=nil, bossQuest=nil, bossFallback=nil, bossAlive=false, bossPolledFor=nil,
     bossPollAt=-1e9, bossUpAt=nil, bossMisses=0, bossRsIgnoreUntil=0,
+    -- stability pass (Oct 15 2026): gen is bumped by the toggle callback and a
+    -- running step stops when it no longer matches stepGen (quick off/on);
+    -- acceptFails/abandonFails drive the bounded retry backoff (retryAt);
+    -- npcBlock holds enemies that survived a 50 s fight (key -> until);
+    -- trackerMissingSince debounces "tracker gone = quest completed".
+    gen=0, stepGen=0, acceptFails=0, abandonFails=0, retryAt=0, npcBlock={},
+    trackerMissingSince=nil,
 }
+local AFQ = AFQ -- this run's table for the callbacks below
 AFQ_SWITCH_COOLDOWN=6       -- s between two quest switches (stops a flapping selection)
 AFQ_LEVEL_CHECK_INTERVAL=3  -- s between the level reads inside a fight
 AFQ_WAIT_HEIGHT=24          -- studs a derived wait spot sits above the spawn centroid
@@ -2059,13 +2314,43 @@ AFQ_STATUS_LABEL=nil   -- set when the UI builds the status line below
 -- forceBossAlive (nil in normal use): true/false replaces the boss presence
 -- scan of the boss interleave (afq_bossAlive), so the boss-up/boss-down
 -- transitions can be tested without waiting for a real respawn.
-AFQ_DEBUG={noAccept=false,noFight=false,noHead=false,noLock=false,noClick=false,forceLevel=nil,forceBossAlive=nil,phase="idle"}
+-- safeMode (false in normal use): true doubles every bridge-write / swing
+-- interval (root lock, holdAt, tween step, head expander, BasicM1, clicks)
+-- for A/B crash tests.
+-- quietAccept (true in normal use): every CommF_ invoke (StartQuest,
+-- AbandonQuest, AddPoint) gets the quiet window of quietInvoke (00_core);
+-- false skips the quiet window for A/B tests (the remotes stay serialised).
+-- remoteAcceptOff (false in normal use): true sends no StartQuest and no
+-- AbandonQuest at all: Auto Farm Quest accepts at the giver through the
+-- dialogue (needs Roblox in front), Level Farm clicks its dialogue. A/B test
+-- for the user-reported crash on the remote quest pickup (CHANGES.md).
+AFQ_DEBUG={noAccept=false,noFight=false,noHead=false,noLock=false,noClick=false,forceLevel=nil,forceBossAlive=nil,phase="idle",safeMode=false,
+    quietAccept=true,remoteAcceptOff=false}
+WRITE_BUDGET.debug=AFQ_DEBUG -- writeInterval() (00_core) reads safeMode through this link
 
+AFQ_LABEL_INTERVAL=0.25 -- s between two status label writes (4 Hz)
+AFQ_LABEL={last=nil,at=-1e9,pending=false}
 function afq_updateLabel()
     local label=AFQ_STATUS_LABEL
-    if type(label)=="table" then
-        pcall(function() label.Text="Auto Farm Quest: "..tostring(AFQ.status) end)
+    if type(label)~="table" then return end
+    local text="Auto Farm Quest: "..tostring(AFQ.status)
+    if text==AFQ_LABEL.last then return end
+    local now=clock()
+    local left=AFQ_LABEL_INTERVAL-(now-AFQ_LABEL.at)
+    if left>0 then
+        -- Throttled: one trailing update shows the newest status.
+        if not AFQ_LABEL.pending then
+            AFQ_LABEL.pending=true
+            task.spawn(function()
+                task.wait(left)
+                AFQ_LABEL.pending=false
+                if alive() then pcall(afq_updateLabel) end
+            end)
+        end
+        return
     end
+    AFQ_LABEL.last=text; AFQ_LABEL.at=now
+    pcall(function() label.Text=text end)
 end
 
 mainTab:AddSection("Auto Farm Quest", { Column = 1 })
@@ -2075,9 +2360,14 @@ mainTab:AddToggle("auto_farm_quest", {
     Default=false, Column=1,
     Callback=function(v)
         S.autoFarmQuest=v
+        -- A step still running from before this toggle stops at its next check.
+        if AFQ then AFQ.gen=(AFQ.gen or 0)+1 end
         if v then
-            RemoteFailures["StartQuest"]=0
-            if AFQ then AFQ.entry=nil; AFQ.kills=0; AFQ.switchPending=false; AFQ.bossUpAt=nil; AFQ.bossMisses=0; AFQ.bossPollAt=-1e9 end
+            RemoteFailures["StartQuest"]=0; RemoteFailures["AbandonQuest"]=0
+            if AFQ then
+                AFQ.entry=nil; AFQ.kills=0; AFQ.switchPending=false; AFQ.bossUpAt=nil; AFQ.bossMisses=0; AFQ.bossPollAt=-1e9
+                AFQ.acceptFails=0; AFQ.abandonFails=0; AFQ.retryAt=0; AFQ.npcBlock={}; AFQ.trackerMissingSince=nil
+            end
         else
             if AFQ then AFQ.entry=nil; AFQ.kills=0; AFQ.switchPending=false; AFQ.bossUpAt=nil; AFQ.bossMisses=0; AFQ.bossMode=nil; AFQ.status="off"; pcall(afq_updateLabel) end
         end
@@ -2143,7 +2433,10 @@ miscTab:AddToggle("fruit_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.fruitEsp=v; S.chamEsp=v
-        if v then buildEspLabels(); buildChamBoxes() else clearEspLabels(); clearChamBoxes() end
+        if v then
+            if type(buildEspLabels)=="function" then buildEspLabels() end
+            if type(buildChamBoxes)=="function" then buildChamBoxes() end
+        else clearEspLabels(); clearChamBoxes() end
         notify(v and "Fruit ESP On!" or "Fruit ESP Off!","laced.club",2)
     end
 })
@@ -2153,7 +2446,7 @@ miscTab:AddToggle("chest_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.chestEsp=v
-        if v then buildChestEspLabels() else clearChestEspLabels() end
+        if v then if type(buildChestEspLabels)=="function" then buildChestEspLabels() end else clearChestEspLabels() end
         notify(v and "Chest ESP On!" or "Chest ESP Off!","laced.club",2)
     end
 })
@@ -2163,7 +2456,7 @@ miscTab:AddToggle("berry_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.berryEsp=v
-        if v then buildBerryEspLabels() else clearBerryEspLabels() end
+        if v then if type(buildBerryEspLabels)=="function" then buildBerryEspLabels(true) end else clearBerryEspLabels() end
         notify(v and "Berry Esp On!" or "Berry Esp Off!","laced.club",2)
     end
 })
@@ -2173,7 +2466,7 @@ miscTab:AddToggle("boat_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.boatEsp=v
-        if v then buildBoatEsp() else clearBoatEsp() end
+        if v then if type(buildBoatEsp)=="function" then buildBoatEsp() end else clearBoatEsp() end
         notify(v and "Boat ESP On!" or "Boat ESP Off!","laced.club",2)
     end
 })
@@ -2183,7 +2476,7 @@ miscTab:AddToggle("flower_esp", {
     Default=false, Column=1,
     Callback=function(v)
         S.flowerEsp=v
-        if v then buildFlowerEsp() else clearFlowerEsp() end
+        if v then if type(buildFlowerEsp)=="function" then buildFlowerEsp() end else clearFlowerEsp() end
         notify(v and "Flower Esp On!" or "Flower Esp Off!","laced.club",2)
     end
 })
@@ -2502,15 +2795,19 @@ function findNearestDinoBone(playerRoot)
 end
 
 task.spawn(function()
+    -- A Workspace:GetChildren() rescan at most every 0.5 s while no bone is
+    -- found (it ran every frame), and root writes at 30 Hz.
+    local nextScan=0
     while alive() do
-        frameWait()
+        if S.autoDinoBone then task.wait(1/30) else task.wait(IDLE_POLL) end
         if S.autoDinoBone then
             local okStep=pcall(function()
                 local char=LocalPlayer.Character
                 local hrp=char and char:FindFirstChild("HumanoidRootPart")
                 if hrp then
                     local bonePart=getDinoBonePart(dinoBoneTarget)
-                    if not bonePart then
+                    if not bonePart and clock()>=nextScan then
+                        nextScan=clock()+0.5
                         dinoBoneTarget=findNearestDinoBone(hrp)
                         bonePart=getDinoBonePart(dinoBoneTarget)
                     end
@@ -2538,7 +2835,7 @@ task.spawn(function()
             local okSeat,seatParent,seatPos=pcall(function()
                 return seat and seat.Parent,seat and seat.Position
             end)
-            if seat and char and hrp and humanoid and okSeat and seatParent and seatPos
+            if seat and char and hrp and humanoid and okSeat and seatParent and seatPos and not writesPaused()
                 and not isUsingSelectedBoatSeat(seat,char,humanoid,hrp) then
                 pcall(function()
                     hrp.Position=Vector3.new(seatPos.X,seatPos.Y+2,seatPos.Z)
@@ -2547,7 +2844,8 @@ task.spawn(function()
                 end)
             end
         end
-        frameWait()
+        -- 30 Hz while on (three root writes per pass), idle cadence while off.
+        if S.autoBoatSeat then task.wait(1/30) else task.wait(IDLE_POLL) end
     end
 end)
 
@@ -2893,6 +3191,8 @@ function boatTweenTo(targetPos)
     local t0=clock()
     local arrived=false
     while active() do
+        -- CommF_ quiet window: no write; the flight resumes where it stopped.
+        while writesPaused() and active() do local pausedAt=clock(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
         local alpha=math.min((clock()-t0)/duration,1)
         local okMove=pcall(function()
             primary.Position=Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha)
@@ -2900,15 +3200,15 @@ function boatTweenTo(targetPos)
         if not okMove then break end
         zeroVelocity(primary)
         if alpha>=1 then arrived=true; break end
-        task.wait(0.01)
+        frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based, so the speed is unchanged
     end
     finish(arrived)
 end
 
 task.spawn(function()
     while alive() do
-        frameWait()
-        if not S.boatFlyEnabled or S.boatTweening then continue end
+        idleWait(S.boatFlyEnabled)
+        if not S.boatFlyEnabled or S.boatTweening or writesPaused() then continue end
         local boat=getBoat(); if not boat then continue end
         local okPrimary,primary=pcall(function() return boat.PrimaryPart end)
         if not okPrimary or not primary then continue end
@@ -2928,43 +3228,59 @@ task.spawn(function()
 end)
 
 -- ESP clear functions: remove every Drawing object, not just hide it, so the
--- caches cannot grow without bound across toggles.
-function clearEspLabels()
-    clearEspCache(S.espLabelCache)
-    S.espLabels={}
+-- caches cannot grow without bound across toggles. `state` defaults to this
+-- run's S (shutdownScript clears its own run's caches directly).
+function clearEspLabels(state)
+    state=state or S
+    clearEspCache(state.espLabelCache)
+    state.espLabels={}
 end
 
-function clearChestEspLabels()
-    clearEspCache(S.chestEspLabelCache)
-    S.chestEspLabels={}
+function clearChestEspLabels(state)
+    state=state or S
+    clearEspCache(state.chestEspLabelCache)
+    state.chestEspLabels={}
 end
 
-function clearBerryEspLabels()
-    S.berryScanGeneration=S.berryScanGeneration+1
-    clearEspCache(S.berryEspLabelCache)
-    S.berryEspLabels={}
+function clearBerryEspLabels(state)
+    state=state or S
+    state.berryScanGeneration=state.berryScanGeneration+1
+    clearEspCache(state.berryEspLabelCache)
+    state.berryEspLabels={}
+    -- The running scan sees the new generation at its next batch and stops;
+    -- clearing the flag lets a quick off/on start a fresh scan at once.
+    berryScanRunning=false
 end
 
-function clearBoatEsp()
-    clearEspCache(S.boatEspCache)
-    S.boatEspEntries={}
+function clearBoatEsp(state)
+    state=state or S
+    clearEspCache(state.boatEspCache)
+    state.boatEspEntries={}
 end
 
-function clearFlowerEsp()
-    clearEspCache(S.flowerEspCache)
-    S.flowerEspEntries={}
+function clearFlowerEsp(state)
+    state=state or S
+    clearEspCache(state.flowerEspCache)
+    state.flowerEspEntries={}
 end
 
-function clearChamBoxes()
-    clearEspCache(S.chamBoxCache)
-    S.chamBoxes={}
+function clearChamBoxes(state)
+    state=state or S
+    clearEspCache(state.chamBoxCache)
+    state.chamBoxes={}
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["20_ui2"] = true end
 -- @chunk 30_esp  (lines 2951-3650 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["30_esp"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
 BERRIES={
     {name="Green Toad Berry",   sphere="Sphere.011"},
     {name="Yellow Star Berry",  sphere="Sphere.022"},
@@ -3146,6 +3462,16 @@ berryScanRunning=false
 BERRY_SCAN_BATCH=80
 BERRY_DRAW_DISTANCE=10000
 BERRY_DRAW_DISTANCE_SQ=BERRY_DRAW_DISTANCE*BERRY_DRAW_DISTANCE
+-- Stability pass (Oct 15 2026): the scan walks the whole Workspace tree and
+-- the 1 s builder restarted it as soon as it finished, so with Berry ESP on
+-- the script traversed the map continuously. Now a scan starts at most every
+-- BERRY_RESCAN_INTERVAL s (the toggle forces one at once), skips the
+-- top-level folders that never hold map berries, and stops expanding after
+-- BERRY_SCAN_MAX_OBJECTS objects.
+BERRY_RESCAN_INTERVAL=15
+BERRY_SCAN_MAX_OBJECTS=60000
+BERRY_SCAN_SKIP_ROOTS={Enemies=true,Characters=true,Camera=true,Boats=true,ChestModels=true}
+berryNextScanAt=0
 
 function isBerryWorldObject(object)
     local current=object
@@ -3166,12 +3492,14 @@ function isBerryWorldObject(object)
     return false
 end
 
-function buildBerryEspLabels()
+function buildBerryEspLabels(force)
     if berryScanRunning then
         return
     end
+    if not force and clock()<berryNextScanAt then return end
 
     berryScanRunning=true
+    berryNextScanAt=clock()+BERRY_RESCAN_INTERVAL
     local generation=S.berryScanGeneration
     task.spawn(function()
         -- A scan that outlives its toggle (off/on while it is yielded) stops
@@ -3185,6 +3513,7 @@ function buildBerryEspLabels()
             local publishedKeys={}
             local queue={}
             local queueIndex=1
+            local queueCount=0
             local processed=0
 
             local char=LocalPlayer and LocalPlayer.Character or nil
@@ -3197,11 +3526,20 @@ function buildBerryEspLabels()
 
             local okRoots,roots=pcall(function() return Workspace:GetChildren() end)
             if okRoots and roots then
-                for _,root in pairs(roots) do table.insert(queue,root) end
+                for _,root in pairs(roots) do
+                    local okRootName,rootName=pcall(function() return root.Name end)
+                    if not (okRootName and BERRY_SCAN_SKIP_ROOTS[rootName]) then
+                        queueCount=queueCount+1
+                        queue[queueCount]=root
+                    end
+                end
             end
 
-            while current() and queueIndex<=#queue do
+            while current() and queueIndex<=queueCount do
                 local object=queue[queueIndex]
+                -- Drop the reference once taken, so the wrappers of the part of
+                -- the tree already scanned can be collected during the scan.
+                queue[queueIndex]=nil
                 queueIndex=queueIndex+1
 
                 local okName,objectName=pcall(function() return object.Name end)
@@ -3246,9 +3584,14 @@ function buildBerryEspLabels()
                     end
                 end
 
-                local okChildren,children=pcall(function() return object:GetChildren() end)
-                if okChildren and children then
-                    for _,child in pairs(children) do table.insert(queue,child) end
+                if queueCount<BERRY_SCAN_MAX_OBJECTS then
+                    local okChildren,children=pcall(function() return object:GetChildren() end)
+                    if okChildren and children then
+                        for _,child in pairs(children) do
+                            queueCount=queueCount+1
+                            queue[queueCount]=child
+                        end
+                    end
                 end
 
                 processed=processed+1
@@ -3263,12 +3606,15 @@ function buildBerryEspLabels()
                 S.berryEspLabels=activeEntries
             end
         end)
-        berryScanRunning=false
+        -- Only the scan of the current generation owns the flag (a quick
+        -- off/on clears it and may already have started a newer scan).
+        if S.berryScanGeneration==generation then berryScanRunning=false end
+        berryNextScanAt=clock()+BERRY_RESCAN_INTERVAL
         if not okScan then warnThrottled("berryScan","[laced.club] Berry scan failed: "..tostring(scanError),30) end
     end)
 end
 
-TWEEN_STEP_TIME=0.01
+TWEEN_STEP_TIME=1/60 -- was 0.01 (~100 CFrame writes/s through the bridge); safe mode doubles it
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
 -- target was reached, false when stopped (checkFn false, part gone, unload).
@@ -3277,6 +3623,30 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local okStart,startPos=pcall(function() return hrp.Position end)
     if not okStart or not startPos then return false end
     local rotationCF=rootRotation(hrp)
+    -- The local character's root is re-fetched every step and compared by key:
+    -- after a death or respawn the old root (possibly freed) is never touched.
+    local rootKey=instKey(hrp)
+    local isLocalRoot=false
+    pcall(function()
+        local char=LocalPlayer.Character
+        local cur=char and char:FindFirstChild("HumanoidRootPart")
+        isLocalRoot=cur~=nil and instKey(cur)==rootKey
+    end)
+    local function currentPart()
+        if not isLocalRoot then
+            local okParent,parent=pcall(function() return hrp.Parent end)
+            return (okParent and parent) and hrp or nil
+        end
+        -- Stop when the character left the DataModel (death/respawn) or its
+        -- root is no longer the one this tween started with.
+        local okCur,cur=pcall(function()
+            local char=LocalPlayer.Character
+            if not char or not char.Parent then return nil end
+            return char:FindFirstChild("HumanoidRootPart")
+        end)
+        if okCur and cur and instKey(cur)==rootKey then return cur end
+        return nil
+    end
     local function keepGoing()
         if not alive() then return false end
         if not checkFn then return true end
@@ -3291,15 +3661,32 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local moveSpeed=tonumber(speed) or 320
     if moveSpeed<=0 then moveSpeed=320 end
     local duration=distance/moveSpeed; local startTime=clock()
+    -- Write-rate cap: never two CFrame writes closer than 90% of the step,
+    -- even if task.wait resumes early (a bare task.wait() resumes ~2,400
+    -- times a second in Matcha), however long the flight is.
+    local lastWrite=-1e9
     while keepGoing() do
-        local okParent,parent=pcall(function() return hrp.Parent end)
-        if not okParent or not parent then return false end
-        local alpha=math.min((clock()-startTime)/duration,1)
-        if not moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,rotationCF) then
-            return false
+        local step=writeInterval(TWEEN_STEP_TIME)
+        local since=clock()-lastWrite
+        if writesPaused() then
+            -- CommF_ quiet window (quietInvoke): no write; the flight resumes
+            -- where it stopped (startTime moves by the pause).
+            local pausedAt=clock()
+            task.wait(0.05)
+            startTime=startTime+(clock()-pausedAt)
+        elseif since<step*0.9 then
+            task.wait(step-since)
+        else
+            local part=currentPart()
+            if not part then return false end
+            local alpha=math.min((clock()-startTime)/duration,1)
+            if not moveRoot(part,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,rotationCF) then
+                return false
+            end
+            lastWrite=clock()
+            if alpha>=1 then return true end
+            task.wait(step)
         end
-        if alpha>=1 then return true end
-        task.wait(TWEEN_STEP_TIME)
     end
     return false
 end
@@ -3665,11 +4052,17 @@ function renderChamEntry(entry,playerPos)
     setEntryVisible(entry,true)
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["30_esp"] = true end
 -- @chunk 40_combat  (lines 3651-4274 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["40_combat"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
 function localRootPosition()
     local char=LocalPlayer.Character
     local hrp=char and char:FindFirstChild("HumanoidRootPart")
@@ -3678,19 +4071,25 @@ function localRootPosition()
     return okPos and pos or nil
 end
 
+HARD_LOCK_LAST = 0
 function hardLockNpcCFrame(hrp,targetPos)
     if not hrp or not targetPos then return end
-    moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rootRotation(hrp))
+    -- 30 Hz cap (was every frame, 60 Hz). 4 ms slack so 60 Hz frame jitter
+    -- does not turn every other frame into every third.
+    local now=clock()
+    if now-HARD_LOCK_LAST<writeInterval(1/ROOT_WRITE_HZ)-0.004 then return end
+    HARD_LOCK_LAST=now
+    if not moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rootRotation(hrp)) then return end
 
     pcall(function()
         local velocity=hrp.Velocity
-        if velocity and velocity.X and velocity.Z then
+        if velocity and velocity.X and velocity.Z and math.abs(velocity.Y)>0.01 then
             hrp.Velocity=Vector3.new(velocity.X,0,velocity.Z)
         end
     end)
     pcall(function()
         local assemblyVelocity=hrp.AssemblyLinearVelocity
-        if assemblyVelocity and assemblyVelocity.X and assemblyVelocity.Z then
+        if assemblyVelocity and assemblyVelocity.X and assemblyVelocity.Z and math.abs(assemblyVelocity.Y)>0.01 then
             hrp.AssemblyLinearVelocity=Vector3.new(assemblyVelocity.X,0,assemblyVelocity.Z)
         end
     end)
@@ -3733,8 +4132,9 @@ end
 
 -- Head hitbox expansion shared by every click-farm loop. Remembers the
 -- original size so it can be restored when the fight ends.
+HEAD_APPLY_INTERVAL = 0.25
 function headExpander(model)
-    local state={head=nil,size=nil,canCollide=nil}
+    local state={head=nil,size=nil,canCollide=nil,nextApply=0}
     local okHead,head=pcall(function() return model:FindFirstChild("Head") end)
     if okHead and head then
         state.head=head
@@ -3743,20 +4143,39 @@ function headExpander(model)
             state.canCollide=head.CanCollide
         end)
     end
+    -- A dying enemy is destroyed shortly after its Humanoid reaches 0 HP: no
+    -- write may race that destroy.
+    local function modelAlive()
+        local okAlive,result=pcall(function()
+            if not model.Parent then return false end
+            local hum=model:FindFirstChildOfClass("Humanoid")
+            return hum~=nil and hum.Health~=nil and hum.Health>0
+        end)
+        return okAlive and result==true
+    end
     function state.apply()
+        if writesPaused() then return end -- CommF_ quiet window
+        local now=clock()
+        if now<state.nextApply then return end
+        state.nextApply=now+writeInterval(HEAD_APPLY_INTERVAL)
+        if not modelAlive() then return end
         local okCurrent,current=pcall(function() return model:FindFirstChild("Head") end)
-        if okCurrent and current then state.head=current end
-        if state.head then
-            local size=S.bigHitbox and 200 or 50
-            pcall(function()
-                state.head.Size=Vector3.new(size,size,size)
-                state.head.CanCollide=false
-            end)
-        end
+        if not okCurrent or not current then return end
+        state.head=current
+        local size=S.bigHitbox and 200 or 50
+        pcall(function()
+            if not current.Parent then return end
+            local s=current.Size
+            if not (s and s.X and math.abs(s.X-size)<0.01 and math.abs(s.Y-size)<0.01 and math.abs(s.Z-size)<0.01) then
+                current.Size=Vector3.new(size,size,size)
+            end
+            if current.CanCollide~=false then current.CanCollide=false end
+        end)
     end
     function state.restore()
         local target=state.head
         if not target or not state.size then return end
+        if not modelAlive() then return end
         pcall(function()
             if target.Parent then
                 target.Size=state.size
@@ -3827,7 +4246,10 @@ function farmAttack(hrp, checkFn, enemyName, useTween, maxDistance, attackFn, at
         if now-lastClick>=hitDelay then
             lastClick=now
             if attackFn then
-                task.spawn(attackFn, nearest)
+                -- Matcha's task.spawn forwards no arguments: attackFn used to
+                -- get nil and hit the first enemy in range, not this target.
+                local target=nearest
+                task.spawn(function() attackFn(target) end)
             else
                 farmClick()
             end
@@ -3883,7 +4305,7 @@ BasicM1 = {
     comboReset   = 0.75,  -- client resets the combo after 0.75 s without a swing
     maxExtra     = 9,     -- extra rigs per swing (client cap: 10 rigs total, Buddha only)
     maxDist      = REMOTE_MAX_DIST,
-    minInterval  = 0.045, -- per caller tag; farms call at 0.05 s
+    minInterval  = 0.25,  -- per caller tag (was 0.045: ~20 swings = 40 FireServer/s); the client's own M1 is ~3-4/s
     noDamageSecs = 2.0,   -- watchdog: advance profile after this long with no HP loss
     requireTool  = true,  -- the server-side M1 needs an equipped weapon
     hitParts     = { "Head", "UpperTorso", "LowerTorso", "LeftLowerLeg", "RightLowerLeg",
@@ -4004,10 +4426,17 @@ end
 -- existing safeRemote/remoteFailing tags ("" -> "RegisterAttack"/"RegisterHit",
 -- "NPC Aura " -> "NPC Aura RegisterHit", ...), so the back-off and the Remote
 -- Mode auto-off keep working unchanged.
+function BasicM1.ready(tagPrefix)
+    return clock() - (BasicM1.lastFireBy[tagPrefix] or 0) >= writeInterval(BasicM1.minInterval)
+end
+
 function BasicM1.fire(tagPrefix, primaryPart, extras)
     if not primaryPart or not ensureRemotes() then return false end
+    -- Never swing while a CommF_ invoke (quest accept/abandon, AddPoint) is
+    -- pending: the remotes are serialised (see quietInvoke in 00_core).
+    if remoteInvokePending() then return false end
+    if not BasicM1.ready(tagPrefix) then return false end
     local now = clock()
-    if now - (BasicM1.lastFireBy[tagPrefix] or 0) < BasicM1.minInterval then return false end
     BasicM1.lastFireBy[tagPrefix] = now
     local prof = BasicM1.profiles[BasicM1.profile] or BasicM1.profiles[1]
     if now - BasicM1.lastSwing > BasicM1.comboReset then BasicM1.combo = 0 end
@@ -4019,8 +4448,21 @@ function BasicM1.fire(tagPrefix, primaryPart, extras)
         safeRemote(tagPrefix .. "RegisterAttack", _remoteRegAtk, "FireServer", BasicM1.attackLen)
     end
     frameWait()
+    -- The frame above can despawn rigs collected before it: re-check them so
+    -- RegisterHit never carries a part that has left the DataModel.
+    local function attached(part)
+        local okParent, parent = pcall(function() return part.Parent end)
+        return okParent and parent ~= nil
+    end
+    if not attached(primaryPart) or remoteInvokePending() then return false end
+    local fresh = {}
+    for _, pair in ipairs(extras or {}) do
+        if type(pair) == "table" and pair[1] and pair[2] and BasicM1.alive(pair[1]) and attached(pair[2]) then
+            fresh[#fresh + 1] = pair
+        end
+    end
     local okHit = safeRemote(tagPrefix .. "RegisterHit", _remoteRegHit, "FireServer",
-        primaryPart, extras or {}, nil, BasicM1.sessionId())
+        primaryPart, fresh, nil, BasicM1.sessionId())
     _lastRemoteFire = clock()
     return okHit
 end
@@ -4058,6 +4500,8 @@ end
 -- farmClick() only as the fallback when Remote Mode is off.
 function basicAttack(target)
     if S.remoteMode then
+        -- Swing gate first: also skips the Enemies scan in BasicM1.collect.
+        if not BasicM1.ready("") then return false end
         if BasicM1.requireTool and type(getCurrentlyHeldTool) == "function" then
             local okTool, tool = pcall(getCurrentlyHeldTool)
             if okTool and not tool then return false end
@@ -4242,7 +4686,9 @@ do
                             local attackDelay=useRemote and 0.05 or 0.06
                             if now-lastAttack>=attackDelay then
                                 lastAttack=now
-                                if useRemote then task.spawn(remoteAttack, target)
+                                if useRemote then
+                                    local swingTarget=target -- task.spawn forwards no arguments
+                                    task.spawn(function() remoteAttack(swingTarget) end)
                                 else farmClick() end
                             end
                             frameWait()
@@ -4280,11 +4726,14 @@ do
                 and Dungeon.targetingObjective and dungeonIsAlive(Dungeon.target) then
                 for _,keyCode in pairs(skillKeys) do
                     if not S.dungeonEnabled or not dungeonIsAlive(Dungeon.target) then break end
-                    pcall(function()
-                        keypress(keyCode)
-                        task.wait(0.04)
-                        keyrelease(keyCode)
-                    end)
+                    -- Keys go to whatever window has focus: only with Roblox in front.
+                    if robloxFocused() then
+                        pcall(function()
+                            keypress(keyCode)
+                            task.wait(0.04)
+                            keyrelease(keyCode)
+                        end)
+                    end
                     task.wait(0.16)
                 end
             end
@@ -4294,11 +4743,18 @@ do
 
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["40_combat"] = true end
 -- @chunk 50_farms  (lines 4275-5015 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["50_farms"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
 function getChestType(chest)
     local okName,name=pcall(function() return chest and chest.Name end)
     if not okName or type(name)~="string" then return "Other" end
@@ -4353,6 +4809,9 @@ function getPriorityChest(children,hrp)
 end
 
 task.spawn(function()
+    -- An unreachable chest (tween never ends within 2 studs) is given up after
+    -- three tries instead of being picked again every 0.25 s forever.
+    local chestTries={}
     while alive() do
         if S.autoFarming and not farmPriorityBlocked() then
             local reachedChest=false
@@ -4379,9 +4838,14 @@ task.spawn(function()
                             local dx=currentPos.X-destination.X
                             local dy=currentPos.Y-destination.Y
                             local dz=currentPos.Z-destination.Z
+                            local chestKey=trackedInstanceKey(chest)
                             if dx*dx+dy*dy+dz*dz<=4 then
-                                S.handledChests[trackedInstanceKey(chest)]=true
+                                S.handledChests[chestKey]=true
+                                chestTries[chestKey]=nil
                                 reachedChest=true
+                            elseif S.autoFarming and not farmPriorityBlocked() then
+                                chestTries[chestKey]=(chestTries[chestKey] or 0)+1
+                                if chestTries[chestKey]>=3 then S.handledChests[chestKey]=true; chestTries[chestKey]=nil end
                             end
                         end
                     end
@@ -4612,6 +5076,10 @@ function partStillThere(part)
 end
 
 task.spawn(function()
+    -- A fruit still there after a full collect attempt is skipped for 60 s, so
+    -- it cannot hold the priority flag (which pauses every other farm) in a
+    -- 3 s loop forever.
+    local fruitBlock={}
     while alive() do
         if S.autoFruits then
             local okStep,stepError=pcall(function()
@@ -4621,9 +5089,11 @@ task.spawn(function()
                 local bestPart, bestDist=nil, math.huge
                 local okHrp, hrpPos=pcall(function() return hrp.Position end)
                 if okHrp and hrpPos and hrpPos.X and hrpPos.Y and hrpPos.Z then
+                    local now=clock()
+                    for key,untilAt in pairs(fruitBlock) do if now>=untilAt then fruitBlock[key]=nil end end
                     for _, fruit in pairs(getWorkspaceFruits()) do
                         local fp, fpPos=fruit.part, getSafeFruitPosition(fruit.part)
-                        if fp and fpPos then
+                        if fp and fpPos and not fruitBlock[getFruitInstanceKey(fp)] then
                             local dx=fpPos.X-hrpPos.X
                             local dy=fpPos.Y-hrpPos.Y
                             local dz=fpPos.Z-hrpPos.Z
@@ -4648,12 +5118,15 @@ task.spawn(function()
 
                     if arrived and S.autoFruits then
                         task.wait(1)
-                        equipWeaponSlot(S.weaponSlot)
+                        if alive() and S.autoFruits then equipWeaponSlot(S.weaponSlot) end
                     end
 
                     local fruitWaitStart=clock()
                     while alive() and S.autoFruits and partStillThere(bestPart) and clock()-fruitWaitStart<3 do
                         task.wait(0.05)
+                    end
+                    if alive() and S.autoFruits and partStillThere(bestPart) then
+                        fruitBlock[getFruitInstanceKey(bestPart)]=clock()+60
                     end
                 end
             end
@@ -4670,15 +5143,22 @@ end)
 
 task.spawn(function()
     local equipping=false
+    -- Bounded retry: after 5 failed attempts in a row (empty slot, lost tool)
+    -- one attempt every 5 s instead of a key tap every ~0.4 s.
+    local failures=0
+    local nextTry=0
     while alive() do
         local farming=S.autoFarmNearest or S.autoNpcFarm or S.autoFarmLevel or S.autoRaid or S.autoBossFarm or S.autoMaterialFarm or S.autoSeaEvent
             or S.autoFarmQuest or S.dungeonEnabled or S.autoMastery
+        if not farming then failures=0 end
         -- One equip attempt at a time: overlapping key taps toggle the tool back off.
-        if farming and not equipping and not getCurrentlyHeldTool() then
+        if farming and not equipping and clock()>=nextTry and not getCurrentlyHeldTool() then
             local selectedSlot=S.weaponSlot
             equipping=true
             task.spawn(function()
-                pcall(equipWeaponSlot,selectedSlot)
+                local okEquip,equipped=pcall(equipWeaponSlot,selectedSlot)
+                if okEquip and equipped then failures=0 else failures=failures+1 end
+                if failures>=5 then nextTry=clock()+5 end
                 equipping=false
             end)
         end
@@ -4723,12 +5203,9 @@ task.spawn(function()
                 notify("NPC Farm: going to "..tostring(island.name),"laced.club",2)
                 tweenTo(hrp, Vector3.new(ip.X,ip.Y,ip.Z), S.NPC_TWEEN_SPEED, function() return S.autoNpcFarm and not farmPriorityBlocked() end)
                 task.wait(0.5)
-                local char2=LocalPlayer.Character
-                if char2 then
-                    for _,part in pairs(char2:GetChildren()) do
-                        pcall(function() if isA(part,"BasePart") then part.CanCollide=false end end)
-                    end
-                end
+                -- Same parts as before (every BasePart child of the character);
+                -- restored below when the farm stops (it used to stay off).
+                afl_setCanCollide(false)
                 while alive() and S.autoNpcFarm and not farmPriorityBlocked() do
                     local hrp2=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if not hrp2 then task.wait(0.1); break end
@@ -4743,6 +5220,7 @@ task.spawn(function()
                 end
             end
             end)
+            if S.collisionOff then pcall(afl_setCanCollide,true) end
             if not okStep then warnThrottled("npcFarm","[laced.club] NPC farm step failed: "..tostring(stepError),15) end
             task.wait(0.1)
         else task.wait(0.1) end
@@ -4882,15 +5360,31 @@ end
 
 -- afl_setCanCollide(on) sets CanCollide to `on` (it used to write `not on`,
 -- so the travel tween ran WITH collisions and noclip was left on afterwards).
+-- Writes only parts whose value differs (fewer bridge writes) and records in
+-- S.collisionOff that this run switched collisions off, so unload restores
+-- them (shutdown hook below).
 function afl_setCanCollide(on)
     local char=afl_getCharacter()
     if not char then return end
+    if writesPaused() then return end
+    S.collisionOff=(on==false)
     for _,c in pairs(char:GetChildren()) do
         pcall(function()
-            if isA(c,"BasePart") then c.CanCollide=on end
+            if isA(c,"BasePart") and c.CanCollide~=on then c.CanCollide=on end
         end)
     end
 end
+onShutdown(function()
+    if S.collisionOff then
+        S.collisionOff=false
+        local char=afl_getCharacter()
+        if char then
+            for _,c in pairs(char:GetChildren()) do
+                pcall(function() if isA(c,"BasePart") and c.CanCollide~=true then c.CanCollide=true end end)
+            end
+        end
+    end
+end)
 
 function afl_teleportTo(position)
     local char,hrp=afl_getCharacter()
@@ -5040,11 +5534,20 @@ function afl_waitDialogueOption(optionNumber,timeout,notAddress)
     return lastObject,lastCenter
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["50_farms"] = true end
 -- @chunk 60_afq  (lines 5016-6378 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["60_afq"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
+local AFQ = AFQ
+local AFQ_DEBUG = AFQ_DEBUG
 AFL_QUEST_OFFSET_X=70
 AFL_QUEST_OFFSET_Y=50
 
@@ -5169,11 +5672,30 @@ end
 -- completed, any other number = level required. Under Matcha Hybrid mode the
 -- invoke returns a boolean (true) instead of the code, so a boolean true is
 -- taken as accepted.
+--
+-- Stability pass (Oct 15 2026): the user reports the client crashing
+-- consistently when this remote pickup fires. Every StartQuest now goes
+-- through quietInvoke (00_core: no part writes and no other remote for
+-- AFQ_REMOTE_QUIET_BEFORE/AFTER s around the invoke, one CommF_ invoke at a
+-- time), at most one per AFQ_REMOTE_MIN_INTERVAL s for the same quest, and
+-- AFQ_DEBUG.remoteAcceptOff = true stops it altogether (Auto Farm Quest then
+-- accepts through the giver dialogue, Level Farm clicks its dialogue).
+AFQ_REMOTE_MIN_INTERVAL=10 -- s between two StartQuest invokes for one quest, and between two AbandonQuest
+questRemoteLastAt={}       -- "giverKey#index" -> clock() of the last StartQuest invoke
+function afl_questRemoteWait(giverKey,questIndex)
+    local last=questRemoteLastAt[tostring(giverKey).."#"..tostring(questIndex)]
+    if not last then return 0 end
+    return math.max(0,AFQ_REMOTE_MIN_INTERVAL-(clock()-last))
+end
 function afl_startQuestRemote(giverKey,questIndex)
+    if AFQ_DEBUG and AFQ_DEBUG.remoteAcceptOff then return false,"remote accept disabled (AFQ_DEBUG.remoteAcceptOff)" end
     if remoteFailing("StartQuest") then return false,"StartQuest remote keeps failing" end
+    local left=afl_questRemoteWait(giverKey,questIndex)
+    if left>0 then return false,"StartQuest for this quest was sent less than "..AFQ_REMOTE_MIN_INTERVAL.."s ago" end
     local remote=afl_getQuestRemote()
     if not remote then return false,"CommF_ not found" end
-    local ok,result=safeRemote("StartQuest",remote,"InvokeServer","StartQuest",giverKey,questIndex)
+    questRemoteLastAt[tostring(giverKey).."#"..tostring(questIndex)]=clock()
+    local ok,result=quietInvoke("StartQuest",remote,"StartQuest",giverKey,questIndex)
     if not ok then return false,tostring(result) end
     if type(result)=="number" then
         if result==0 then return true end
@@ -5209,10 +5731,19 @@ function afl_setQuest()
         warnThrottled("questRemote","[laced.club] Remote quest accept failed ("..tostring(reason).."); clicking the dialogue instead",30)
     end
     AFL.lastQuestVia="click"
+    -- The clicks go to whatever window has focus, and the farm may be
+    -- switched off during the ~3 s of waits: check both between the clicks.
+    local function stillOn() return alive() and S.autoFarmLevel and robloxFocused() end
+    if not robloxFocused() then
+        warnThrottled("questClickFocus","[laced.club] Level Farm: the dialogue quest pickup needs the Roblox window in front",30)
+        return false
+    end
 
     wait(0.5)
+    if not stillOn() then return false end
     mouse1press(); wait(0.08); mouse1release()
     wait(1)
+    if not stillOn() then return false end
 
     local originalOption1=nil
     local initialOption1=afl_waitDialogueOption(1,3)
@@ -5221,6 +5752,7 @@ function afl_setQuest()
     local selected=afl_clickDialogueOption(quest.questButton,3)
     if not selected then return false end
     wait(0.35)
+    if not stillOn() then return false end
 
     local accepted=afl_clickDialogueOption(1,3,originalOption1)
     if not accepted then
@@ -5805,7 +6337,7 @@ function afq_bossDecide(boss,fallback)
         if not AFQ.bossUpAt then AFQ.bossUpAt=clock() end
         local done
         if onEntry then
-            done=AFQ.kills>=entry.count or (AFQ.trackerSeen and not afq_trackerFrame())
+            done=AFQ.kills>=entry.count or afq_trackerGone(afq_trackerFrame())
         else
             local k,n=afq_trackerProgress()
             done=(k~=nil and n~=nil and k>=n) or not afq_trackerFrame()
@@ -5858,24 +6390,77 @@ function afq_trackerFrame()
     return ok and frame or nil
 end
 
--- "k/n" progress from the tracker when it shows one; nil otherwise.
-function afq_trackerProgress()
+-- Address key of the tracker frame now on screen (nil: none).
+function afq_trackerKey()
     local frame=afq_trackerFrame()
+    return frame and instKey(frame) or nil
+end
+
+-- "The tracker seen after the accept has gone" = quest completed, but only
+-- after AFQ_TRACKER_GONE_SECS without a frame: a React remount (respawn, UI
+-- reload) used to read as a completed quest from one missing sample.
+AFQ_TRACKER_GONE_SECS=1.5
+function afq_trackerGone(tracker)
+    if tracker then AFQ.trackerMissingSince=nil; return false end
+    if not AFQ.trackerSeen then return false end
+    local now=clock()
+    if not AFQ.trackerMissingSince then AFQ.trackerMissingSince=now; return false end
+    return now-AFQ.trackerMissingSince>=AFQ_TRACKER_GONE_SECS
+end
+
+-- Text of every TrackedQuestFrame descendant, from one GetDescendants at most
+-- every AFQ_TRACKER_TTL s (afq_waitTrackerFor polls at 10 Hz). Strings are
+-- cached, never Instances, so a React re-render leaves no stale handles; a
+-- different frame (tracker closed and reopened) invalidates the cache.
+AFQ_TRACKER_TTL=1
+AFQ_TRACKER_CACHE={key=nil,at=-1e9,texts=nil}
+function afq_trackerTexts(frame)
     if not frame then return nil end
+    local key=instKey(frame)
+    local cache=AFQ_TRACKER_CACHE
+    local now=clock()
+    if cache.texts and cache.key==key and now-cache.at<AFQ_TRACKER_TTL then return cache.texts end
     local okDesc,descendants=pcall(function() return frame:GetDescendants() end)
     if not okDesc or not descendants then return nil end
+    local texts={}
     for _,d in pairs(descendants) do
         local okText,text=pcall(function() return d.Text end)
-        if okText and type(text)=="string" then
-            local k,n=string.match(text,"(%d+)%s*/%s*(%d+)")
-            if k and n then return tonumber(k),tonumber(n) end
-        end
+        if okText and type(text)=="string" and text~="" then texts[#texts+1]=text end
+    end
+    cache.key=key; cache.at=now; cache.texts=texts
+    return texts
+end
+
+-- "k/n" progress from the tracker when it shows one; nil otherwise.
+function afq_trackerProgress()
+    local texts=afq_trackerTexts(afq_trackerFrame())
+    if not texts then return nil end
+    for _,text in ipairs(texts) do
+        local k,n=string.match(text,"(%d+)%s*/%s*(%d+)")
+        if k and n then return tonumber(k),tonumber(n) end
     end
     return nil
 end
 
+-- AFQ.stepGen is the generation the running step started with; the toggle
+-- callback bumps AFQ.gen, so a step left over from before a quick off/on
+-- stops at its next check instead of writing into the freshly reset state.
 function afq_farming()
-    return alive() and S.autoFarmQuest==true and not farmPriorityFeatureActive()
+    return alive() and S.autoFarmQuest==true and AFQ.stepGen==AFQ.gen and not farmPriorityFeatureActive()
+end
+
+-- Sleep up to seconds, in steps of at most 0.25 s, ending early when the
+-- farm stops (a plain wait(60) would keep the step alive after toggle off).
+function afq_sleep(seconds)
+    local untilAt=clock()+(tonumber(seconds) or 0)
+    repeat
+        task.wait(math.min(0.25,math.max(0.05,untilAt-clock())))
+    until clock()>=untilAt or not afq_farming()
+end
+
+-- Bounded retry backoff: 3 s, 6 s, 12 s ... at most 60 s.
+function afq_backoff(fails)
+    return math.min(3*2^(math.max(1,fails)-1),60)
 end
 
 -- Level the quest selector uses: AFQ_DEBUG.forceLevel when it is a number
@@ -5898,8 +6483,8 @@ end
 function afq_trackerQuestIs(q)
     local frame=afq_trackerFrame()
     if not frame then return nil end
-    local okDesc,descendants=pcall(function() return frame:GetDescendants() end)
-    if not okDesc or not descendants then return "unknown" end
+    local texts=afq_trackerTexts(frame)
+    if not texts then return "unknown" end
     local names={}
     for _,n in ipairs({q.enemy,q.internalName}) do
         if type(n)=="string" and n~="" then
@@ -5909,9 +6494,8 @@ function afq_trackerQuestIs(q)
         end
     end
     local sawObjective=false
-    for _,d in pairs(descendants) do
-        local okText,text=pcall(function() return d.Text end)
-        if okText and type(text)=="string" then
+    for _,text in ipairs(texts) do
+        do
             local lower=string.lower(string.match(text,"^%s*(.-)%s*$") or text)
             local objective=string.find(lower,"^defeat%s")~=nil
             if objective then sawObjective=true end
@@ -5935,15 +6519,98 @@ end
 -- InvokeServer returns only a boolean, so the refusal cannot be read from
 -- the result and the old quest has to be abandoned first. Waits up to 1.5 s
 -- (0.1 s steps) for the tracker to go away.
-function afq_abandon()
+--
+-- Stability pass (Oct 15 2026): the local quest state used to be wiped as the
+-- first statement, before the remote ran or was seen to work, and the result
+-- was the pcall status only. Now: no tracker on screen = nothing to abandon
+-- (local state dropped, no invoke); otherwise at most one AbandonQuest per
+-- AFQ_REMOTE_MIN_INTERVAL s through quietInvoke, and the local state is
+-- dropped only once the tracker is gone. Returns ok, reason; on false the
+-- held quest is kept and the caller backs off.
+function afq_clearHeld()
     AFQ.current=nil; AFQ.accepted=false; AFQ.trackerSeen=false; AFQ.kills=0; AFQ.selectedNpc=nil
-    if AFQ_DEBUG.noAccept then return true end
+    AFQ.trackerMissingSince=nil
+end
+function afq_abandon()
+    if AFQ_DEBUG.noAccept then afq_clearHeld(); return true end
+    if not afq_trackerFrame() then afq_clearHeld(); return true end
+    if AFQ_DEBUG.remoteAcceptOff then
+        return false,"AbandonQuest is off with AFQ_DEBUG.remoteAcceptOff (finish or abandon the quest by hand)"
+    end
+    local since=clock()-(AFQ.lastAbandonAt or -1e9)
+    if since<AFQ_REMOTE_MIN_INTERVAL then
+        return false,"AbandonQuest was sent "..math.floor(since).."s ago (at most one per "..AFQ_REMOTE_MIN_INTERVAL.."s)"
+    end
+    if remoteFailing("AbandonQuest") then return false,"AbandonQuest remote keeps failing" end
     local remote=afl_getQuestRemote()
-    if not remote then return false end
-    local ok=safeRemote("AbandonQuest",remote,"InvokeServer","AbandonQuest")
-    local deadline=clock()+1.5
-    while afq_farming() and afq_trackerFrame() and clock()<deadline do task.wait(0.1) end
-    return ok
+    if not remote then return false,"CommF_ not found" end
+    AFQ.lastAbandonAt=clock()
+    local ok,err=quietInvoke("AbandonQuest",remote,"AbandonQuest")
+    if not ok then return false,"AbandonQuest failed: "..tostring(err) end
+    -- InvokeServer returns only a boolean: the tracker going away is the
+    -- proof. Polled at 2 Hz (FindFirstChild only), at most 2 s.
+    local deadline=clock()+2
+    while afq_farming() and afq_trackerFrame() and clock()<deadline do task.wait(0.5) end
+    if afq_trackerFrame() then return false,"the tracker still shows a quest after AbandonQuest" end
+    afq_clearHeld()
+    return true
+end
+
+-- Accept proof (Matcha's InvokeServer returns only a boolean): poll the
+-- tracker until it shows quest q, for at most seconds. Stability pass (Oct 15
+-- 2026): polled at AFQ_TRACKER_POLL (2 Hz) through the cached tracker
+-- strings (afq_trackerTexts, at most one GetDescendants per second), starting
+-- after quietInvoke's quiet window, not at 10 Hz right after the invoke.
+-- False whenever the farm was switched off (it used to return the last
+-- poll's result). An unreadable tracker ("unknown") counts only when a
+-- tracker frame appeared during this accept (none before, or a different
+-- one: beforeKey = afq_trackerKey() taken before the invoke); a frame that
+-- was already there proves nothing.
+AFQ_REMOTE_ACCEPT_WAIT=3    -- s the tracker may take to show an accepted quest (was 2 s at 10 Hz)
+AFQ_TRACKER_POLL=0.5
+function afq_waitTrackerFor(q,seconds,beforeKey)
+    local deadline=clock()+(seconds or AFQ_REMOTE_ACCEPT_WAIT)
+    local state=afq_trackerQuestIs(q)
+    while state~="same" and clock()<deadline and afq_farming() do
+        task.wait(AFQ_TRACKER_POLL)
+        state=afq_trackerQuestIs(q)
+    end
+    if not afq_farming() then return false end
+    if state=="same" then return true end
+    if state=="unknown" then
+        local key=afq_trackerKey()
+        return key~=nil and key~=beforeKey
+    end
+    return false
+end
+
+-- Seconds until a StartQuest for q may be sent (0 = now): never inside the
+-- switch cooldown, at most one per AFQ_REMOTE_MIN_INTERVAL s per quest.
+function afq_acceptWait(q)
+    local cooldown=AFQ_SWITCH_COOLDOWN-(clock()-(AFQ.lastSwitch or -1e9))
+    return math.max(0,cooldown,afl_questRemoteWait(q.giverKey,q.questIndex))
+end
+
+-- No-remote accept for the A/B test (AFQ_DEBUG.remoteAcceptOff): the Level
+-- Farm dialogue clicks at the giver (questButton = questIndex for every
+-- quest, checked against the Quests module). Needs Roblox in front.
+function afq_acceptByDialogue(q)
+    if not robloxFocused() then return false,"the dialogue accept needs the Roblox window in front" end
+    wait(0.5)
+    if not afq_farming() then return false,"stopped" end
+    mouse1press(); wait(0.08); mouse1release()
+    wait(1)
+    if not afq_farming() then return false,"stopped" end
+    local original=nil
+    local first=afl_waitDialogueOption(1,3)
+    if first then pcall(function() original=first.Address end) end
+    if not afl_clickDialogueOption(q.questIndex,3) then return false,"quest option "..q.questIndex.." not found in the dialogue" end
+    wait(0.35)
+    if not afq_farming() then return false,"stopped" end
+    local accepted=afl_clickDialogueOption(1,3,original)
+    if not accepted then wait(0.4); accepted=afl_clickDialogueOption(1,1) end
+    if not accepted then return false,"accept option not found in the dialogue" end
+    return true
 end
 
 -- Cheap level read during a fight: when the selection no longer matches the
@@ -5994,7 +6661,7 @@ function afq_holdAt(position,seconds)
             moveRoot(root,position.X,position.Y,position.Z,rootRotation(root))
             zeroVelocity(root)
         end
-        frameWait()
+        task.wait(writeInterval(1/ROOT_WRITE_HZ))
     until clock()>=deadline or not afq_farming()
 end
 
@@ -6070,8 +6737,12 @@ function afq_nearestEnemy(q)
     local ok,enemies=pcall(function() return folder:GetChildren() end)
     if not ok or not enemies then return nil end
     local best,bestD=nil,math.huge
+    local now=clock()
+    local blocked=AFQ.npcBlock or {}
+    for key,untilAt in pairs(blocked) do if now>=untilAt then blocked[key]=nil end end
+    local anyBlocked=next(blocked)~=nil
     for _,enemy in pairs(enemies) do
-        if enemy and enemy.Parent and isA(enemy,"Model") then
+        if enemy and enemy.Parent and isA(enemy,"Model") and not (anyBlocked and blocked[instKey(enemy)]) then
             local hrp=enemy:FindFirstChild("HumanoidRootPart")
             local hum=enemy:FindFirstChildOfClass("Humanoid")
             local name=""
@@ -6104,7 +6775,12 @@ function afq_fight(npc)
     AFQ.activeHead=head
     while hum and hum.Health>0 and partStillThere(npc) and afq_farming() do
         if not partStillThere(hrp) then break end
-        if clock()-fightStart>50 then break end
+        if clock()-fightStart>50 then
+            -- Not damageable (out of reach, immune, safe zone): skip it for 60 s
+            -- instead of fighting it again in 50 s blocks forever.
+            if type(AFQ.npcBlock)=="table" then AFQ.npcBlock[instKey(npc)]=clock()+60 end
+            break
+        end
         local char,playerHrp=afl_getCharacter()
         if not char or not playerHrp then break end
         local okEnemy,enemyPos=pcall(function() return hrp.Position end)
@@ -6135,7 +6811,7 @@ function afq_fight(npc)
         elseif useRemote then
             if now-lastRemoteAttack>=0.05 then remoteAttack(npc); lastRemoteAttack=now end
         else
-            if now-lastClick>=0.06 then farmClick(); lastClick=now end
+            if now-lastClick>=writeInterval(0.06) then farmClick(); lastClick=now end
         end
         frameWait()
         hrp=npc:FindFirstChild("HumanoidRootPart")
@@ -6172,7 +6848,7 @@ function afq_step()
     -- interleave switches to the boss only after the fallback quest is done,
     -- and back to the fallback after the boss quest's single kill.
     if held and not afq_sameQuest(held,q) and AFQ.accepted and AFQ.entry and afq_sameQuest(held,AFQ.entry)
-        and (AFQ.kills>=AFQ.entry.count or (AFQ.trackerSeen and not afq_trackerFrame())) then
+        and (AFQ.kills>=AFQ.entry.count or afq_trackerGone(afq_trackerFrame())) then
         AFQ.current=nil; held=nil
     end
     if held and not afq_sameQuest(held,q) then
@@ -6190,12 +6866,26 @@ function afq_step()
             afq_logSwitch("Lv "..level..": switching "..held.giverKey.." #"..held.questIndex
                 .." -> "..q.giverKey.." #"..q.questIndex.." (abandoning the old quest)")
             AFQ.lastSwitch=clock()
-            afq_abandon()
+            local okAbandon,why=afq_abandon()
+            if not okAbandon then
+                -- The held quest is kept (and farmed meanwhile, see the cooldown
+                -- branch above); the next switch attempt waits a bounded backoff.
+                AFQ.abandonFails=(AFQ.abandonFails or 0)+1
+                local backoff=math.max(AFQ_SWITCH_COOLDOWN,afq_backoff(AFQ.abandonFails))
+                AFQ.lastSwitch=clock()+backoff-AFQ_SWITCH_COOLDOWN
+                afq_logSwitch("Lv "..level..": abandon of "..held.giverKey.." #"..held.questIndex
+                    .." not confirmed ("..tostring(why).."), keeping it; retry in "..math.ceil(backoff).."s")
+                afq_sleep(0.5)
+                return
+            end
+            AFQ.abandonFails=0
             AFQ.entry=nil
             if not afq_farming() then return end
         end
     end
     local function setStatus(extra)
+        -- A step that outlived its toggle must not overwrite the "off" status.
+        if not afq_farming() then return end
         local mode=AFQ.bossMode
         local text
         if mode and q.boss and afq_sameQuest(q,AFQ.bossQuest) then
@@ -6213,10 +6903,18 @@ function afq_step()
     end
     if AFQ.entry~=q then
         AFQ.entry=q; AFQ.kills=0; AFQ.accepted=false; AFQ.trackerSeen=false; AFQ.selectedNpc=nil
-        AFQ.switchPending=false
+        AFQ.switchPending=false; AFQ.trackerMissingSince=nil
     end
     local tracker=afq_trackerFrame()
+    local trackerGone=afq_trackerGone(tracker)
     if tracker then AFQ.trackerSeen=true end
+    -- The tracker seen after the accept is missing, but not yet for
+    -- AFQ_TRACKER_GONE_SECS: look again shortly instead of fighting on.
+    if AFQ.accepted and AFQ.trackerSeen and not tracker and not trackerGone then
+        setStatus(" (checking the quest tracker)")
+        afq_sleep(0.5)
+        return
+    end
     -- The tracker already shows the selected quest (accepted before the toggle
     -- went on, or by the player): hold it, no giver trip.
     if not AFQ.accepted and tracker and afq_trackerQuestIs(q)=="same" then
@@ -6226,53 +6924,163 @@ function afq_step()
     end
     -- Re-accept when nothing is accepted yet, the local count is complete, or
     -- the tracker that was seen after the accept has gone (quest completed).
-    local completed=AFQ.accepted and (AFQ.kills>=q.count or (AFQ.trackerSeen and not tracker))
+    local completed=AFQ.accepted and (AFQ.kills>=q.count or trackerGone)
     local needAccept=not AFQ.accepted or completed
     if needAccept then
         if completed then AFQ.current=nil end -- the held quest is done
         AFQ.kills=0
-        setStatus(" accepting")
-        AFQ_DEBUG.phase="tween-giver"
-        local giverPos=AFQ.giverPos[q.giverKey]
-        local atGiver=afq_teleportTo(giverPos)
-        if not afq_farming() then return end
-        if atGiver then afq_holdAt(giverPos,0.5) else wait(0.5) end
-        if not afq_farming() then return end -- toggled off during the wait: do not accept
-        -- Re-check the level right before every (re-)accept: the completed
-        -- quest's EXP can level the player after this step's first read. A
-        -- different pick goes back through the top of afq_step (switch/travel).
-        local freshLevel=afq_level()
-        local fresh=freshLevel and afq_select(freshLevel) or nil
-        if fresh and not afq_sameQuest(fresh,q) then
-            AFQ.status="Lv "..freshLevel..": "..fresh.giverKey.." #"..fresh.questIndex.." selected before accepting "
-                ..q.giverKey.." #"..q.questIndex
-            afq_updateLabel()
-            AFQ.entry=nil
-            return
+        -- Level re-check plus the one-active-quest guard, run right before
+        -- every StartQuest. The completed quest's EXP can level the player
+        -- after this step's first read: a different pick goes back through
+        -- the top of afq_step (switch/travel). Another quest the tracker shows
+        -- (or a different one this loop still holds) is abandoned first.
+        -- False when this step should return.
+        local function preAccept()
+            local freshLevel=afq_level()
+            local fresh=freshLevel and afq_select(freshLevel) or nil
+            if fresh and not afq_sameQuest(fresh,q) then
+                AFQ.status="Lv "..freshLevel..": "..fresh.giverKey.." #"..fresh.questIndex.." selected before accepting "
+                    ..q.giverKey.." #"..q.questIndex
+                afq_updateLabel()
+                AFQ.entry=nil
+                return false
+            end
+            if afq_trackerQuestIs(q)=="other" or (AFQ.current and not afq_sameQuest(AFQ.current,q)) then
+                AFQ_DEBUG.phase="abandon"
+                afq_logSwitch("Lv "..tostring(freshLevel or level)..": another quest is active, abandoning it before "
+                    ..q.giverKey.." #"..q.questIndex)
+                AFQ.lastSwitch=clock()
+                local okAbandon,why=afq_abandon()
+                if not okAbandon then
+                    AFQ.abandonFails=(AFQ.abandonFails or 0)+1
+                    local backoff=math.max(AFQ_SWITCH_COOLDOWN,afq_backoff(AFQ.abandonFails))
+                    AFQ.lastSwitch=clock()+backoff-AFQ_SWITCH_COOLDOWN
+                    afq_logSwitch("Lv "..tostring(freshLevel or level)..": abandon not confirmed ("..tostring(why)
+                        .."); retry in "..math.ceil(backoff).."s")
+                    afq_sleep(math.min(backoff,1))
+                    return false
+                end
+                AFQ.abandonFails=0
+                if not afq_farming() then return false end
+            end
+            return true
         end
-        -- One active quest at a time: abandon another quest the tracker shows
-        -- (or a different one this loop still holds) before StartQuest.
-        if afq_trackerQuestIs(q)=="other" or (AFQ.current and not afq_sameQuest(AFQ.current,q)) then
-            AFQ_DEBUG.phase="abandon"
-            afq_logSwitch("Lv "..tostring(freshLevel or level)..": another quest is active, abandoning it before "
-                ..q.giverKey.." #"..q.questIndex)
-            AFQ.lastSwitch=clock()
-            afq_abandon()
+        local function markAccepted(seen)
+            AFQ.accepted=true; AFQ.trackerSeen=seen and true or false
+            AFQ.trackerMissingSince=nil
+            AFQ.current={giverKey=q.giverKey,questIndex=q.questIndex}
+        end
+        -- Dedupe: never send StartQuest while the tracker already shows q.
+        local function adoptIfShown()
+            if afq_trackerQuestIs(q)=="same" then
+                markAccepted(true)
+                local k=afq_trackerProgress(); AFQ.kills=k or 0
+                setStatus(" (already active)")
+                return true
+            end
+            return false
+        end
+        -- Remote quest accept on: StartQuest is accepted from anywhere (seen
+        -- live from 289 studs in Underwater City and across Upper Skylands),
+        -- so accept where the character stands and go straight to the wait
+        -- spot. Under Matcha the invoke returns only a boolean, so the
+        -- tracker showing q (afq_waitTrackerFor) is the proof of acceptance.
+        -- No proof within AFQ_REMOTE_ACCEPT_WAIT: fall back once to the giver
+        -- trip below.
+        -- AFQ_DEBUG.remoteAcceptOff (A/B test of the reported crash trigger):
+        -- no StartQuest from where the character stands; accept at the giver
+        -- through the dialogue instead.
+        local viaGiver=not AFL.useRemoteQuest or AFQ_DEBUG.remoteAcceptOff==true
+        local fallback=false
+        if not viaGiver then
+            setStatus(" accepting (remote)")
+            if not preAccept() then return end
+            if adoptIfShown() then return end
+            local gate=afq_acceptWait(q)
+            if gate>0 then
+                setStatus(" accepting in "..math.ceil(gate).."s")
+                afq_sleep(math.min(gate,1))
+                return
+            end
+            AFQ_DEBUG.phase="accept"
+            local beforeKey=afq_trackerKey()
+            local ok,reason=true,nil
+            -- From the step thread, after every hold/tween of this step has
+            -- returned; quietInvoke pauses all other part writes and remotes.
+            if not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
+            local shown=AFQ_DEBUG.noAccept or (ok and afq_waitTrackerFor(q,AFQ_REMOTE_ACCEPT_WAIT,beforeKey))
+            if not afq_farming() then return end
+            if shown then
+                markAccepted(not AFQ_DEBUG.noAccept)
+                AFQ.acceptFails=0
+            else
+                viaGiver=true; fallback=true
+                local why=ok and ("tracker did not show "..q.enemy.." within "..AFQ_REMOTE_ACCEPT_WAIT.."s")
+                    or tostring(reason)
+                setStatus(" accepting at giver (fallback)")
+                warnThrottled("questRemoteAFQ","[laced.club] Auto Farm Quest: remote accept of "..q.giverKey
+                    .." #"..q.questIndex.." not confirmed ("..why.."); accepting at the giver instead",30)
+            end
+        end
+        if viaGiver then
+            -- Remote accept off (unchanged), or the fallback above: travel to
+            -- the giver and accept there.
+            if not fallback then setStatus(" accepting") end
+            -- No travel while the remote is known to be failing: wait for the
+            -- next probe (one call per backoff period, see below) instead.
+            if not AFQ_DEBUG.remoteAcceptOff and not AFQ_DEBUG.noAccept and remoteFailing("StartQuest") then
+                AFQ.acceptFails=(AFQ.acceptFails or 0)+1
+                local backoff=afq_backoff(AFQ.acceptFails)
+                setStatus(" accept failed: StartQuest remote keeps failing (retry in "..math.ceil(backoff).."s)")
+                RemoteFailures["StartQuest"]=REMOTE_FAILURE_LIMIT-1 -- allows one probe after the backoff
+                afq_sleep(backoff); return
+            end
+            AFQ_DEBUG.phase="tween-giver"
+            local giverPos=AFQ.giverPos[q.giverKey]
+            local atGiver=afq_teleportTo(giverPos)
+            if not afq_farming() then return end
+            if atGiver then afq_holdAt(giverPos,0.5) else afq_sleep(0.5) end
+            if not afq_farming() then return end -- toggled off during the wait: do not accept
+            if not preAccept() then return end
+            if adoptIfShown() then return end
+            -- Wait out the rate limit / switch cooldown at the giver (holding)
+            -- rather than failing the fallback right after the remote try.
+            local gate=afq_acceptWait(q)
+            if gate>0 then
+                setStatus(" accepting at the giver in "..math.ceil(gate).."s")
+                if atGiver then afq_holdAt(giverPos,gate) else afq_sleep(gate) end
+                if not afq_farming() then return end
+                if adoptIfShown() then return end
+            end
+            AFQ_DEBUG.phase=fallback and "accept-fallback" or "accept"
+            local beforeKey=afq_trackerKey()
+            local ok,reason=true,nil
+            if AFQ_DEBUG.remoteAcceptOff then ok,reason=afq_acceptByDialogue(q)
+            elseif not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
+            -- The boolean result is not proof: the tracker has to show q (the
+            -- giver path used to mark the quest accepted without any check).
+            local shown=AFQ_DEBUG.noAccept or (ok and afq_waitTrackerFor(q,AFQ_REMOTE_ACCEPT_WAIT,beforeKey))
+            if not afq_farming() then return end
+            if not shown then
+                AFQ.accepted=false
+                AFQ.acceptFails=(AFQ.acceptFails or 0)+1
+                local backoff=afq_backoff(AFQ.acceptFails)
+                local why=ok and ("the tracker did not show "..q.enemy) or tostring(reason)
+                setStatus(" accept failed: "..why.." (retry in "..math.ceil(backoff).."s)")
+                warnThrottled("questFarm","[laced.club] Auto Farm Quest: accept of "..q.giverKey.." #"..q.questIndex
+                    .." failed ("..why.."); retry in "..math.ceil(backoff).."s",30)
+                if remoteFailing("StartQuest") then RemoteFailures["StartQuest"]=REMOTE_FAILURE_LIMIT-1 end
+                afq_sleep(backoff); return
+            end
+            AFQ.acceptFails=0
+            markAccepted(not AFQ_DEBUG.noAccept)
+            if atGiver then afq_holdAt(giverPos,0.5) else afq_sleep(0.5) end
             if not afq_farming() then return end
         end
-        AFQ_DEBUG.phase="accept"
-        local ok,reason=true,nil
-        if not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
-        if not ok then
-            AFQ.accepted=false
-            setStatus(" accept failed: "..tostring(reason))
-            warnThrottled("questFarm","[laced.club] Auto Farm Quest: StartQuest failed ("..tostring(reason)..")",30)
-            wait(3); return
-        end
-        AFQ.accepted=true; AFQ.trackerSeen=false
-        AFQ.current={giverKey=q.giverKey,questIndex=q.questIndex}
-        if atGiver then afq_holdAt(giverPos,0.5) else wait(0.5) end
-        if not afq_farming() then return end
+        -- Travel to the wait (or boss) spot. afq_teleportTo picks the island
+        -- enter/leave step (Underwater City pads) from the current position
+        -- and this destination, so the island change happens on this leg when
+        -- the giver trip was skipped.
         AFQ_DEBUG.phase="tween-wait"
         if q.boss then afq_goToBoss(q) else afq_goToWait(q) end
         setStatus()
@@ -6321,7 +7129,10 @@ function afq_step()
     AFQ.bossMisses=0
     local killed=afq_fight(AFQ.selectedNpc)
     AFQ_DEBUG.phase="after-fight"
-    if killed then AFQ.kills=AFQ.kills+1; AFQ.selectedNpc=nil end
+    if not afq_farming() then return end
+    -- Not killed (50 s cap, own death, target gone): pick afresh next step.
+    if killed then AFQ.kills=AFQ.kills+1 end
+    AFQ.selectedNpc=nil
     local k=afq_trackerProgress()
     if k then AFQ.kills=k end
     -- Boss interleave: the boss is down, so the next afq_step picks the
@@ -6334,6 +7145,7 @@ task.spawn(function()
     while alive() do
         if S.autoFarmQuest and not farmPriorityFeatureActive() and not AFQ.loopRunning then
             AFQ.loopRunning=true
+            AFQ.stepGen=AFQ.gen
             local ok,stepError=pcall(afq_step)
             AFQ.loopRunning=false
             if AFQ.activeHead then pcall(AFQ.activeHead.restore); AFQ.activeHead=nil end
@@ -6346,6 +7158,13 @@ task.spawn(function()
         end
         wait(0.3)
     end
+end)
+
+-- Unload: restore a head the Level Farm or Auto Farm Quest fight left
+-- enlarged (their loops restore it too, at their next wake-up).
+onShutdown(function()
+    if AFQ.activeHead then pcall(AFQ.activeHead.restore); AFQ.activeHead=nil end
+    if AFL.activeHead then pcall(AFL.activeHead.restore); AFL.activeHead=nil end
 end)
 
 -- (Two leftover per-type render loops for fruit and chest labels were removed
@@ -6374,7 +7193,7 @@ task.spawn(function()
         if S.flowerEsp then
             for _, entry in pairs(S.flowerEspEntries) do pcall(updateWorldBoxEntry,entry) end
         end
-        frameWait()
+        idleWait(S.fruitEsp or S.chamEsp or S.chestEsp or S.berryEsp or S.boatEsp or S.flowerEsp)
     end
 end)
 
@@ -6408,20 +7227,31 @@ task.spawn(function()
     end
 end)
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["60_afq"] = true end
 -- @chunk 70_misc  (lines 6379-7475 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["70_misc"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
 function localRoot()
     local char=LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart") or nil
 end
 
+-- Stability pass (Oct 15 2026): 30 Hz instead of every frame, only living
+-- enemies (no write races a despawn), CanCollide written only when it is
+-- still true, nothing during a CommF_ quiet window, idle cadence while off.
+PULL_WRITE_HZ=30
 function doPullLoop(flag, getPoint)
     task.spawn(function()
         while alive() do
-            if flag() then
+            local on=flag()
+            if on and not writesPaused() then
                 local myHrp=localRoot()
                 local okPoint,pullPoint=pcall(getPoint,myHrp)
                 local folder=Workspace:FindFirstChild("Enemies")
@@ -6429,15 +7259,18 @@ function doPullLoop(flag, getPoint)
                     -- Inline per enemy: the old code spawned one thread per enemy every frame.
                     for _, model in pairs(folder:GetChildren()) do
                         pcall(function()
-                            if isA(model,"Model") then
+                            if isA(model,"Model") and isAlive(model) then
                                 local hrp=model:FindFirstChild("HumanoidRootPart")
-                                if hrp then hrp.CanCollide=false; hrp.Position=pullPoint end
+                                if hrp then
+                                    if hrp.CanCollide~=false then hrp.CanCollide=false end
+                                    hrp.Position=pullPoint
+                                end
                             end
                         end)
                     end
                 end
             end
-            frameWait()
+            if on then task.wait(writeInterval(1/PULL_WRITE_HZ)) else task.wait(IDLE_POLL) end
         end
     end)
 end
@@ -6446,38 +7279,55 @@ doPullLoop(function() return S.pullEnemies end,  function(h) return Vector3.new(
 doPullLoop(function() return S.buddhaPull end,   function(h) return Vector3.new(h.Position.X+37, h.Position.Y-3, h.Position.Z) end)
 doPullLoop(function() return S.customPull end,   function(h) return Vector3.new(h.Position.X+S.customPullX, h.Position.Y+S.customPullY, h.Position.Z+S.customPullZ) end)
 
+-- Auto Ken / Auto Haki: keys only with Roblox in front (they went to any
+-- window), and after 5 presses that did not turn the state on (attribute
+-- missing or renamed: Matcha reads it as nil) one press every 10 s instead of
+-- every pass.
 task.spawn(function()
+    local misses,nextPress=0,0
     while alive() do
         task.wait(0.1)
         if S.autoKen then
             local okAttr,kenActive=pcall(function() return LocalPlayer:GetAttribute("KenActive") end)
-            if okAttr and not kenActive then
+            if okAttr and kenActive then misses=0 end
+            if okAttr and not kenActive and robloxFocused() and clock()>=nextPress then
                 pcall(function() keypress(0x45); task.wait(0.1); keyrelease(0x45) end)
+                misses=misses+1
+                if misses>=5 then nextPress=clock()+10 end
             end
+        else
+            misses,nextPress=0,0
         end
     end
 end)
 
 task.spawn(function()
+    local misses,nextPress=0,0
     while alive() do
         task.wait(0.25)
         if S.autoHaki then
             local char=LocalPlayer.Character
-            if char and not char:FindFirstChild("HasBuso") then
+            if char and char:FindFirstChild("HasBuso") then misses=0 end
+            if char and not char:FindFirstChild("HasBuso") and robloxFocused() and clock()>=nextPress then
                 pcall(function()
                     setrobloxinput(true)
                     keypress(0x4A)
                     task.wait(0.1)
                     keyrelease(0x4A)
                 end)
+                misses=misses+1
+                if misses>=5 then nextPress=clock()+10 end
             end
+        else
+            misses,nextPress=0,0
         end
     end
 end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
+        -- 30 Hz while on (two root writes per pass), idle cadence while off.
+        if S.freezePos then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
         if S.freezePos then
             local hrp=localRoot()
             if hrp then
@@ -6497,8 +7347,8 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
-        if S.freezeEnemies then
+        if S.freezeEnemies then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
+        if S.freezeEnemies and not writesPaused() then
             -- Keyed by Instance.Address: Instance userdata are not guaranteed to be
             -- the same table key between GetChildren calls.
             local folder=Workspace:FindFirstChild("Enemies")
@@ -6515,7 +7365,8 @@ task.spawn(function()
             end
             for key, frozen in pairs(S.frozenEnemies) do
                 local model=frozen.model
-                if partStillThere(model) then
+                -- Dead enemies are dropped: no write may race their despawn.
+                if partStillThere(model) and isAlive(model) then
                     pcall(function()
                         local hrp=model:FindFirstChild("HumanoidRootPart")
                         if hrp then
@@ -6577,7 +7428,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
+        idleWait(S.tweenEmber)
         if S.tweenEmber then
             zeroVelocity(localRoot())
         end
@@ -6617,8 +7468,8 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
-        if S.teleportEmber and not S.tweenEmber then
+        idleWait(S.teleportEmber and not S.tweenEmber)
+        if S.teleportEmber and not S.tweenEmber and not writesPaused() then
             local hrp=localRoot()
             if hrp then
                 pcall(function()
@@ -6674,7 +7525,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
+        idleWait(S.teleportKitsune)
         if S.teleportKitsune then
             zeroVelocity(localRoot())
         end
@@ -6811,7 +7662,7 @@ task.spawn(function()
                                     moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,nil)
                                     zeroVelocity(hrp)
                                     if alpha>=1 then notify("Arrived!","laced.club",2); break end
-                                    task.wait(0.01)
+                                    frameWait() -- was task.wait(0.01); alpha is time-based
                                 end
                             end
                             end)
@@ -6854,27 +7705,27 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.voidPull then
+        if S.voidPull and not writesPaused() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,100000,hrp.Position.Z) end)
                 zeroVelocity(hrp)
             end
         end
-        frameWait()
+        if S.voidPull then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
     end
 end)
 
 task.spawn(function()
     while alive() do
-        if S.skyPull then
+        if S.skyPull and not writesPaused() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,1000,hrp.Position.Z) end)
                 zeroVelocity(hrp)
             end
         end
-        frameWait()
+        if S.skyPull then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
     end
 end)
 
@@ -6954,7 +7805,7 @@ task.spawn(function()
                         while engaged() do
                             local alpha=math.min((clock()-t0)/duration,1)
                             if not moveRoot(myHrp,startX+dx*alpha,startY+dy*alpha,startZ+dz*alpha,nil) then break end
-                            if alpha>=1 then break end; task.wait(0.01)
+                            if alpha>=1 then break end; frameWait()
                         end
                         local lastClick=0
                         local attackStart=clock()
@@ -7000,6 +7851,9 @@ task.spawn(function()
             else task.wait(0.5) end
             end)
             if not okStep then pvpTarget=nil; task.wait(0.5) end
+            -- Some branches above (target without a root) returned without
+            -- yielding: always yield once per pass.
+            frameWait()
         else pvpTarget=nil; task.wait(0.5) end
     end
 end)
@@ -7227,7 +8081,7 @@ do
     }
 
     local function fish_hold()
-        if not FishState.IsHolding and not menuUnderMouse() then FishState.IsHolding=true; pcall(mouse1press); FishState.Clicks=FishState.Clicks+1 end
+        if not FishState.IsHolding and robloxFocused() and not menuUnderMouse() then FishState.IsHolding=true; pcall(mouse1press); FishState.Clicks=FishState.Clicks+1 end
     end
     local function fish_release()
         if FishState.IsHolding then FishState.IsHolding=false; pcall(mouse1release) end
@@ -7447,6 +8301,12 @@ do
             end
         end
     })
+    -- Unload (also a re-run): never leave the left button held.
+    onShutdown(function()
+        FishState.Running=false
+        FishState.Generation=(FishState.Generation or 0)+1
+        fish_release()
+    end)
 end
 
 do
@@ -7460,7 +8320,7 @@ do
     end
 
     local function repairHold()
-        if not RepairState.holding and not menuUnderMouse() then
+        if not RepairState.holding and robloxFocused() and not menuUnderMouse() then
             RepairState.holding=true
             pcall(mouse1press)
         end
@@ -7507,14 +8367,23 @@ do
                 task.wait(0.2)
             end
         end
+        repairRelease()
     end)
+    onShutdown(function() repairRelease() end)
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["70_misc"] = true end
 -- @chunk 80_misc2  (lines 7476-8507 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["80_misc2"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
 MASTERY_WAYPOINTS={
     {pos=Vector3.new(109.6,47.5,-12520.8)},
     {pos=Vector3.new(15.1,47.5,-12567.3)},
@@ -7583,7 +8452,7 @@ function masteryTweenTo(hrp,targetPos,lookVector,checkFn)
         local alpha=distance<0.1 and 1 or math.min((clock()-startTime)/duration,1)
         local okMove=moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,facingCF)
         if not okMove or alpha>=1 then return end
-        task.wait(0.01)
+        frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based
     end
 end
 
@@ -7714,13 +8583,13 @@ function runVelocityBoost(settings,enabledFn,horizontalOnly,lockedDirection)
         local currentChar=LocalPlayer and LocalPlayer.Character or nil
         local currentHrp=currentChar and currentChar:FindFirstChild("HumanoidRootPart") or nil
         if not currentHrp then return end
-        pcall(function()
+        if not writesPaused() then pcall(function()
             currentHrp.AssemblyLinearVelocity=Vector3.new(
                 direction.X*settings.speed,
                 horizontalOnly and 0 or direction.Y*settings.speed,
                 direction.Z*settings.speed
             )
-        end)
+        end) end
         frameWait()
     end
 end
@@ -7740,7 +8609,7 @@ task.spawn(function()
             end)
         end
         wasZFire=zFire
-        frameWait()
+        idleWait(S.sanguineZBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7764,7 +8633,7 @@ task.spawn(function()
         elseif not pressed then
             holdingZ=false
         end
-        frameWait()
+        idleWait(S.dragonTalonZBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7788,7 +8657,7 @@ task.spawn(function()
         elseif not pressed then
             holdingZ=false
         end
-        frameWait()
+        idleWait(S.yamaZBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7812,7 +8681,7 @@ task.spawn(function()
         elseif not pressed then
             holdingX=false
         end
-        frameWait()
+        idleWait(S.tushitaXBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7836,7 +8705,7 @@ task.spawn(function()
         elseif not pressed then
             holdingX=false
         end
-        frameWait()
+        idleWait(S.foxLampXBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7878,7 +8747,7 @@ task.spawn(function()
 
         wasQPressed=qPressed
         wasM1Pressed=m1Pressed
-        frameWait()
+        idleWait(S.soulGuitarM1Boost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7900,7 +8769,7 @@ task.spawn(function()
             end)
         end
         wasM1Pressed=m1Pressed
-        frameWait()
+        idleWait(S.diamondM1Boost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7924,7 +8793,7 @@ task.spawn(function()
         elseif not pressed then
             holdingF=false
         end
-        frameWait()
+        idleWait(S.flameFBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7951,7 +8820,7 @@ task.spawn(function()
         elseif not rPressed then
             holdingR=false
         end
-        frameWait()
+        idleWait(S.rToX) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -7984,7 +8853,7 @@ task.spawn(function()
         elseif not rPressed then
             holdingR=false
         end
-        frameWait()
+        idleWait(S.rToXThenZ) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -8032,7 +8901,7 @@ task.spawn(function()
         elseif not rPressed then
             holdingR=false
         end
-        frameWait()
+        idleWait(S.flameRToC) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -8075,6 +8944,7 @@ function materialWaitPosition(material)
 end
 
 enhancedComm=nil
+enhancedCommMissUntil=0 -- a failed full ReplicatedStorage scan is not repeated for 10 s
 function getEnhancedComm()
     if enhancedComm then
         local okParent,parent=pcall(function() return enhancedComm.Parent end)
@@ -8084,6 +8954,8 @@ function getEnhancedComm()
     local storage=game:GetService("ReplicatedStorage")
     local remotes=storage and storage:FindFirstChild("Remotes")
     enhancedComm=remotes and remotes:FindFirstChild("CommF_") or nil
+    if not enhancedComm and clock()<enhancedCommMissUntil then return nil end
+    if not enhancedComm then enhancedCommMissUntil=clock()+10 end
     if not enhancedComm and storage then
         local okDescendants,descendants=pcall(function() return storage:GetDescendants() end)
         if okDescendants and descendants then
@@ -8099,14 +8971,15 @@ end
 function invokeEnhancedComm(first,second,third,fourth)
     local remote=getEnhancedComm()
     if not remote then return false,nil,"CommF_ not found" end
-    -- Same trailing-nil trimming as before; safeRemote pcalls the call and
-    -- throttles the warning (the stat loop used to warn every 0.12 s).
+    -- Same trailing-nil trimming as before; quietInvoke (00_core) serialises
+    -- the CommF_ invokes, keeps the part writes quiet around them, and goes
+    -- through safeRemote (pcall, throttled warning).
     local ok,result
-    if fourth~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first,second,third,fourth)
-    elseif third~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first,second,third)
-    elseif second~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first,second)
-    elseif first~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first)
-    else ok,result=safeRemote("CommF_",remote,"InvokeServer") end
+    if fourth~=nil then ok,result=quietInvoke("CommF_",remote,first,second,third,fourth)
+    elseif third~=nil then ok,result=quietInvoke("CommF_",remote,first,second,third)
+    elseif second~=nil then ok,result=quietInvoke("CommF_",remote,first,second)
+    elseif first~=nil then ok,result=quietInvoke("CommF_",remote,first)
+    else ok,result=quietInvoke("CommF_",remote) end
     if not ok then
         enhancedComm=nil
         return false,nil,tostring(result)
@@ -8286,6 +9159,7 @@ function findMirageGear()
 end
 
 namedRemoteCache={}
+namedRemoteMissUntil={} -- name -> clock(): no full ReplicatedStorage scan before then
 function findReplicatedObject(name)
     local cached=namedRemoteCache[name]
     if cached then
@@ -8296,6 +9170,8 @@ function findReplicatedObject(name)
     local storage=game:GetService("ReplicatedStorage")
     local direct=storage and storage:FindFirstChild(name)
     if direct then namedRemoteCache[name]=direct; return direct end
+    if clock()<(namedRemoteMissUntil[name] or 0) then return nil end
+    namedRemoteMissUntil[name]=clock()+10
     local okDescendants,descendants=pcall(function() return storage:GetDescendants() end)
     if okDescendants and descendants then
         for _,object in pairs(descendants) do
@@ -8451,12 +9327,29 @@ end)
 -- Auto Stat with per-stat caps. Reads LocalPlayer.Data.Points and
 -- Data.Stats[<name>].Level (confirmed live); the AddPoint name is the
 -- Data.Stats folder name. Cap 0 = unlimited (the old behaviour). Each call
--- spends min(points per upgrade, cap - level, available points), so a cap is
--- never overshot; a just-spent amount is held as a floor until Data catches up.
+-- spends min(points per upgrade, cap - level, available points).
+--
+-- Stability pass (Oct 15 2026). Matcha's InvokeServer returns only a boolean,
+-- so a refused AddPoint looked like a spend, and a spend whose Data update
+-- took longer than 5 s was forgotten and spent again (cap overshoot; with no
+-- replication at all, one irreversible AddPoint about every 1.6 s). Now:
+--   * a spend is "pending" until Data proves it (Level rose or Points
+--     dropped); while anything is pending no stat spends at all;
+--   * a proven spend whose Level has not replicated yet keeps its expected
+--     level as a floor for the cap arithmetic, so a stale Level cannot cause
+--     a second spend past the cap;
+--   * no proof within AUTO_STAT_CONFIRM_SECS: that stat's toggle is switched
+--     off with a warning (never a blind re-spend after a timeout); its floor
+--     stays until the toggle is switched on again;
+--   * the cap switches a toggle off only against the confirmed (live) level;
+--   * one spend per pass, and the pass is pcall'd with a back-off on error.
+AUTO_STAT_CONFIRM_SECS=15
 task.spawn(function()
     -- {toggle state key, AddPoint / Data.Stats name, cap state key, toggle id, label}
     local statEntries={{"autoStatMelee","Melee","statCapMelee","stat_melee","Melee"},{"autoStatDefense","Defense","statCapDefense","stat_defense","Def"},{"autoStatSword","Sword","statCapSword","stat_sword","Sword"},{"autoStatGun","Gun","statCapGun","stat_gun","Gun"},{"autoStatFruit","Demon Fruit","statCapFruit","stat_fruit","Fruit"}}
-    local pending={}   -- name -> {lvl=expected level, t=time} until Data replicates
+    local pending={}   -- name -> {base, lvl, pts, t, entry}: one AddPoint not yet proven by Data
+    local floor={}     -- name -> expected level of proven (or unproven, stopped) spends not replicated yet
+    local wasOn={}     -- name -> toggle state last pass (a fresh "on" clears the floor)
     local function readValue(parent,name)
         local child=parent and parent:FindFirstChild(name)
         if not child then return nil end
@@ -8465,17 +9358,22 @@ task.spawn(function()
     end
     local function statData() return LocalPlayer and LocalPlayer:FindFirstChild("Data") end
     local function points() return readValue(statData(),"Points") end
-    -- Level as far as the cap is concerned: the live value, floored by a
-    -- just-spent amount the server has not replicated yet (held up to 5 s).
-    local function level(name)
+    local function liveLevel(name)
         local data=statData()
         local stats=data and data:FindFirstChild("Stats")
-        local cur=readValue(stats and stats:FindFirstChild(name),"Level")
-        local p=pending[name]
-        if p then
-            if (cur and cur>=p.lvl) or clock()-p.t>5 then pending[name]=nil
-            elseif cur then cur=math.max(cur,p.lvl) end
+        return readValue(stats and stats:FindFirstChild(name),"Level")
+    end
+    -- Level for the cap arithmetic: the live value, raised by the floor and by
+    -- a pending spend. nil when Level cannot be read.
+    local function spendLevel(name)
+        local cur=liveLevel(name)
+        if cur==nil then return nil end
+        local f=floor[name]
+        if f then
+            if cur>=f then floor[name]=nil else cur=f end
         end
+        local p=pending[name]
+        if p and p.lvl>cur then cur=p.lvl end
         return cur
     end
     local function capOf(e)
@@ -8488,68 +9386,112 @@ task.spawn(function()
         if type(label)~="table" then return end
         local parts={}
         for _,e in ipairs(statEntries) do
-            local cur,cap=level(e[2]),capOf(e)
+            local cur,cap,live=spendLevel(e[2]),capOf(e),liveLevel(e[2])
             local s=e[5].." "..(cur and tostring(cur) or "?").."/"..(cap==math.huge and "-" or tostring(cap))
-            if cur and cap~=math.huge and cur>=cap then s=s.."(cap)" end
+            if live and cap~=math.huge and live>=cap then s=s.."(cap)"
+            elseif pending[e[2]] then s=s.."(wait)" end
             parts[#parts+1]=s
         end
         pcall(function() label.Text="Pts "..(pts and tostring(pts) or "?").." | "..table.concat(parts," ") end)
     end
-    local function capReached(e,cap)
+    local function switchOff(e)
         if not S[e[1]] then return end
         pcall(function() Window:Set(e[4],false) end)
         S[e[1]]=false
+    end
+    local function capReached(e,cap)
+        if not S[e[1]] then return end
+        switchOff(e)
         notify("Auto "..e[2].." stopped at cap "..tostring(cap),"Auto Stat",3)
         warnThrottled("autostat:cap:"..e[2],"[laced.club] Auto Stat: "..e[2].." reached its cap ("..tostring(cap).."), toggle switched off",30)
     end
-    while alive() do
+    -- Proven: the level rose above the level before the call, or Points
+    -- dropped below the points before it. Timed out: the stat is stopped.
+    local function resolvePending()
+        local now=clock()
         local pts=points()
+        for name,p in pairs(pending) do
+            local cur=liveLevel(name)
+            local levelRose=cur~=nil and p.base~=nil and cur>p.base
+            local pointsDropped=pts~=nil and p.pts~=nil and pts<p.pts
+            if levelRose or pointsDropped then
+                pending[name]=nil
+                if cur==nil or cur<p.lvl then floor[name]=math.max(floor[name] or 0,p.lvl) end
+            elseif now-p.t>=AUTO_STAT_CONFIRM_SECS then
+                pending[name]=nil
+                floor[name]=math.max(floor[name] or 0,p.lvl)
+                switchOff(p.entry)
+                warnThrottled("autostat:unconfirmed:"..name,"[laced.club] Auto Stat: AddPoint "..name.." was not confirmed by Data within "
+                    ..AUTO_STAT_CONFIRM_SECS.."s; Auto "..name.." switched off (no blind re-spend)",30)
+            end
+        end
+    end
+    local function pass()
+        resolvePending()
+        local pts=points()
+        for _,e in ipairs(statEntries) do
+            local on=S[e[1]]==true
+            if on and not wasOn[e[2]] then floor[e[2]]=nil end
+            wasOn[e[2]]=on
+        end
         updateLabel(pts)
-        if pts and pts>0 and not remoteFailing("CommF_") then
-            for _,e in ipairs(statEntries) do
-                if not alive() or pts<=0 then break end
-                if S[e[1]] then
-                    local cap=capOf(e)
-                    local cur=level(e[2])
-                    if cur==nil and cap~=math.huge then
-                        -- Never spend blind against a cap.
-                        warnThrottled("autostat:read","[laced.club] Auto Stat: cannot read Data.Stats."..e[2]..".Level; capped stat skipped",30)
-                    elseif cap-(cur or 0)<=0 then
-                        capReached(e,cap)
-                    else
-                        local remaining=cap-(cur or 0)
-                        local amount=math.max(1,math.floor(tonumber(S.statAmount) or 10))
-                        local n=math.floor(math.min(amount,remaining,pts))
-                        if n>0 then
-                            local ok,_,err=invokeEnhancedComm("AddPoint",e[2],n)
-                            if not ok then
-                                warnThrottled("autostat:remote","[laced.club] Auto Stat: AddPoint failed: "..tostring(err),20)
-                                break
-                            end
-                            if cur then pending[e[2]]={lvl=cur+n,t=clock()} end
-                            -- Give the server up to ~1 s to update Data, then re-read.
-                            local waited=0
-                            repeat
-                                task.wait(0.12)
-                                waited=waited+0.12
-                                level(e[2])
-                            until not alive() or waited>=1 or pending[e[2]]==nil
-                            local fresh=points()
-                            pts=fresh and math.min(fresh,pts-n) or (pts-n)
-                            local after=level(e[2])
-                            if after and cap~=math.huge and after>=cap then capReached(e,cap) end
-                            updateLabel(pts)
+        if not pts or pts<=0 or remoteFailing("CommF_") or next(pending)~=nil then return end
+        for _,e in ipairs(statEntries) do
+            if not alive() then return end
+            if S[e[1]] then
+                local cap=capOf(e)
+                local live=liveLevel(e[2])
+                local cur=spendLevel(e[2])
+                if cur==nil and cap~=math.huge then
+                    -- Never spend blind against a cap.
+                    warnThrottled("autostat:read","[laced.club] Auto Stat: cannot read Data.Stats."..e[2]..".Level; capped stat skipped",30)
+                elseif live~=nil and cap~=math.huge and live>=cap then
+                    capReached(e,cap)
+                elseif cap-(cur or 0)>0 then
+                    local remaining=cap-(cur or 0)
+                    local amount=math.max(1,math.floor(tonumber(S.statAmount) or 10))
+                    local n=math.floor(math.min(amount,remaining,pts))
+                    if n>0 then
+                        local ok,_,err=invokeEnhancedComm("AddPoint",e[2],n)
+                        if not ok then
+                            warnThrottled("autostat:remote","[laced.club] Auto Stat: AddPoint failed: "..tostring(err),20)
+                            return
                         end
+                        pending[e[2]]={base=live,lvl=(cur or 0)+n,pts=pts,t=clock(),entry=e}
+                        -- Give Data up to ~1 s; an unproven spend stays pending
+                        -- (blocking every stat) until AUTO_STAT_CONFIRM_SECS.
+                        local waited=0
+                        repeat
+                            task.wait(0.12)
+                            waited=waited+0.12
+                            resolvePending()
+                        until not alive() or waited>=1 or pending[e[2]]==nil
+                        updateLabel(points())
+                        return -- one spend per pass; the next pass re-reads everything
                     end
                 end
+                -- else: the cap is reached only by spends Data has not shown
+                -- yet (floor/pending): hold, do not switch the toggle off.
             end
+        end
+    end
+    while alive() do
+        local okPass,passError=pcall(pass)
+        if not okPass then
+            warnThrottled("autostat:error","[laced.club] Auto Stat error: "..tostring(passError),30)
+            task.wait(2)
         end
         if remoteFailing("CommF_") then task.wait(5) else task.wait(0.5) end
     end
 end)
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["80_misc2"] = true end
 -- @chunk 90_main  (lines 8508-8537 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["90_main"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
 
@@ -8557,28 +9499,15 @@ local SCRIPT_STATE = SCRIPT_STATE
 -- Unload: the UE "Unload UI" button (and re-executing the script, which
 -- unloads the previous UE copy) used to remove only the menu while every
 -- automation loop and ESP drawing kept running with no way to stop them.
+-- Stability pass (Oct 15 2026): shutdownScript now lives in 00_core (bound to
+-- this run's state, idempotent, safe before the later chunks exist) and is
+-- registered with UE right after the window is created (10_ui), so a chunk
+-- that fails to load in between can no longer leave loops that the menu
+-- cannot stop. Cleanup steps of the later chunks are registered with
+-- onShutdown().
 -- ---------------------------------------------------------------------------
 SCRIPT_LIBRARY = Library
-function shutdownScript()
-    if SCRIPT_STATE.unloaded then return end
-    -- Turn every feature toggle off through its own callback first, so each
-    -- feature runs its normal "off" path (clears ESP, releases mouse, ...).
-    -- Only while S is still this execution's table: during a re-run the
-    -- callbacks would write into the new copy's S.
-    if S == SCRIPT_STATE then
-        for _, control in pairs(SCRIPT_LIBRARY.Controls or {}) do
-            if type(control)=="table" and control.Type=="Toggle" and control.Value==true then
-                pcall(function() control:SetValue(false) end)
-            end
-        end
-    end
-    SCRIPT_STATE.unloaded=true
-    S.boatTweening=false
-    S.boatTween=nil
-    pcall(clearEspLabels); pcall(clearChamBoxes); pcall(clearChestEspLabels)
-    pcall(clearBerryEspLabels); pcall(clearBoatEsp); pcall(clearFlowerEsp); pcall(clearMirageEsp)
-    pcall(mouse1release)
-end
-Library:OnUnload(shutdownScript)
 
+-- Load marker before the keep-alive loop (it does not end while loaded).
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["90_main"] = true end
 while alive() do task.wait(1) end

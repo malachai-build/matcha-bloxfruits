@@ -1,8 +1,13 @@
 -- @chunk 80_misc2  (lines 7476-8507 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["80_misc2"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
 MASTERY_WAYPOINTS={
     {pos=Vector3.new(109.6,47.5,-12520.8)},
     {pos=Vector3.new(15.1,47.5,-12567.3)},
@@ -71,7 +76,7 @@ function masteryTweenTo(hrp,targetPos,lookVector,checkFn)
         local alpha=distance<0.1 and 1 or math.min((clock()-startTime)/duration,1)
         local okMove=moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,facingCF)
         if not okMove or alpha>=1 then return end
-        task.wait(0.01)
+        frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based
     end
 end
 
@@ -202,13 +207,13 @@ function runVelocityBoost(settings,enabledFn,horizontalOnly,lockedDirection)
         local currentChar=LocalPlayer and LocalPlayer.Character or nil
         local currentHrp=currentChar and currentChar:FindFirstChild("HumanoidRootPart") or nil
         if not currentHrp then return end
-        pcall(function()
+        if not writesPaused() then pcall(function()
             currentHrp.AssemblyLinearVelocity=Vector3.new(
                 direction.X*settings.speed,
                 horizontalOnly and 0 or direction.Y*settings.speed,
                 direction.Z*settings.speed
             )
-        end)
+        end) end
         frameWait()
     end
 end
@@ -228,7 +233,7 @@ task.spawn(function()
             end)
         end
         wasZFire=zFire
-        frameWait()
+        idleWait(S.sanguineZBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -252,7 +257,7 @@ task.spawn(function()
         elseif not pressed then
             holdingZ=false
         end
-        frameWait()
+        idleWait(S.dragonTalonZBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -276,7 +281,7 @@ task.spawn(function()
         elseif not pressed then
             holdingZ=false
         end
-        frameWait()
+        idleWait(S.yamaZBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -300,7 +305,7 @@ task.spawn(function()
         elseif not pressed then
             holdingX=false
         end
-        frameWait()
+        idleWait(S.tushitaXBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -324,7 +329,7 @@ task.spawn(function()
         elseif not pressed then
             holdingX=false
         end
-        frameWait()
+        idleWait(S.foxLampXBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -366,7 +371,7 @@ task.spawn(function()
 
         wasQPressed=qPressed
         wasM1Pressed=m1Pressed
-        frameWait()
+        idleWait(S.soulGuitarM1Boost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -388,7 +393,7 @@ task.spawn(function()
             end)
         end
         wasM1Pressed=m1Pressed
-        frameWait()
+        idleWait(S.diamondM1Boost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -412,7 +417,7 @@ task.spawn(function()
         elseif not pressed then
             holdingF=false
         end
-        frameWait()
+        idleWait(S.flameFBoost) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -439,7 +444,7 @@ task.spawn(function()
         elseif not rPressed then
             holdingR=false
         end
-        frameWait()
+        idleWait(S.rToX) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -472,7 +477,7 @@ task.spawn(function()
         elseif not rPressed then
             holdingR=false
         end
-        frameWait()
+        idleWait(S.rToXThenZ) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -520,7 +525,7 @@ task.spawn(function()
         elseif not rPressed then
             holdingR=false
         end
-        frameWait()
+        idleWait(S.flameRToC) -- 60 Hz key polling only while the feature is on
     end
 end)
 
@@ -563,6 +568,7 @@ function materialWaitPosition(material)
 end
 
 enhancedComm=nil
+enhancedCommMissUntil=0 -- a failed full ReplicatedStorage scan is not repeated for 10 s
 function getEnhancedComm()
     if enhancedComm then
         local okParent,parent=pcall(function() return enhancedComm.Parent end)
@@ -572,6 +578,8 @@ function getEnhancedComm()
     local storage=game:GetService("ReplicatedStorage")
     local remotes=storage and storage:FindFirstChild("Remotes")
     enhancedComm=remotes and remotes:FindFirstChild("CommF_") or nil
+    if not enhancedComm and clock()<enhancedCommMissUntil then return nil end
+    if not enhancedComm then enhancedCommMissUntil=clock()+10 end
     if not enhancedComm and storage then
         local okDescendants,descendants=pcall(function() return storage:GetDescendants() end)
         if okDescendants and descendants then
@@ -587,14 +595,15 @@ end
 function invokeEnhancedComm(first,second,third,fourth)
     local remote=getEnhancedComm()
     if not remote then return false,nil,"CommF_ not found" end
-    -- Same trailing-nil trimming as before; safeRemote pcalls the call and
-    -- throttles the warning (the stat loop used to warn every 0.12 s).
+    -- Same trailing-nil trimming as before; quietInvoke (00_core) serialises
+    -- the CommF_ invokes, keeps the part writes quiet around them, and goes
+    -- through safeRemote (pcall, throttled warning).
     local ok,result
-    if fourth~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first,second,third,fourth)
-    elseif third~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first,second,third)
-    elseif second~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first,second)
-    elseif first~=nil then ok,result=safeRemote("CommF_",remote,"InvokeServer",first)
-    else ok,result=safeRemote("CommF_",remote,"InvokeServer") end
+    if fourth~=nil then ok,result=quietInvoke("CommF_",remote,first,second,third,fourth)
+    elseif third~=nil then ok,result=quietInvoke("CommF_",remote,first,second,third)
+    elseif second~=nil then ok,result=quietInvoke("CommF_",remote,first,second)
+    elseif first~=nil then ok,result=quietInvoke("CommF_",remote,first)
+    else ok,result=quietInvoke("CommF_",remote) end
     if not ok then
         enhancedComm=nil
         return false,nil,tostring(result)
@@ -774,6 +783,7 @@ function findMirageGear()
 end
 
 namedRemoteCache={}
+namedRemoteMissUntil={} -- name -> clock(): no full ReplicatedStorage scan before then
 function findReplicatedObject(name)
     local cached=namedRemoteCache[name]
     if cached then
@@ -784,6 +794,8 @@ function findReplicatedObject(name)
     local storage=game:GetService("ReplicatedStorage")
     local direct=storage and storage:FindFirstChild(name)
     if direct then namedRemoteCache[name]=direct; return direct end
+    if clock()<(namedRemoteMissUntil[name] or 0) then return nil end
+    namedRemoteMissUntil[name]=clock()+10
     local okDescendants,descendants=pcall(function() return storage:GetDescendants() end)
     if okDescendants and descendants then
         for _,object in pairs(descendants) do
@@ -939,12 +951,29 @@ end)
 -- Auto Stat with per-stat caps. Reads LocalPlayer.Data.Points and
 -- Data.Stats[<name>].Level (confirmed live); the AddPoint name is the
 -- Data.Stats folder name. Cap 0 = unlimited (the old behaviour). Each call
--- spends min(points per upgrade, cap - level, available points), so a cap is
--- never overshot; a just-spent amount is held as a floor until Data catches up.
+-- spends min(points per upgrade, cap - level, available points).
+--
+-- Stability pass (Oct 15 2026). Matcha's InvokeServer returns only a boolean,
+-- so a refused AddPoint looked like a spend, and a spend whose Data update
+-- took longer than 5 s was forgotten and spent again (cap overshoot; with no
+-- replication at all, one irreversible AddPoint about every 1.6 s). Now:
+--   * a spend is "pending" until Data proves it (Level rose or Points
+--     dropped); while anything is pending no stat spends at all;
+--   * a proven spend whose Level has not replicated yet keeps its expected
+--     level as a floor for the cap arithmetic, so a stale Level cannot cause
+--     a second spend past the cap;
+--   * no proof within AUTO_STAT_CONFIRM_SECS: that stat's toggle is switched
+--     off with a warning (never a blind re-spend after a timeout); its floor
+--     stays until the toggle is switched on again;
+--   * the cap switches a toggle off only against the confirmed (live) level;
+--   * one spend per pass, and the pass is pcall'd with a back-off on error.
+AUTO_STAT_CONFIRM_SECS=15
 task.spawn(function()
     -- {toggle state key, AddPoint / Data.Stats name, cap state key, toggle id, label}
     local statEntries={{"autoStatMelee","Melee","statCapMelee","stat_melee","Melee"},{"autoStatDefense","Defense","statCapDefense","stat_defense","Def"},{"autoStatSword","Sword","statCapSword","stat_sword","Sword"},{"autoStatGun","Gun","statCapGun","stat_gun","Gun"},{"autoStatFruit","Demon Fruit","statCapFruit","stat_fruit","Fruit"}}
-    local pending={}   -- name -> {lvl=expected level, t=time} until Data replicates
+    local pending={}   -- name -> {base, lvl, pts, t, entry}: one AddPoint not yet proven by Data
+    local floor={}     -- name -> expected level of proven (or unproven, stopped) spends not replicated yet
+    local wasOn={}     -- name -> toggle state last pass (a fresh "on" clears the floor)
     local function readValue(parent,name)
         local child=parent and parent:FindFirstChild(name)
         if not child then return nil end
@@ -953,17 +982,22 @@ task.spawn(function()
     end
     local function statData() return LocalPlayer and LocalPlayer:FindFirstChild("Data") end
     local function points() return readValue(statData(),"Points") end
-    -- Level as far as the cap is concerned: the live value, floored by a
-    -- just-spent amount the server has not replicated yet (held up to 5 s).
-    local function level(name)
+    local function liveLevel(name)
         local data=statData()
         local stats=data and data:FindFirstChild("Stats")
-        local cur=readValue(stats and stats:FindFirstChild(name),"Level")
-        local p=pending[name]
-        if p then
-            if (cur and cur>=p.lvl) or clock()-p.t>5 then pending[name]=nil
-            elseif cur then cur=math.max(cur,p.lvl) end
+        return readValue(stats and stats:FindFirstChild(name),"Level")
+    end
+    -- Level for the cap arithmetic: the live value, raised by the floor and by
+    -- a pending spend. nil when Level cannot be read.
+    local function spendLevel(name)
+        local cur=liveLevel(name)
+        if cur==nil then return nil end
+        local f=floor[name]
+        if f then
+            if cur>=f then floor[name]=nil else cur=f end
         end
+        local p=pending[name]
+        if p and p.lvl>cur then cur=p.lvl end
         return cur
     end
     local function capOf(e)
@@ -976,62 +1010,103 @@ task.spawn(function()
         if type(label)~="table" then return end
         local parts={}
         for _,e in ipairs(statEntries) do
-            local cur,cap=level(e[2]),capOf(e)
+            local cur,cap,live=spendLevel(e[2]),capOf(e),liveLevel(e[2])
             local s=e[5].." "..(cur and tostring(cur) or "?").."/"..(cap==math.huge and "-" or tostring(cap))
-            if cur and cap~=math.huge and cur>=cap then s=s.."(cap)" end
+            if live and cap~=math.huge and live>=cap then s=s.."(cap)"
+            elseif pending[e[2]] then s=s.."(wait)" end
             parts[#parts+1]=s
         end
         pcall(function() label.Text="Pts "..(pts and tostring(pts) or "?").." | "..table.concat(parts," ") end)
     end
-    local function capReached(e,cap)
+    local function switchOff(e)
         if not S[e[1]] then return end
         pcall(function() Window:Set(e[4],false) end)
         S[e[1]]=false
+    end
+    local function capReached(e,cap)
+        if not S[e[1]] then return end
+        switchOff(e)
         notify("Auto "..e[2].." stopped at cap "..tostring(cap),"Auto Stat",3)
         warnThrottled("autostat:cap:"..e[2],"[laced.club] Auto Stat: "..e[2].." reached its cap ("..tostring(cap).."), toggle switched off",30)
     end
-    while alive() do
+    -- Proven: the level rose above the level before the call, or Points
+    -- dropped below the points before it. Timed out: the stat is stopped.
+    local function resolvePending()
+        local now=clock()
         local pts=points()
+        for name,p in pairs(pending) do
+            local cur=liveLevel(name)
+            local levelRose=cur~=nil and p.base~=nil and cur>p.base
+            local pointsDropped=pts~=nil and p.pts~=nil and pts<p.pts
+            if levelRose or pointsDropped then
+                pending[name]=nil
+                if cur==nil or cur<p.lvl then floor[name]=math.max(floor[name] or 0,p.lvl) end
+            elseif now-p.t>=AUTO_STAT_CONFIRM_SECS then
+                pending[name]=nil
+                floor[name]=math.max(floor[name] or 0,p.lvl)
+                switchOff(p.entry)
+                warnThrottled("autostat:unconfirmed:"..name,"[laced.club] Auto Stat: AddPoint "..name.." was not confirmed by Data within "
+                    ..AUTO_STAT_CONFIRM_SECS.."s; Auto "..name.." switched off (no blind re-spend)",30)
+            end
+        end
+    end
+    local function pass()
+        resolvePending()
+        local pts=points()
+        for _,e in ipairs(statEntries) do
+            local on=S[e[1]]==true
+            if on and not wasOn[e[2]] then floor[e[2]]=nil end
+            wasOn[e[2]]=on
+        end
         updateLabel(pts)
-        if pts and pts>0 and not remoteFailing("CommF_") then
-            for _,e in ipairs(statEntries) do
-                if not alive() or pts<=0 then break end
-                if S[e[1]] then
-                    local cap=capOf(e)
-                    local cur=level(e[2])
-                    if cur==nil and cap~=math.huge then
-                        -- Never spend blind against a cap.
-                        warnThrottled("autostat:read","[laced.club] Auto Stat: cannot read Data.Stats."..e[2]..".Level; capped stat skipped",30)
-                    elseif cap-(cur or 0)<=0 then
-                        capReached(e,cap)
-                    else
-                        local remaining=cap-(cur or 0)
-                        local amount=math.max(1,math.floor(tonumber(S.statAmount) or 10))
-                        local n=math.floor(math.min(amount,remaining,pts))
-                        if n>0 then
-                            local ok,_,err=invokeEnhancedComm("AddPoint",e[2],n)
-                            if not ok then
-                                warnThrottled("autostat:remote","[laced.club] Auto Stat: AddPoint failed: "..tostring(err),20)
-                                break
-                            end
-                            if cur then pending[e[2]]={lvl=cur+n,t=clock()} end
-                            -- Give the server up to ~1 s to update Data, then re-read.
-                            local waited=0
-                            repeat
-                                task.wait(0.12)
-                                waited=waited+0.12
-                                level(e[2])
-                            until not alive() or waited>=1 or pending[e[2]]==nil
-                            local fresh=points()
-                            pts=fresh and math.min(fresh,pts-n) or (pts-n)
-                            local after=level(e[2])
-                            if after and cap~=math.huge and after>=cap then capReached(e,cap) end
-                            updateLabel(pts)
+        if not pts or pts<=0 or remoteFailing("CommF_") or next(pending)~=nil then return end
+        for _,e in ipairs(statEntries) do
+            if not alive() then return end
+            if S[e[1]] then
+                local cap=capOf(e)
+                local live=liveLevel(e[2])
+                local cur=spendLevel(e[2])
+                if cur==nil and cap~=math.huge then
+                    -- Never spend blind against a cap.
+                    warnThrottled("autostat:read","[laced.club] Auto Stat: cannot read Data.Stats."..e[2]..".Level; capped stat skipped",30)
+                elseif live~=nil and cap~=math.huge and live>=cap then
+                    capReached(e,cap)
+                elseif cap-(cur or 0)>0 then
+                    local remaining=cap-(cur or 0)
+                    local amount=math.max(1,math.floor(tonumber(S.statAmount) or 10))
+                    local n=math.floor(math.min(amount,remaining,pts))
+                    if n>0 then
+                        local ok,_,err=invokeEnhancedComm("AddPoint",e[2],n)
+                        if not ok then
+                            warnThrottled("autostat:remote","[laced.club] Auto Stat: AddPoint failed: "..tostring(err),20)
+                            return
                         end
+                        pending[e[2]]={base=live,lvl=(cur or 0)+n,pts=pts,t=clock(),entry=e}
+                        -- Give Data up to ~1 s; an unproven spend stays pending
+                        -- (blocking every stat) until AUTO_STAT_CONFIRM_SECS.
+                        local waited=0
+                        repeat
+                            task.wait(0.12)
+                            waited=waited+0.12
+                            resolvePending()
+                        until not alive() or waited>=1 or pending[e[2]]==nil
+                        updateLabel(points())
+                        return -- one spend per pass; the next pass re-reads everything
                     end
                 end
+                -- else: the cap is reached only by spends Data has not shown
+                -- yet (floor/pending): hold, do not switch the toggle off.
             end
+        end
+    end
+    while alive() do
+        local okPass,passError=pcall(pass)
+        if not okPass then
+            warnThrottled("autostat:error","[laced.club] Auto Stat error: "..tostring(passError),30)
+            task.wait(2)
         end
         if remoteFailing("CommF_") then task.wait(5) else task.wait(0.5) end
     end
 end)
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["80_misc2"] = true end

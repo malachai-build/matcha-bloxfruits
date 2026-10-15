@@ -1,8 +1,12 @@
 -- @chunk 40_combat  (lines 3651-4274 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["40_combat"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
 function localRootPosition()
     local char=LocalPlayer.Character
     local hrp=char and char:FindFirstChild("HumanoidRootPart")
@@ -11,19 +15,25 @@ function localRootPosition()
     return okPos and pos or nil
 end
 
+HARD_LOCK_LAST = 0
 function hardLockNpcCFrame(hrp,targetPos)
     if not hrp or not targetPos then return end
-    moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rootRotation(hrp))
+    -- 30 Hz cap (was every frame, 60 Hz). 4 ms slack so 60 Hz frame jitter
+    -- does not turn every other frame into every third.
+    local now=clock()
+    if now-HARD_LOCK_LAST<writeInterval(1/ROOT_WRITE_HZ)-0.004 then return end
+    HARD_LOCK_LAST=now
+    if not moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rootRotation(hrp)) then return end
 
     pcall(function()
         local velocity=hrp.Velocity
-        if velocity and velocity.X and velocity.Z then
+        if velocity and velocity.X and velocity.Z and math.abs(velocity.Y)>0.01 then
             hrp.Velocity=Vector3.new(velocity.X,0,velocity.Z)
         end
     end)
     pcall(function()
         local assemblyVelocity=hrp.AssemblyLinearVelocity
-        if assemblyVelocity and assemblyVelocity.X and assemblyVelocity.Z then
+        if assemblyVelocity and assemblyVelocity.X and assemblyVelocity.Z and math.abs(assemblyVelocity.Y)>0.01 then
             hrp.AssemblyLinearVelocity=Vector3.new(assemblyVelocity.X,0,assemblyVelocity.Z)
         end
     end)
@@ -66,8 +76,9 @@ end
 
 -- Head hitbox expansion shared by every click-farm loop. Remembers the
 -- original size so it can be restored when the fight ends.
+HEAD_APPLY_INTERVAL = 0.25
 function headExpander(model)
-    local state={head=nil,size=nil,canCollide=nil}
+    local state={head=nil,size=nil,canCollide=nil,nextApply=0}
     local okHead,head=pcall(function() return model:FindFirstChild("Head") end)
     if okHead and head then
         state.head=head
@@ -76,20 +87,39 @@ function headExpander(model)
             state.canCollide=head.CanCollide
         end)
     end
+    -- A dying enemy is destroyed shortly after its Humanoid reaches 0 HP: no
+    -- write may race that destroy.
+    local function modelAlive()
+        local okAlive,result=pcall(function()
+            if not model.Parent then return false end
+            local hum=model:FindFirstChildOfClass("Humanoid")
+            return hum~=nil and hum.Health~=nil and hum.Health>0
+        end)
+        return okAlive and result==true
+    end
     function state.apply()
+        if writesPaused() then return end -- CommF_ quiet window
+        local now=clock()
+        if now<state.nextApply then return end
+        state.nextApply=now+writeInterval(HEAD_APPLY_INTERVAL)
+        if not modelAlive() then return end
         local okCurrent,current=pcall(function() return model:FindFirstChild("Head") end)
-        if okCurrent and current then state.head=current end
-        if state.head then
-            local size=S.bigHitbox and 200 or 50
-            pcall(function()
-                state.head.Size=Vector3.new(size,size,size)
-                state.head.CanCollide=false
-            end)
-        end
+        if not okCurrent or not current then return end
+        state.head=current
+        local size=S.bigHitbox and 200 or 50
+        pcall(function()
+            if not current.Parent then return end
+            local s=current.Size
+            if not (s and s.X and math.abs(s.X-size)<0.01 and math.abs(s.Y-size)<0.01 and math.abs(s.Z-size)<0.01) then
+                current.Size=Vector3.new(size,size,size)
+            end
+            if current.CanCollide~=false then current.CanCollide=false end
+        end)
     end
     function state.restore()
         local target=state.head
         if not target or not state.size then return end
+        if not modelAlive() then return end
         pcall(function()
             if target.Parent then
                 target.Size=state.size
@@ -160,7 +190,10 @@ function farmAttack(hrp, checkFn, enemyName, useTween, maxDistance, attackFn, at
         if now-lastClick>=hitDelay then
             lastClick=now
             if attackFn then
-                task.spawn(attackFn, nearest)
+                -- Matcha's task.spawn forwards no arguments: attackFn used to
+                -- get nil and hit the first enemy in range, not this target.
+                local target=nearest
+                task.spawn(function() attackFn(target) end)
             else
                 farmClick()
             end
@@ -216,7 +249,7 @@ BasicM1 = {
     comboReset   = 0.75,  -- client resets the combo after 0.75 s without a swing
     maxExtra     = 9,     -- extra rigs per swing (client cap: 10 rigs total, Buddha only)
     maxDist      = REMOTE_MAX_DIST,
-    minInterval  = 0.045, -- per caller tag; farms call at 0.05 s
+    minInterval  = 0.25,  -- per caller tag (was 0.045: ~20 swings = 40 FireServer/s); the client's own M1 is ~3-4/s
     noDamageSecs = 2.0,   -- watchdog: advance profile after this long with no HP loss
     requireTool  = true,  -- the server-side M1 needs an equipped weapon
     hitParts     = { "Head", "UpperTorso", "LowerTorso", "LeftLowerLeg", "RightLowerLeg",
@@ -337,10 +370,17 @@ end
 -- existing safeRemote/remoteFailing tags ("" -> "RegisterAttack"/"RegisterHit",
 -- "NPC Aura " -> "NPC Aura RegisterHit", ...), so the back-off and the Remote
 -- Mode auto-off keep working unchanged.
+function BasicM1.ready(tagPrefix)
+    return clock() - (BasicM1.lastFireBy[tagPrefix] or 0) >= writeInterval(BasicM1.minInterval)
+end
+
 function BasicM1.fire(tagPrefix, primaryPart, extras)
     if not primaryPart or not ensureRemotes() then return false end
+    -- Never swing while a CommF_ invoke (quest accept/abandon, AddPoint) is
+    -- pending: the remotes are serialised (see quietInvoke in 00_core).
+    if remoteInvokePending() then return false end
+    if not BasicM1.ready(tagPrefix) then return false end
     local now = clock()
-    if now - (BasicM1.lastFireBy[tagPrefix] or 0) < BasicM1.minInterval then return false end
     BasicM1.lastFireBy[tagPrefix] = now
     local prof = BasicM1.profiles[BasicM1.profile] or BasicM1.profiles[1]
     if now - BasicM1.lastSwing > BasicM1.comboReset then BasicM1.combo = 0 end
@@ -352,8 +392,21 @@ function BasicM1.fire(tagPrefix, primaryPart, extras)
         safeRemote(tagPrefix .. "RegisterAttack", _remoteRegAtk, "FireServer", BasicM1.attackLen)
     end
     frameWait()
+    -- The frame above can despawn rigs collected before it: re-check them so
+    -- RegisterHit never carries a part that has left the DataModel.
+    local function attached(part)
+        local okParent, parent = pcall(function() return part.Parent end)
+        return okParent and parent ~= nil
+    end
+    if not attached(primaryPart) or remoteInvokePending() then return false end
+    local fresh = {}
+    for _, pair in ipairs(extras or {}) do
+        if type(pair) == "table" and pair[1] and pair[2] and BasicM1.alive(pair[1]) and attached(pair[2]) then
+            fresh[#fresh + 1] = pair
+        end
+    end
     local okHit = safeRemote(tagPrefix .. "RegisterHit", _remoteRegHit, "FireServer",
-        primaryPart, extras or {}, nil, BasicM1.sessionId())
+        primaryPart, fresh, nil, BasicM1.sessionId())
     _lastRemoteFire = clock()
     return okHit
 end
@@ -391,6 +444,8 @@ end
 -- farmClick() only as the fallback when Remote Mode is off.
 function basicAttack(target)
     if S.remoteMode then
+        -- Swing gate first: also skips the Enemies scan in BasicM1.collect.
+        if not BasicM1.ready("") then return false end
         if BasicM1.requireTool and type(getCurrentlyHeldTool) == "function" then
             local okTool, tool = pcall(getCurrentlyHeldTool)
             if okTool and not tool then return false end
@@ -575,7 +630,9 @@ do
                             local attackDelay=useRemote and 0.05 or 0.06
                             if now-lastAttack>=attackDelay then
                                 lastAttack=now
-                                if useRemote then task.spawn(remoteAttack, target)
+                                if useRemote then
+                                    local swingTarget=target -- task.spawn forwards no arguments
+                                    task.spawn(function() remoteAttack(swingTarget) end)
                                 else farmClick() end
                             end
                             frameWait()
@@ -613,11 +670,14 @@ do
                 and Dungeon.targetingObjective and dungeonIsAlive(Dungeon.target) then
                 for _,keyCode in pairs(skillKeys) do
                     if not S.dungeonEnabled or not dungeonIsAlive(Dungeon.target) then break end
-                    pcall(function()
-                        keypress(keyCode)
-                        task.wait(0.04)
-                        keyrelease(keyCode)
-                    end)
+                    -- Keys go to whatever window has focus: only with Roblox in front.
+                    if robloxFocused() then
+                        pcall(function()
+                            keypress(keyCode)
+                            task.wait(0.04)
+                            keyrelease(keyCode)
+                        end)
+                    end
                     task.wait(0.16)
                 end
             end
@@ -627,3 +687,5 @@ do
 
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["40_combat"] = true end

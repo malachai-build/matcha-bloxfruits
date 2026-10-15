@@ -3,6 +3,8 @@ dist/an_*.txt
 dist/ug_*.txt
 dist/defs_*.txt
 dist/analyze_*.txt
+dist/loader_harness.luau
+dist/static_stability.txt
 # editor / OS
 .vscode/
 *.swp

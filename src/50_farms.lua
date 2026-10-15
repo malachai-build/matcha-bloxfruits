@@ -1,8 +1,13 @@
 -- @chunk 50_farms  (lines 4275-5015 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["50_farms"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
 function getChestType(chest)
     local okName,name=pcall(function() return chest and chest.Name end)
     if not okName or type(name)~="string" then return "Other" end
@@ -57,6 +62,9 @@ function getPriorityChest(children,hrp)
 end
 
 task.spawn(function()
+    -- An unreachable chest (tween never ends within 2 studs) is given up after
+    -- three tries instead of being picked again every 0.25 s forever.
+    local chestTries={}
     while alive() do
         if S.autoFarming and not farmPriorityBlocked() then
             local reachedChest=false
@@ -83,9 +91,14 @@ task.spawn(function()
                             local dx=currentPos.X-destination.X
                             local dy=currentPos.Y-destination.Y
                             local dz=currentPos.Z-destination.Z
+                            local chestKey=trackedInstanceKey(chest)
                             if dx*dx+dy*dy+dz*dz<=4 then
-                                S.handledChests[trackedInstanceKey(chest)]=true
+                                S.handledChests[chestKey]=true
+                                chestTries[chestKey]=nil
                                 reachedChest=true
+                            elseif S.autoFarming and not farmPriorityBlocked() then
+                                chestTries[chestKey]=(chestTries[chestKey] or 0)+1
+                                if chestTries[chestKey]>=3 then S.handledChests[chestKey]=true; chestTries[chestKey]=nil end
                             end
                         end
                     end
@@ -316,6 +329,10 @@ function partStillThere(part)
 end
 
 task.spawn(function()
+    -- A fruit still there after a full collect attempt is skipped for 60 s, so
+    -- it cannot hold the priority flag (which pauses every other farm) in a
+    -- 3 s loop forever.
+    local fruitBlock={}
     while alive() do
         if S.autoFruits then
             local okStep,stepError=pcall(function()
@@ -325,9 +342,11 @@ task.spawn(function()
                 local bestPart, bestDist=nil, math.huge
                 local okHrp, hrpPos=pcall(function() return hrp.Position end)
                 if okHrp and hrpPos and hrpPos.X and hrpPos.Y and hrpPos.Z then
+                    local now=clock()
+                    for key,untilAt in pairs(fruitBlock) do if now>=untilAt then fruitBlock[key]=nil end end
                     for _, fruit in pairs(getWorkspaceFruits()) do
                         local fp, fpPos=fruit.part, getSafeFruitPosition(fruit.part)
-                        if fp and fpPos then
+                        if fp and fpPos and not fruitBlock[getFruitInstanceKey(fp)] then
                             local dx=fpPos.X-hrpPos.X
                             local dy=fpPos.Y-hrpPos.Y
                             local dz=fpPos.Z-hrpPos.Z
@@ -352,12 +371,15 @@ task.spawn(function()
 
                     if arrived and S.autoFruits then
                         task.wait(1)
-                        equipWeaponSlot(S.weaponSlot)
+                        if alive() and S.autoFruits then equipWeaponSlot(S.weaponSlot) end
                     end
 
                     local fruitWaitStart=clock()
                     while alive() and S.autoFruits and partStillThere(bestPart) and clock()-fruitWaitStart<3 do
                         task.wait(0.05)
+                    end
+                    if alive() and S.autoFruits and partStillThere(bestPart) then
+                        fruitBlock[getFruitInstanceKey(bestPart)]=clock()+60
                     end
                 end
             end
@@ -374,15 +396,22 @@ end)
 
 task.spawn(function()
     local equipping=false
+    -- Bounded retry: after 5 failed attempts in a row (empty slot, lost tool)
+    -- one attempt every 5 s instead of a key tap every ~0.4 s.
+    local failures=0
+    local nextTry=0
     while alive() do
         local farming=S.autoFarmNearest or S.autoNpcFarm or S.autoFarmLevel or S.autoRaid or S.autoBossFarm or S.autoMaterialFarm or S.autoSeaEvent
             or S.autoFarmQuest or S.dungeonEnabled or S.autoMastery
+        if not farming then failures=0 end
         -- One equip attempt at a time: overlapping key taps toggle the tool back off.
-        if farming and not equipping and not getCurrentlyHeldTool() then
+        if farming and not equipping and clock()>=nextTry and not getCurrentlyHeldTool() then
             local selectedSlot=S.weaponSlot
             equipping=true
             task.spawn(function()
-                pcall(equipWeaponSlot,selectedSlot)
+                local okEquip,equipped=pcall(equipWeaponSlot,selectedSlot)
+                if okEquip and equipped then failures=0 else failures=failures+1 end
+                if failures>=5 then nextTry=clock()+5 end
                 equipping=false
             end)
         end
@@ -427,12 +456,9 @@ task.spawn(function()
                 notify("NPC Farm: going to "..tostring(island.name),"laced.club",2)
                 tweenTo(hrp, Vector3.new(ip.X,ip.Y,ip.Z), S.NPC_TWEEN_SPEED, function() return S.autoNpcFarm and not farmPriorityBlocked() end)
                 task.wait(0.5)
-                local char2=LocalPlayer.Character
-                if char2 then
-                    for _,part in pairs(char2:GetChildren()) do
-                        pcall(function() if isA(part,"BasePart") then part.CanCollide=false end end)
-                    end
-                end
+                -- Same parts as before (every BasePart child of the character);
+                -- restored below when the farm stops (it used to stay off).
+                afl_setCanCollide(false)
                 while alive() and S.autoNpcFarm and not farmPriorityBlocked() do
                     local hrp2=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if not hrp2 then task.wait(0.1); break end
@@ -447,6 +473,7 @@ task.spawn(function()
                 end
             end
             end)
+            if S.collisionOff then pcall(afl_setCanCollide,true) end
             if not okStep then warnThrottled("npcFarm","[laced.club] NPC farm step failed: "..tostring(stepError),15) end
             task.wait(0.1)
         else task.wait(0.1) end
@@ -586,15 +613,31 @@ end
 
 -- afl_setCanCollide(on) sets CanCollide to `on` (it used to write `not on`,
 -- so the travel tween ran WITH collisions and noclip was left on afterwards).
+-- Writes only parts whose value differs (fewer bridge writes) and records in
+-- S.collisionOff that this run switched collisions off, so unload restores
+-- them (shutdown hook below).
 function afl_setCanCollide(on)
     local char=afl_getCharacter()
     if not char then return end
+    if writesPaused() then return end
+    S.collisionOff=(on==false)
     for _,c in pairs(char:GetChildren()) do
         pcall(function()
-            if isA(c,"BasePart") then c.CanCollide=on end
+            if isA(c,"BasePart") and c.CanCollide~=on then c.CanCollide=on end
         end)
     end
 end
+onShutdown(function()
+    if S.collisionOff then
+        S.collisionOff=false
+        local char=afl_getCharacter()
+        if char then
+            for _,c in pairs(char:GetChildren()) do
+                pcall(function() if isA(c,"BasePart") and c.CanCollide~=true then c.CanCollide=true end end)
+            end
+        end
+    end
+end)
 
 function afl_teleportTo(position)
     local char,hrp=afl_getCharacter()
@@ -744,3 +787,5 @@ function afl_waitDialogueOption(optionNumber,timeout,notAddress)
     return lastObject,lastCenter
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["50_farms"] = true end

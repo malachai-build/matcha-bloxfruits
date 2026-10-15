@@ -1,17 +1,26 @@
 -- @chunk 70_misc  (lines 6379-7475 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["70_misc"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
 function localRoot()
     local char=LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart") or nil
 end
 
+-- Stability pass (Oct 15 2026): 30 Hz instead of every frame, only living
+-- enemies (no write races a despawn), CanCollide written only when it is
+-- still true, nothing during a CommF_ quiet window, idle cadence while off.
+PULL_WRITE_HZ=30
 function doPullLoop(flag, getPoint)
     task.spawn(function()
         while alive() do
-            if flag() then
+            local on=flag()
+            if on and not writesPaused() then
                 local myHrp=localRoot()
                 local okPoint,pullPoint=pcall(getPoint,myHrp)
                 local folder=Workspace:FindFirstChild("Enemies")
@@ -19,15 +28,18 @@ function doPullLoop(flag, getPoint)
                     -- Inline per enemy: the old code spawned one thread per enemy every frame.
                     for _, model in pairs(folder:GetChildren()) do
                         pcall(function()
-                            if isA(model,"Model") then
+                            if isA(model,"Model") and isAlive(model) then
                                 local hrp=model:FindFirstChild("HumanoidRootPart")
-                                if hrp then hrp.CanCollide=false; hrp.Position=pullPoint end
+                                if hrp then
+                                    if hrp.CanCollide~=false then hrp.CanCollide=false end
+                                    hrp.Position=pullPoint
+                                end
                             end
                         end)
                     end
                 end
             end
-            frameWait()
+            if on then task.wait(writeInterval(1/PULL_WRITE_HZ)) else task.wait(IDLE_POLL) end
         end
     end)
 end
@@ -36,38 +48,55 @@ doPullLoop(function() return S.pullEnemies end,  function(h) return Vector3.new(
 doPullLoop(function() return S.buddhaPull end,   function(h) return Vector3.new(h.Position.X+37, h.Position.Y-3, h.Position.Z) end)
 doPullLoop(function() return S.customPull end,   function(h) return Vector3.new(h.Position.X+S.customPullX, h.Position.Y+S.customPullY, h.Position.Z+S.customPullZ) end)
 
+-- Auto Ken / Auto Haki: keys only with Roblox in front (they went to any
+-- window), and after 5 presses that did not turn the state on (attribute
+-- missing or renamed: Matcha reads it as nil) one press every 10 s instead of
+-- every pass.
 task.spawn(function()
+    local misses,nextPress=0,0
     while alive() do
         task.wait(0.1)
         if S.autoKen then
             local okAttr,kenActive=pcall(function() return LocalPlayer:GetAttribute("KenActive") end)
-            if okAttr and not kenActive then
+            if okAttr and kenActive then misses=0 end
+            if okAttr and not kenActive and robloxFocused() and clock()>=nextPress then
                 pcall(function() keypress(0x45); task.wait(0.1); keyrelease(0x45) end)
+                misses=misses+1
+                if misses>=5 then nextPress=clock()+10 end
             end
+        else
+            misses,nextPress=0,0
         end
     end
 end)
 
 task.spawn(function()
+    local misses,nextPress=0,0
     while alive() do
         task.wait(0.25)
         if S.autoHaki then
             local char=LocalPlayer.Character
-            if char and not char:FindFirstChild("HasBuso") then
+            if char and char:FindFirstChild("HasBuso") then misses=0 end
+            if char and not char:FindFirstChild("HasBuso") and robloxFocused() and clock()>=nextPress then
                 pcall(function()
                     setrobloxinput(true)
                     keypress(0x4A)
                     task.wait(0.1)
                     keyrelease(0x4A)
                 end)
+                misses=misses+1
+                if misses>=5 then nextPress=clock()+10 end
             end
+        else
+            misses,nextPress=0,0
         end
     end
 end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
+        -- 30 Hz while on (two root writes per pass), idle cadence while off.
+        if S.freezePos then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
         if S.freezePos then
             local hrp=localRoot()
             if hrp then
@@ -87,8 +116,8 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
-        if S.freezeEnemies then
+        if S.freezeEnemies then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
+        if S.freezeEnemies and not writesPaused() then
             -- Keyed by Instance.Address: Instance userdata are not guaranteed to be
             -- the same table key between GetChildren calls.
             local folder=Workspace:FindFirstChild("Enemies")
@@ -105,7 +134,8 @@ task.spawn(function()
             end
             for key, frozen in pairs(S.frozenEnemies) do
                 local model=frozen.model
-                if partStillThere(model) then
+                -- Dead enemies are dropped: no write may race their despawn.
+                if partStillThere(model) and isAlive(model) then
                     pcall(function()
                         local hrp=model:FindFirstChild("HumanoidRootPart")
                         if hrp then
@@ -167,7 +197,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
+        idleWait(S.tweenEmber)
         if S.tweenEmber then
             zeroVelocity(localRoot())
         end
@@ -207,8 +237,8 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
-        if S.teleportEmber and not S.tweenEmber then
+        idleWait(S.teleportEmber and not S.tweenEmber)
+        if S.teleportEmber and not S.tweenEmber and not writesPaused() then
             local hrp=localRoot()
             if hrp then
                 pcall(function()
@@ -264,7 +294,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        frameWait()
+        idleWait(S.teleportKitsune)
         if S.teleportKitsune then
             zeroVelocity(localRoot())
         end
@@ -401,7 +431,7 @@ task.spawn(function()
                                     moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,nil)
                                     zeroVelocity(hrp)
                                     if alpha>=1 then notify("Arrived!","laced.club",2); break end
-                                    task.wait(0.01)
+                                    frameWait() -- was task.wait(0.01); alpha is time-based
                                 end
                             end
                             end)
@@ -444,27 +474,27 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.voidPull then
+        if S.voidPull and not writesPaused() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,100000,hrp.Position.Z) end)
                 zeroVelocity(hrp)
             end
         end
-        frameWait()
+        if S.voidPull then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
     end
 end)
 
 task.spawn(function()
     while alive() do
-        if S.skyPull then
+        if S.skyPull and not writesPaused() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,1000,hrp.Position.Z) end)
                 zeroVelocity(hrp)
             end
         end
-        frameWait()
+        if S.skyPull then task.wait(writeInterval(1/30)) else task.wait(IDLE_POLL) end
     end
 end)
 
@@ -544,7 +574,7 @@ task.spawn(function()
                         while engaged() do
                             local alpha=math.min((clock()-t0)/duration,1)
                             if not moveRoot(myHrp,startX+dx*alpha,startY+dy*alpha,startZ+dz*alpha,nil) then break end
-                            if alpha>=1 then break end; task.wait(0.01)
+                            if alpha>=1 then break end; frameWait()
                         end
                         local lastClick=0
                         local attackStart=clock()
@@ -590,6 +620,9 @@ task.spawn(function()
             else task.wait(0.5) end
             end)
             if not okStep then pvpTarget=nil; task.wait(0.5) end
+            -- Some branches above (target without a root) returned without
+            -- yielding: always yield once per pass.
+            frameWait()
         else pvpTarget=nil; task.wait(0.5) end
     end
 end)
@@ -817,7 +850,7 @@ do
     }
 
     local function fish_hold()
-        if not FishState.IsHolding and not menuUnderMouse() then FishState.IsHolding=true; pcall(mouse1press); FishState.Clicks=FishState.Clicks+1 end
+        if not FishState.IsHolding and robloxFocused() and not menuUnderMouse() then FishState.IsHolding=true; pcall(mouse1press); FishState.Clicks=FishState.Clicks+1 end
     end
     local function fish_release()
         if FishState.IsHolding then FishState.IsHolding=false; pcall(mouse1release) end
@@ -1037,6 +1070,12 @@ do
             end
         end
     })
+    -- Unload (also a re-run): never leave the left button held.
+    onShutdown(function()
+        FishState.Running=false
+        FishState.Generation=(FishState.Generation or 0)+1
+        fish_release()
+    end)
 end
 
 do
@@ -1050,7 +1089,7 @@ do
     end
 
     local function repairHold()
-        if not RepairState.holding and not menuUnderMouse() then
+        if not RepairState.holding and robloxFocused() and not menuUnderMouse() then
             RepairState.holding=true
             pcall(mouse1press)
         end
@@ -1097,6 +1136,10 @@ do
                 task.wait(0.2)
             end
         end
+        repairRelease()
     end)
+    onShutdown(function() repairRelease() end)
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["70_misc"] = true end

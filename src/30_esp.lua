@@ -1,8 +1,12 @@
 -- @chunk 30_esp  (lines 2951-3650 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["30_esp"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
 BERRIES={
     {name="Green Toad Berry",   sphere="Sphere.011"},
     {name="Yellow Star Berry",  sphere="Sphere.022"},
@@ -184,6 +188,16 @@ berryScanRunning=false
 BERRY_SCAN_BATCH=80
 BERRY_DRAW_DISTANCE=10000
 BERRY_DRAW_DISTANCE_SQ=BERRY_DRAW_DISTANCE*BERRY_DRAW_DISTANCE
+-- Stability pass (Oct 15 2026): the scan walks the whole Workspace tree and
+-- the 1 s builder restarted it as soon as it finished, so with Berry ESP on
+-- the script traversed the map continuously. Now a scan starts at most every
+-- BERRY_RESCAN_INTERVAL s (the toggle forces one at once), skips the
+-- top-level folders that never hold map berries, and stops expanding after
+-- BERRY_SCAN_MAX_OBJECTS objects.
+BERRY_RESCAN_INTERVAL=15
+BERRY_SCAN_MAX_OBJECTS=60000
+BERRY_SCAN_SKIP_ROOTS={Enemies=true,Characters=true,Camera=true,Boats=true,ChestModels=true}
+berryNextScanAt=0
 
 function isBerryWorldObject(object)
     local current=object
@@ -204,12 +218,14 @@ function isBerryWorldObject(object)
     return false
 end
 
-function buildBerryEspLabels()
+function buildBerryEspLabels(force)
     if berryScanRunning then
         return
     end
+    if not force and clock()<berryNextScanAt then return end
 
     berryScanRunning=true
+    berryNextScanAt=clock()+BERRY_RESCAN_INTERVAL
     local generation=S.berryScanGeneration
     task.spawn(function()
         -- A scan that outlives its toggle (off/on while it is yielded) stops
@@ -223,6 +239,7 @@ function buildBerryEspLabels()
             local publishedKeys={}
             local queue={}
             local queueIndex=1
+            local queueCount=0
             local processed=0
 
             local char=LocalPlayer and LocalPlayer.Character or nil
@@ -235,11 +252,20 @@ function buildBerryEspLabels()
 
             local okRoots,roots=pcall(function() return Workspace:GetChildren() end)
             if okRoots and roots then
-                for _,root in pairs(roots) do table.insert(queue,root) end
+                for _,root in pairs(roots) do
+                    local okRootName,rootName=pcall(function() return root.Name end)
+                    if not (okRootName and BERRY_SCAN_SKIP_ROOTS[rootName]) then
+                        queueCount=queueCount+1
+                        queue[queueCount]=root
+                    end
+                end
             end
 
-            while current() and queueIndex<=#queue do
+            while current() and queueIndex<=queueCount do
                 local object=queue[queueIndex]
+                -- Drop the reference once taken, so the wrappers of the part of
+                -- the tree already scanned can be collected during the scan.
+                queue[queueIndex]=nil
                 queueIndex=queueIndex+1
 
                 local okName,objectName=pcall(function() return object.Name end)
@@ -284,9 +310,14 @@ function buildBerryEspLabels()
                     end
                 end
 
-                local okChildren,children=pcall(function() return object:GetChildren() end)
-                if okChildren and children then
-                    for _,child in pairs(children) do table.insert(queue,child) end
+                if queueCount<BERRY_SCAN_MAX_OBJECTS then
+                    local okChildren,children=pcall(function() return object:GetChildren() end)
+                    if okChildren and children then
+                        for _,child in pairs(children) do
+                            queueCount=queueCount+1
+                            queue[queueCount]=child
+                        end
+                    end
                 end
 
                 processed=processed+1
@@ -301,12 +332,15 @@ function buildBerryEspLabels()
                 S.berryEspLabels=activeEntries
             end
         end)
-        berryScanRunning=false
+        -- Only the scan of the current generation owns the flag (a quick
+        -- off/on clears it and may already have started a newer scan).
+        if S.berryScanGeneration==generation then berryScanRunning=false end
+        berryNextScanAt=clock()+BERRY_RESCAN_INTERVAL
         if not okScan then warnThrottled("berryScan","[laced.club] Berry scan failed: "..tostring(scanError),30) end
     end)
 end
 
-TWEEN_STEP_TIME=0.01
+TWEEN_STEP_TIME=1/60 -- was 0.01 (~100 CFrame writes/s through the bridge); safe mode doubles it
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
 -- target was reached, false when stopped (checkFn false, part gone, unload).
@@ -315,6 +349,30 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local okStart,startPos=pcall(function() return hrp.Position end)
     if not okStart or not startPos then return false end
     local rotationCF=rootRotation(hrp)
+    -- The local character's root is re-fetched every step and compared by key:
+    -- after a death or respawn the old root (possibly freed) is never touched.
+    local rootKey=instKey(hrp)
+    local isLocalRoot=false
+    pcall(function()
+        local char=LocalPlayer.Character
+        local cur=char and char:FindFirstChild("HumanoidRootPart")
+        isLocalRoot=cur~=nil and instKey(cur)==rootKey
+    end)
+    local function currentPart()
+        if not isLocalRoot then
+            local okParent,parent=pcall(function() return hrp.Parent end)
+            return (okParent and parent) and hrp or nil
+        end
+        -- Stop when the character left the DataModel (death/respawn) or its
+        -- root is no longer the one this tween started with.
+        local okCur,cur=pcall(function()
+            local char=LocalPlayer.Character
+            if not char or not char.Parent then return nil end
+            return char:FindFirstChild("HumanoidRootPart")
+        end)
+        if okCur and cur and instKey(cur)==rootKey then return cur end
+        return nil
+    end
     local function keepGoing()
         if not alive() then return false end
         if not checkFn then return true end
@@ -329,15 +387,32 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local moveSpeed=tonumber(speed) or 320
     if moveSpeed<=0 then moveSpeed=320 end
     local duration=distance/moveSpeed; local startTime=clock()
+    -- Write-rate cap: never two CFrame writes closer than 90% of the step,
+    -- even if task.wait resumes early (a bare task.wait() resumes ~2,400
+    -- times a second in Matcha), however long the flight is.
+    local lastWrite=-1e9
     while keepGoing() do
-        local okParent,parent=pcall(function() return hrp.Parent end)
-        if not okParent or not parent then return false end
-        local alpha=math.min((clock()-startTime)/duration,1)
-        if not moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,rotationCF) then
-            return false
+        local step=writeInterval(TWEEN_STEP_TIME)
+        local since=clock()-lastWrite
+        if writesPaused() then
+            -- CommF_ quiet window (quietInvoke): no write; the flight resumes
+            -- where it stopped (startTime moves by the pause).
+            local pausedAt=clock()
+            task.wait(0.05)
+            startTime=startTime+(clock()-pausedAt)
+        elseif since<step*0.9 then
+            task.wait(step-since)
+        else
+            local part=currentPart()
+            if not part then return false end
+            local alpha=math.min((clock()-startTime)/duration,1)
+            if not moveRoot(part,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,rotationCF) then
+                return false
+            end
+            lastWrite=clock()
+            if alpha>=1 then return true end
+            task.wait(step)
         end
-        if alpha>=1 then return true end
-        task.wait(TWEEN_STEP_TIME)
     end
     return false
 end
@@ -703,3 +778,5 @@ function renderChamEntry(entry,playerPos)
     setEntryVisible(entry,true)
 end
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["30_esp"] = true end

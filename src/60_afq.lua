@@ -1,8 +1,15 @@
 -- @chunk 60_afq  (lines 5016-6378 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["60_afq"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local AFL = AFL
+local AFQ = AFQ
+local AFQ_DEBUG = AFQ_DEBUG
 AFL_QUEST_OFFSET_X=70
 AFL_QUEST_OFFSET_Y=50
 
@@ -127,11 +134,30 @@ end
 -- completed, any other number = level required. Under Matcha Hybrid mode the
 -- invoke returns a boolean (true) instead of the code, so a boolean true is
 -- taken as accepted.
+--
+-- Stability pass (Oct 15 2026): the user reports the client crashing
+-- consistently when this remote pickup fires. Every StartQuest now goes
+-- through quietInvoke (00_core: no part writes and no other remote for
+-- AFQ_REMOTE_QUIET_BEFORE/AFTER s around the invoke, one CommF_ invoke at a
+-- time), at most one per AFQ_REMOTE_MIN_INTERVAL s for the same quest, and
+-- AFQ_DEBUG.remoteAcceptOff = true stops it altogether (Auto Farm Quest then
+-- accepts through the giver dialogue, Level Farm clicks its dialogue).
+AFQ_REMOTE_MIN_INTERVAL=10 -- s between two StartQuest invokes for one quest, and between two AbandonQuest
+questRemoteLastAt={}       -- "giverKey#index" -> clock() of the last StartQuest invoke
+function afl_questRemoteWait(giverKey,questIndex)
+    local last=questRemoteLastAt[tostring(giverKey).."#"..tostring(questIndex)]
+    if not last then return 0 end
+    return math.max(0,AFQ_REMOTE_MIN_INTERVAL-(clock()-last))
+end
 function afl_startQuestRemote(giverKey,questIndex)
+    if AFQ_DEBUG and AFQ_DEBUG.remoteAcceptOff then return false,"remote accept disabled (AFQ_DEBUG.remoteAcceptOff)" end
     if remoteFailing("StartQuest") then return false,"StartQuest remote keeps failing" end
+    local left=afl_questRemoteWait(giverKey,questIndex)
+    if left>0 then return false,"StartQuest for this quest was sent less than "..AFQ_REMOTE_MIN_INTERVAL.."s ago" end
     local remote=afl_getQuestRemote()
     if not remote then return false,"CommF_ not found" end
-    local ok,result=safeRemote("StartQuest",remote,"InvokeServer","StartQuest",giverKey,questIndex)
+    questRemoteLastAt[tostring(giverKey).."#"..tostring(questIndex)]=clock()
+    local ok,result=quietInvoke("StartQuest",remote,"StartQuest",giverKey,questIndex)
     if not ok then return false,tostring(result) end
     if type(result)=="number" then
         if result==0 then return true end
@@ -167,10 +193,19 @@ function afl_setQuest()
         warnThrottled("questRemote","[laced.club] Remote quest accept failed ("..tostring(reason).."); clicking the dialogue instead",30)
     end
     AFL.lastQuestVia="click"
+    -- The clicks go to whatever window has focus, and the farm may be
+    -- switched off during the ~3 s of waits: check both between the clicks.
+    local function stillOn() return alive() and S.autoFarmLevel and robloxFocused() end
+    if not robloxFocused() then
+        warnThrottled("questClickFocus","[laced.club] Level Farm: the dialogue quest pickup needs the Roblox window in front",30)
+        return false
+    end
 
     wait(0.5)
+    if not stillOn() then return false end
     mouse1press(); wait(0.08); mouse1release()
     wait(1)
+    if not stillOn() then return false end
 
     local originalOption1=nil
     local initialOption1=afl_waitDialogueOption(1,3)
@@ -179,6 +214,7 @@ function afl_setQuest()
     local selected=afl_clickDialogueOption(quest.questButton,3)
     if not selected then return false end
     wait(0.35)
+    if not stillOn() then return false end
 
     local accepted=afl_clickDialogueOption(1,3,originalOption1)
     if not accepted then
@@ -763,7 +799,7 @@ function afq_bossDecide(boss,fallback)
         if not AFQ.bossUpAt then AFQ.bossUpAt=clock() end
         local done
         if onEntry then
-            done=AFQ.kills>=entry.count or (AFQ.trackerSeen and not afq_trackerFrame())
+            done=AFQ.kills>=entry.count or afq_trackerGone(afq_trackerFrame())
         else
             local k,n=afq_trackerProgress()
             done=(k~=nil and n~=nil and k>=n) or not afq_trackerFrame()
@@ -816,24 +852,77 @@ function afq_trackerFrame()
     return ok and frame or nil
 end
 
--- "k/n" progress from the tracker when it shows one; nil otherwise.
-function afq_trackerProgress()
+-- Address key of the tracker frame now on screen (nil: none).
+function afq_trackerKey()
     local frame=afq_trackerFrame()
+    return frame and instKey(frame) or nil
+end
+
+-- "The tracker seen after the accept has gone" = quest completed, but only
+-- after AFQ_TRACKER_GONE_SECS without a frame: a React remount (respawn, UI
+-- reload) used to read as a completed quest from one missing sample.
+AFQ_TRACKER_GONE_SECS=1.5
+function afq_trackerGone(tracker)
+    if tracker then AFQ.trackerMissingSince=nil; return false end
+    if not AFQ.trackerSeen then return false end
+    local now=clock()
+    if not AFQ.trackerMissingSince then AFQ.trackerMissingSince=now; return false end
+    return now-AFQ.trackerMissingSince>=AFQ_TRACKER_GONE_SECS
+end
+
+-- Text of every TrackedQuestFrame descendant, from one GetDescendants at most
+-- every AFQ_TRACKER_TTL s (afq_waitTrackerFor polls at 10 Hz). Strings are
+-- cached, never Instances, so a React re-render leaves no stale handles; a
+-- different frame (tracker closed and reopened) invalidates the cache.
+AFQ_TRACKER_TTL=1
+AFQ_TRACKER_CACHE={key=nil,at=-1e9,texts=nil}
+function afq_trackerTexts(frame)
     if not frame then return nil end
+    local key=instKey(frame)
+    local cache=AFQ_TRACKER_CACHE
+    local now=clock()
+    if cache.texts and cache.key==key and now-cache.at<AFQ_TRACKER_TTL then return cache.texts end
     local okDesc,descendants=pcall(function() return frame:GetDescendants() end)
     if not okDesc or not descendants then return nil end
+    local texts={}
     for _,d in pairs(descendants) do
         local okText,text=pcall(function() return d.Text end)
-        if okText and type(text)=="string" then
-            local k,n=string.match(text,"(%d+)%s*/%s*(%d+)")
-            if k and n then return tonumber(k),tonumber(n) end
-        end
+        if okText and type(text)=="string" and text~="" then texts[#texts+1]=text end
+    end
+    cache.key=key; cache.at=now; cache.texts=texts
+    return texts
+end
+
+-- "k/n" progress from the tracker when it shows one; nil otherwise.
+function afq_trackerProgress()
+    local texts=afq_trackerTexts(afq_trackerFrame())
+    if not texts then return nil end
+    for _,text in ipairs(texts) do
+        local k,n=string.match(text,"(%d+)%s*/%s*(%d+)")
+        if k and n then return tonumber(k),tonumber(n) end
     end
     return nil
 end
 
+-- AFQ.stepGen is the generation the running step started with; the toggle
+-- callback bumps AFQ.gen, so a step left over from before a quick off/on
+-- stops at its next check instead of writing into the freshly reset state.
 function afq_farming()
-    return alive() and S.autoFarmQuest==true and not farmPriorityFeatureActive()
+    return alive() and S.autoFarmQuest==true and AFQ.stepGen==AFQ.gen and not farmPriorityFeatureActive()
+end
+
+-- Sleep up to seconds, in steps of at most 0.25 s, ending early when the
+-- farm stops (a plain wait(60) would keep the step alive after toggle off).
+function afq_sleep(seconds)
+    local untilAt=clock()+(tonumber(seconds) or 0)
+    repeat
+        task.wait(math.min(0.25,math.max(0.05,untilAt-clock())))
+    until clock()>=untilAt or not afq_farming()
+end
+
+-- Bounded retry backoff: 3 s, 6 s, 12 s ... at most 60 s.
+function afq_backoff(fails)
+    return math.min(3*2^(math.max(1,fails)-1),60)
 end
 
 -- Level the quest selector uses: AFQ_DEBUG.forceLevel when it is a number
@@ -856,8 +945,8 @@ end
 function afq_trackerQuestIs(q)
     local frame=afq_trackerFrame()
     if not frame then return nil end
-    local okDesc,descendants=pcall(function() return frame:GetDescendants() end)
-    if not okDesc or not descendants then return "unknown" end
+    local texts=afq_trackerTexts(frame)
+    if not texts then return "unknown" end
     local names={}
     for _,n in ipairs({q.enemy,q.internalName}) do
         if type(n)=="string" and n~="" then
@@ -867,9 +956,8 @@ function afq_trackerQuestIs(q)
         end
     end
     local sawObjective=false
-    for _,d in pairs(descendants) do
-        local okText,text=pcall(function() return d.Text end)
-        if okText and type(text)=="string" then
+    for _,text in ipairs(texts) do
+        do
             local lower=string.lower(string.match(text,"^%s*(.-)%s*$") or text)
             local objective=string.find(lower,"^defeat%s")~=nil
             if objective then sawObjective=true end
@@ -893,15 +981,98 @@ end
 -- InvokeServer returns only a boolean, so the refusal cannot be read from
 -- the result and the old quest has to be abandoned first. Waits up to 1.5 s
 -- (0.1 s steps) for the tracker to go away.
-function afq_abandon()
+--
+-- Stability pass (Oct 15 2026): the local quest state used to be wiped as the
+-- first statement, before the remote ran or was seen to work, and the result
+-- was the pcall status only. Now: no tracker on screen = nothing to abandon
+-- (local state dropped, no invoke); otherwise at most one AbandonQuest per
+-- AFQ_REMOTE_MIN_INTERVAL s through quietInvoke, and the local state is
+-- dropped only once the tracker is gone. Returns ok, reason; on false the
+-- held quest is kept and the caller backs off.
+function afq_clearHeld()
     AFQ.current=nil; AFQ.accepted=false; AFQ.trackerSeen=false; AFQ.kills=0; AFQ.selectedNpc=nil
-    if AFQ_DEBUG.noAccept then return true end
+    AFQ.trackerMissingSince=nil
+end
+function afq_abandon()
+    if AFQ_DEBUG.noAccept then afq_clearHeld(); return true end
+    if not afq_trackerFrame() then afq_clearHeld(); return true end
+    if AFQ_DEBUG.remoteAcceptOff then
+        return false,"AbandonQuest is off with AFQ_DEBUG.remoteAcceptOff (finish or abandon the quest by hand)"
+    end
+    local since=clock()-(AFQ.lastAbandonAt or -1e9)
+    if since<AFQ_REMOTE_MIN_INTERVAL then
+        return false,"AbandonQuest was sent "..math.floor(since).."s ago (at most one per "..AFQ_REMOTE_MIN_INTERVAL.."s)"
+    end
+    if remoteFailing("AbandonQuest") then return false,"AbandonQuest remote keeps failing" end
     local remote=afl_getQuestRemote()
-    if not remote then return false end
-    local ok=safeRemote("AbandonQuest",remote,"InvokeServer","AbandonQuest")
-    local deadline=clock()+1.5
-    while afq_farming() and afq_trackerFrame() and clock()<deadline do task.wait(0.1) end
-    return ok
+    if not remote then return false,"CommF_ not found" end
+    AFQ.lastAbandonAt=clock()
+    local ok,err=quietInvoke("AbandonQuest",remote,"AbandonQuest")
+    if not ok then return false,"AbandonQuest failed: "..tostring(err) end
+    -- InvokeServer returns only a boolean: the tracker going away is the
+    -- proof. Polled at 2 Hz (FindFirstChild only), at most 2 s.
+    local deadline=clock()+2
+    while afq_farming() and afq_trackerFrame() and clock()<deadline do task.wait(0.5) end
+    if afq_trackerFrame() then return false,"the tracker still shows a quest after AbandonQuest" end
+    afq_clearHeld()
+    return true
+end
+
+-- Accept proof (Matcha's InvokeServer returns only a boolean): poll the
+-- tracker until it shows quest q, for at most seconds. Stability pass (Oct 15
+-- 2026): polled at AFQ_TRACKER_POLL (2 Hz) through the cached tracker
+-- strings (afq_trackerTexts, at most one GetDescendants per second), starting
+-- after quietInvoke's quiet window, not at 10 Hz right after the invoke.
+-- False whenever the farm was switched off (it used to return the last
+-- poll's result). An unreadable tracker ("unknown") counts only when a
+-- tracker frame appeared during this accept (none before, or a different
+-- one: beforeKey = afq_trackerKey() taken before the invoke); a frame that
+-- was already there proves nothing.
+AFQ_REMOTE_ACCEPT_WAIT=3    -- s the tracker may take to show an accepted quest (was 2 s at 10 Hz)
+AFQ_TRACKER_POLL=0.5
+function afq_waitTrackerFor(q,seconds,beforeKey)
+    local deadline=clock()+(seconds or AFQ_REMOTE_ACCEPT_WAIT)
+    local state=afq_trackerQuestIs(q)
+    while state~="same" and clock()<deadline and afq_farming() do
+        task.wait(AFQ_TRACKER_POLL)
+        state=afq_trackerQuestIs(q)
+    end
+    if not afq_farming() then return false end
+    if state=="same" then return true end
+    if state=="unknown" then
+        local key=afq_trackerKey()
+        return key~=nil and key~=beforeKey
+    end
+    return false
+end
+
+-- Seconds until a StartQuest for q may be sent (0 = now): never inside the
+-- switch cooldown, at most one per AFQ_REMOTE_MIN_INTERVAL s per quest.
+function afq_acceptWait(q)
+    local cooldown=AFQ_SWITCH_COOLDOWN-(clock()-(AFQ.lastSwitch or -1e9))
+    return math.max(0,cooldown,afl_questRemoteWait(q.giverKey,q.questIndex))
+end
+
+-- No-remote accept for the A/B test (AFQ_DEBUG.remoteAcceptOff): the Level
+-- Farm dialogue clicks at the giver (questButton = questIndex for every
+-- quest, checked against the Quests module). Needs Roblox in front.
+function afq_acceptByDialogue(q)
+    if not robloxFocused() then return false,"the dialogue accept needs the Roblox window in front" end
+    wait(0.5)
+    if not afq_farming() then return false,"stopped" end
+    mouse1press(); wait(0.08); mouse1release()
+    wait(1)
+    if not afq_farming() then return false,"stopped" end
+    local original=nil
+    local first=afl_waitDialogueOption(1,3)
+    if first then pcall(function() original=first.Address end) end
+    if not afl_clickDialogueOption(q.questIndex,3) then return false,"quest option "..q.questIndex.." not found in the dialogue" end
+    wait(0.35)
+    if not afq_farming() then return false,"stopped" end
+    local accepted=afl_clickDialogueOption(1,3,original)
+    if not accepted then wait(0.4); accepted=afl_clickDialogueOption(1,1) end
+    if not accepted then return false,"accept option not found in the dialogue" end
+    return true
 end
 
 -- Cheap level read during a fight: when the selection no longer matches the
@@ -952,7 +1123,7 @@ function afq_holdAt(position,seconds)
             moveRoot(root,position.X,position.Y,position.Z,rootRotation(root))
             zeroVelocity(root)
         end
-        frameWait()
+        task.wait(writeInterval(1/ROOT_WRITE_HZ))
     until clock()>=deadline or not afq_farming()
 end
 
@@ -1028,8 +1199,12 @@ function afq_nearestEnemy(q)
     local ok,enemies=pcall(function() return folder:GetChildren() end)
     if not ok or not enemies then return nil end
     local best,bestD=nil,math.huge
+    local now=clock()
+    local blocked=AFQ.npcBlock or {}
+    for key,untilAt in pairs(blocked) do if now>=untilAt then blocked[key]=nil end end
+    local anyBlocked=next(blocked)~=nil
     for _,enemy in pairs(enemies) do
-        if enemy and enemy.Parent and isA(enemy,"Model") then
+        if enemy and enemy.Parent and isA(enemy,"Model") and not (anyBlocked and blocked[instKey(enemy)]) then
             local hrp=enemy:FindFirstChild("HumanoidRootPart")
             local hum=enemy:FindFirstChildOfClass("Humanoid")
             local name=""
@@ -1062,7 +1237,12 @@ function afq_fight(npc)
     AFQ.activeHead=head
     while hum and hum.Health>0 and partStillThere(npc) and afq_farming() do
         if not partStillThere(hrp) then break end
-        if clock()-fightStart>50 then break end
+        if clock()-fightStart>50 then
+            -- Not damageable (out of reach, immune, safe zone): skip it for 60 s
+            -- instead of fighting it again in 50 s blocks forever.
+            if type(AFQ.npcBlock)=="table" then AFQ.npcBlock[instKey(npc)]=clock()+60 end
+            break
+        end
         local char,playerHrp=afl_getCharacter()
         if not char or not playerHrp then break end
         local okEnemy,enemyPos=pcall(function() return hrp.Position end)
@@ -1093,7 +1273,7 @@ function afq_fight(npc)
         elseif useRemote then
             if now-lastRemoteAttack>=0.05 then remoteAttack(npc); lastRemoteAttack=now end
         else
-            if now-lastClick>=0.06 then farmClick(); lastClick=now end
+            if now-lastClick>=writeInterval(0.06) then farmClick(); lastClick=now end
         end
         frameWait()
         hrp=npc:FindFirstChild("HumanoidRootPart")
@@ -1130,7 +1310,7 @@ function afq_step()
     -- interleave switches to the boss only after the fallback quest is done,
     -- and back to the fallback after the boss quest's single kill.
     if held and not afq_sameQuest(held,q) and AFQ.accepted and AFQ.entry and afq_sameQuest(held,AFQ.entry)
-        and (AFQ.kills>=AFQ.entry.count or (AFQ.trackerSeen and not afq_trackerFrame())) then
+        and (AFQ.kills>=AFQ.entry.count or afq_trackerGone(afq_trackerFrame())) then
         AFQ.current=nil; held=nil
     end
     if held and not afq_sameQuest(held,q) then
@@ -1148,12 +1328,26 @@ function afq_step()
             afq_logSwitch("Lv "..level..": switching "..held.giverKey.." #"..held.questIndex
                 .." -> "..q.giverKey.." #"..q.questIndex.." (abandoning the old quest)")
             AFQ.lastSwitch=clock()
-            afq_abandon()
+            local okAbandon,why=afq_abandon()
+            if not okAbandon then
+                -- The held quest is kept (and farmed meanwhile, see the cooldown
+                -- branch above); the next switch attempt waits a bounded backoff.
+                AFQ.abandonFails=(AFQ.abandonFails or 0)+1
+                local backoff=math.max(AFQ_SWITCH_COOLDOWN,afq_backoff(AFQ.abandonFails))
+                AFQ.lastSwitch=clock()+backoff-AFQ_SWITCH_COOLDOWN
+                afq_logSwitch("Lv "..level..": abandon of "..held.giverKey.." #"..held.questIndex
+                    .." not confirmed ("..tostring(why).."), keeping it; retry in "..math.ceil(backoff).."s")
+                afq_sleep(0.5)
+                return
+            end
+            AFQ.abandonFails=0
             AFQ.entry=nil
             if not afq_farming() then return end
         end
     end
     local function setStatus(extra)
+        -- A step that outlived its toggle must not overwrite the "off" status.
+        if not afq_farming() then return end
         local mode=AFQ.bossMode
         local text
         if mode and q.boss and afq_sameQuest(q,AFQ.bossQuest) then
@@ -1171,10 +1365,18 @@ function afq_step()
     end
     if AFQ.entry~=q then
         AFQ.entry=q; AFQ.kills=0; AFQ.accepted=false; AFQ.trackerSeen=false; AFQ.selectedNpc=nil
-        AFQ.switchPending=false
+        AFQ.switchPending=false; AFQ.trackerMissingSince=nil
     end
     local tracker=afq_trackerFrame()
+    local trackerGone=afq_trackerGone(tracker)
     if tracker then AFQ.trackerSeen=true end
+    -- The tracker seen after the accept is missing, but not yet for
+    -- AFQ_TRACKER_GONE_SECS: look again shortly instead of fighting on.
+    if AFQ.accepted and AFQ.trackerSeen and not tracker and not trackerGone then
+        setStatus(" (checking the quest tracker)")
+        afq_sleep(0.5)
+        return
+    end
     -- The tracker already shows the selected quest (accepted before the toggle
     -- went on, or by the player): hold it, no giver trip.
     if not AFQ.accepted and tracker and afq_trackerQuestIs(q)=="same" then
@@ -1184,53 +1386,163 @@ function afq_step()
     end
     -- Re-accept when nothing is accepted yet, the local count is complete, or
     -- the tracker that was seen after the accept has gone (quest completed).
-    local completed=AFQ.accepted and (AFQ.kills>=q.count or (AFQ.trackerSeen and not tracker))
+    local completed=AFQ.accepted and (AFQ.kills>=q.count or trackerGone)
     local needAccept=not AFQ.accepted or completed
     if needAccept then
         if completed then AFQ.current=nil end -- the held quest is done
         AFQ.kills=0
-        setStatus(" accepting")
-        AFQ_DEBUG.phase="tween-giver"
-        local giverPos=AFQ.giverPos[q.giverKey]
-        local atGiver=afq_teleportTo(giverPos)
-        if not afq_farming() then return end
-        if atGiver then afq_holdAt(giverPos,0.5) else wait(0.5) end
-        if not afq_farming() then return end -- toggled off during the wait: do not accept
-        -- Re-check the level right before every (re-)accept: the completed
-        -- quest's EXP can level the player after this step's first read. A
-        -- different pick goes back through the top of afq_step (switch/travel).
-        local freshLevel=afq_level()
-        local fresh=freshLevel and afq_select(freshLevel) or nil
-        if fresh and not afq_sameQuest(fresh,q) then
-            AFQ.status="Lv "..freshLevel..": "..fresh.giverKey.." #"..fresh.questIndex.." selected before accepting "
-                ..q.giverKey.." #"..q.questIndex
-            afq_updateLabel()
-            AFQ.entry=nil
-            return
+        -- Level re-check plus the one-active-quest guard, run right before
+        -- every StartQuest. The completed quest's EXP can level the player
+        -- after this step's first read: a different pick goes back through
+        -- the top of afq_step (switch/travel). Another quest the tracker shows
+        -- (or a different one this loop still holds) is abandoned first.
+        -- False when this step should return.
+        local function preAccept()
+            local freshLevel=afq_level()
+            local fresh=freshLevel and afq_select(freshLevel) or nil
+            if fresh and not afq_sameQuest(fresh,q) then
+                AFQ.status="Lv "..freshLevel..": "..fresh.giverKey.." #"..fresh.questIndex.." selected before accepting "
+                    ..q.giverKey.." #"..q.questIndex
+                afq_updateLabel()
+                AFQ.entry=nil
+                return false
+            end
+            if afq_trackerQuestIs(q)=="other" or (AFQ.current and not afq_sameQuest(AFQ.current,q)) then
+                AFQ_DEBUG.phase="abandon"
+                afq_logSwitch("Lv "..tostring(freshLevel or level)..": another quest is active, abandoning it before "
+                    ..q.giverKey.." #"..q.questIndex)
+                AFQ.lastSwitch=clock()
+                local okAbandon,why=afq_abandon()
+                if not okAbandon then
+                    AFQ.abandonFails=(AFQ.abandonFails or 0)+1
+                    local backoff=math.max(AFQ_SWITCH_COOLDOWN,afq_backoff(AFQ.abandonFails))
+                    AFQ.lastSwitch=clock()+backoff-AFQ_SWITCH_COOLDOWN
+                    afq_logSwitch("Lv "..tostring(freshLevel or level)..": abandon not confirmed ("..tostring(why)
+                        .."); retry in "..math.ceil(backoff).."s")
+                    afq_sleep(math.min(backoff,1))
+                    return false
+                end
+                AFQ.abandonFails=0
+                if not afq_farming() then return false end
+            end
+            return true
         end
-        -- One active quest at a time: abandon another quest the tracker shows
-        -- (or a different one this loop still holds) before StartQuest.
-        if afq_trackerQuestIs(q)=="other" or (AFQ.current and not afq_sameQuest(AFQ.current,q)) then
-            AFQ_DEBUG.phase="abandon"
-            afq_logSwitch("Lv "..tostring(freshLevel or level)..": another quest is active, abandoning it before "
-                ..q.giverKey.." #"..q.questIndex)
-            AFQ.lastSwitch=clock()
-            afq_abandon()
+        local function markAccepted(seen)
+            AFQ.accepted=true; AFQ.trackerSeen=seen and true or false
+            AFQ.trackerMissingSince=nil
+            AFQ.current={giverKey=q.giverKey,questIndex=q.questIndex}
+        end
+        -- Dedupe: never send StartQuest while the tracker already shows q.
+        local function adoptIfShown()
+            if afq_trackerQuestIs(q)=="same" then
+                markAccepted(true)
+                local k=afq_trackerProgress(); AFQ.kills=k or 0
+                setStatus(" (already active)")
+                return true
+            end
+            return false
+        end
+        -- Remote quest accept on: StartQuest is accepted from anywhere (seen
+        -- live from 289 studs in Underwater City and across Upper Skylands),
+        -- so accept where the character stands and go straight to the wait
+        -- spot. Under Matcha the invoke returns only a boolean, so the
+        -- tracker showing q (afq_waitTrackerFor) is the proof of acceptance.
+        -- No proof within AFQ_REMOTE_ACCEPT_WAIT: fall back once to the giver
+        -- trip below.
+        -- AFQ_DEBUG.remoteAcceptOff (A/B test of the reported crash trigger):
+        -- no StartQuest from where the character stands; accept at the giver
+        -- through the dialogue instead.
+        local viaGiver=not AFL.useRemoteQuest or AFQ_DEBUG.remoteAcceptOff==true
+        local fallback=false
+        if not viaGiver then
+            setStatus(" accepting (remote)")
+            if not preAccept() then return end
+            if adoptIfShown() then return end
+            local gate=afq_acceptWait(q)
+            if gate>0 then
+                setStatus(" accepting in "..math.ceil(gate).."s")
+                afq_sleep(math.min(gate,1))
+                return
+            end
+            AFQ_DEBUG.phase="accept"
+            local beforeKey=afq_trackerKey()
+            local ok,reason=true,nil
+            -- From the step thread, after every hold/tween of this step has
+            -- returned; quietInvoke pauses all other part writes and remotes.
+            if not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
+            local shown=AFQ_DEBUG.noAccept or (ok and afq_waitTrackerFor(q,AFQ_REMOTE_ACCEPT_WAIT,beforeKey))
+            if not afq_farming() then return end
+            if shown then
+                markAccepted(not AFQ_DEBUG.noAccept)
+                AFQ.acceptFails=0
+            else
+                viaGiver=true; fallback=true
+                local why=ok and ("tracker did not show "..q.enemy.." within "..AFQ_REMOTE_ACCEPT_WAIT.."s")
+                    or tostring(reason)
+                setStatus(" accepting at giver (fallback)")
+                warnThrottled("questRemoteAFQ","[laced.club] Auto Farm Quest: remote accept of "..q.giverKey
+                    .." #"..q.questIndex.." not confirmed ("..why.."); accepting at the giver instead",30)
+            end
+        end
+        if viaGiver then
+            -- Remote accept off (unchanged), or the fallback above: travel to
+            -- the giver and accept there.
+            if not fallback then setStatus(" accepting") end
+            -- No travel while the remote is known to be failing: wait for the
+            -- next probe (one call per backoff period, see below) instead.
+            if not AFQ_DEBUG.remoteAcceptOff and not AFQ_DEBUG.noAccept and remoteFailing("StartQuest") then
+                AFQ.acceptFails=(AFQ.acceptFails or 0)+1
+                local backoff=afq_backoff(AFQ.acceptFails)
+                setStatus(" accept failed: StartQuest remote keeps failing (retry in "..math.ceil(backoff).."s)")
+                RemoteFailures["StartQuest"]=REMOTE_FAILURE_LIMIT-1 -- allows one probe after the backoff
+                afq_sleep(backoff); return
+            end
+            AFQ_DEBUG.phase="tween-giver"
+            local giverPos=AFQ.giverPos[q.giverKey]
+            local atGiver=afq_teleportTo(giverPos)
+            if not afq_farming() then return end
+            if atGiver then afq_holdAt(giverPos,0.5) else afq_sleep(0.5) end
+            if not afq_farming() then return end -- toggled off during the wait: do not accept
+            if not preAccept() then return end
+            if adoptIfShown() then return end
+            -- Wait out the rate limit / switch cooldown at the giver (holding)
+            -- rather than failing the fallback right after the remote try.
+            local gate=afq_acceptWait(q)
+            if gate>0 then
+                setStatus(" accepting at the giver in "..math.ceil(gate).."s")
+                if atGiver then afq_holdAt(giverPos,gate) else afq_sleep(gate) end
+                if not afq_farming() then return end
+                if adoptIfShown() then return end
+            end
+            AFQ_DEBUG.phase=fallback and "accept-fallback" or "accept"
+            local beforeKey=afq_trackerKey()
+            local ok,reason=true,nil
+            if AFQ_DEBUG.remoteAcceptOff then ok,reason=afq_acceptByDialogue(q)
+            elseif not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
+            -- The boolean result is not proof: the tracker has to show q (the
+            -- giver path used to mark the quest accepted without any check).
+            local shown=AFQ_DEBUG.noAccept or (ok and afq_waitTrackerFor(q,AFQ_REMOTE_ACCEPT_WAIT,beforeKey))
+            if not afq_farming() then return end
+            if not shown then
+                AFQ.accepted=false
+                AFQ.acceptFails=(AFQ.acceptFails or 0)+1
+                local backoff=afq_backoff(AFQ.acceptFails)
+                local why=ok and ("the tracker did not show "..q.enemy) or tostring(reason)
+                setStatus(" accept failed: "..why.." (retry in "..math.ceil(backoff).."s)")
+                warnThrottled("questFarm","[laced.club] Auto Farm Quest: accept of "..q.giverKey.." #"..q.questIndex
+                    .." failed ("..why.."); retry in "..math.ceil(backoff).."s",30)
+                if remoteFailing("StartQuest") then RemoteFailures["StartQuest"]=REMOTE_FAILURE_LIMIT-1 end
+                afq_sleep(backoff); return
+            end
+            AFQ.acceptFails=0
+            markAccepted(not AFQ_DEBUG.noAccept)
+            if atGiver then afq_holdAt(giverPos,0.5) else afq_sleep(0.5) end
             if not afq_farming() then return end
         end
-        AFQ_DEBUG.phase="accept"
-        local ok,reason=true,nil
-        if not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
-        if not ok then
-            AFQ.accepted=false
-            setStatus(" accept failed: "..tostring(reason))
-            warnThrottled("questFarm","[laced.club] Auto Farm Quest: StartQuest failed ("..tostring(reason)..")",30)
-            wait(3); return
-        end
-        AFQ.accepted=true; AFQ.trackerSeen=false
-        AFQ.current={giverKey=q.giverKey,questIndex=q.questIndex}
-        if atGiver then afq_holdAt(giverPos,0.5) else wait(0.5) end
-        if not afq_farming() then return end
+        -- Travel to the wait (or boss) spot. afq_teleportTo picks the island
+        -- enter/leave step (Underwater City pads) from the current position
+        -- and this destination, so the island change happens on this leg when
+        -- the giver trip was skipped.
         AFQ_DEBUG.phase="tween-wait"
         if q.boss then afq_goToBoss(q) else afq_goToWait(q) end
         setStatus()
@@ -1279,7 +1591,10 @@ function afq_step()
     AFQ.bossMisses=0
     local killed=afq_fight(AFQ.selectedNpc)
     AFQ_DEBUG.phase="after-fight"
-    if killed then AFQ.kills=AFQ.kills+1; AFQ.selectedNpc=nil end
+    if not afq_farming() then return end
+    -- Not killed (50 s cap, own death, target gone): pick afresh next step.
+    if killed then AFQ.kills=AFQ.kills+1 end
+    AFQ.selectedNpc=nil
     local k=afq_trackerProgress()
     if k then AFQ.kills=k end
     -- Boss interleave: the boss is down, so the next afq_step picks the
@@ -1292,6 +1607,7 @@ task.spawn(function()
     while alive() do
         if S.autoFarmQuest and not farmPriorityFeatureActive() and not AFQ.loopRunning then
             AFQ.loopRunning=true
+            AFQ.stepGen=AFQ.gen
             local ok,stepError=pcall(afq_step)
             AFQ.loopRunning=false
             if AFQ.activeHead then pcall(AFQ.activeHead.restore); AFQ.activeHead=nil end
@@ -1304,6 +1620,13 @@ task.spawn(function()
         end
         wait(0.3)
     end
+end)
+
+-- Unload: restore a head the Level Farm or Auto Farm Quest fight left
+-- enlarged (their loops restore it too, at their next wake-up).
+onShutdown(function()
+    if AFQ.activeHead then pcall(AFQ.activeHead.restore); AFQ.activeHead=nil end
+    if AFL.activeHead then pcall(AFL.activeHead.restore); AFL.activeHead=nil end
 end)
 
 -- (Two leftover per-type render loops for fruit and chest labels were removed
@@ -1332,7 +1655,7 @@ task.spawn(function()
         if S.flowerEsp then
             for _, entry in pairs(S.flowerEspEntries) do pcall(updateWorldBoxEntry,entry) end
         end
-        frameWait()
+        idleWait(S.fruitEsp or S.chamEsp or S.chestEsp or S.berryEsp or S.boatEsp or S.flowerEsp)
     end
 end)
 
@@ -1366,3 +1689,5 @@ task.spawn(function()
     end
 end)
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["60_afq"] = true end

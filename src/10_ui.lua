@@ -1,8 +1,13 @@
 -- @chunk 10_ui  (lines 784-1821 of the single-file build)
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil -- load marker (loader.lua)
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["10_ui"] = true end
 -- Per-execution bindings: captured at chunk load so a re-run of the script
--- cannot make this copy's loops read the new copy's state.
+-- cannot make this copy's loops read the new copy's state (alive is a
+-- closure over this run's state since the Oct 15 stability pass).
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
+local S = S
+local shutdownScript = shutdownScript -- this run's (00_core), for the UE OnUnload hook
 UE_URL = "https://raw.githubusercontent.com/hauntedscripts/Scripts2/refs/heads/main/matcha%20ue"
 
 function ueEnvironments()
@@ -47,9 +52,17 @@ function validateUESource(body)
     return true, nil
 end
 
+UE_DOWNLOAD_ATTEMPTS = 3 -- bounded retry: 1 s, then 2 s between attempts
+
 function loadUEAdapter()
-    local ueSource = safeHttpGet(UE_URL)
-    local valid, reason = validateUESource(ueSource)
+    local ueSource, valid, reason = "", false, nil
+    for attempt = 1, UE_DOWNLOAD_ATTEMPTS do
+        ueSource = safeHttpGet(UE_URL)
+        valid, reason = validateUESource(ueSource)
+        if valid or attempt == UE_DOWNLOAD_ATTEMPTS then break end
+        warnThrottled("ueDownload", "[laced.club] UE download rejected (" .. tostring(reason) .. "), retrying", 5)
+        task.wait(attempt)
+    end
     assert(valid, "UE download rejected: " .. tostring(reason))
 
     local previousUE = findExposedUE()
@@ -58,9 +71,19 @@ function loadUEAdapter()
     ueChunk()
 
     local UE = findExposedUE()
-    assert(type(UE) == "table", "UE did not expose UELibrary")
-    assert(UE ~= previousUE, "UE chunk did not run (stale UELibrary from a previous execution)")
-    assert(not UE._unloaded, "UE library is already unloaded")
+    -- A new UE copy that fails the checks below has already created its
+    -- windows (and unloaded the previous copy): unload it, do not leave a
+    -- half-built menu on screen.
+    local function rejectNewUE(message)
+        if type(UE) == "table" and UE ~= previousUE and type(UE.Unload) == "function" and not UE._unloaded then
+            pcall(function() UE:Unload() end)
+        end
+        assert(false, message)
+    end
+    if type(UE) ~= "table" then rejectNewUE("UE did not expose UELibrary") end
+    if UE == previousUE then rejectNewUE("UE chunk did not run (stale UELibrary from a previous execution)") end
+    if UE._unloaded then rejectNewUE("UE library is already unloaded") end
+    if type(UE.CreateWindow) ~= "function" then rejectNewUE("UE library has no CreateWindow") end
 
     local controls = {}
 
@@ -317,8 +340,14 @@ function loadUEAdapter()
         return popup
     end
 
+    -- True when the hook was installed (UE builds without OnUnload cannot stop
+    -- the script from the menu's Unload button).
     function Adapter:OnUnload(callback)
-        if type(self.Raw.OnUnload) == "function" then self.Raw:OnUnload(callback) end
+        if type(self.Raw.OnUnload) == "function" then
+            self.Raw:OnUnload(callback)
+            return true
+        end
+        return false
     end
 
     function Adapter:CreateWindow(info)
@@ -538,9 +567,13 @@ do
     if okUE and type(ueResult) == "table" then
         Library = ueResult
         menuUE = ueResult.Raw
+        SCRIPT_STATE.ue = ueResult.Raw
     else
+        -- assert, not return: a plain return used to end only this chunk, so
+        -- the loader ran 20_ui2 into a nil index. The loader catches this and
+        -- runs this run's shutdownScript.
         warn("Failed to load UE UI: " .. tostring(ueResult))
-        return
+        assert(false, "[laced.club] UE UI failed to load: " .. tostring(ueResult))
     end
 end
 
@@ -561,6 +594,18 @@ Window = Library:CreateWindow({
     Height = 570,
     Theme = { Colors = { Accent = Color3.fromRGB(255,111,0) } }
 })
+
+-- Unload hook, registered as soon as the window exists (it used to be the
+-- last statement of 90_main, so a chunk that failed in between left every
+-- loop already started with no way to stop it from the menu). shutdownScript
+-- is this run's own (captured at the top of this chunk): a re-run unloads
+-- this UE copy from inside the new run, when the global is already the new
+-- run's.
+SCRIPT_STATE.library = Library
+SCRIPT_LIBRARY = Library
+if not Library:OnUnload(function() shutdownScript("ui") end) then
+    warn("[laced.club] this UE build has no OnUnload: the menu's Unload button cannot stop the script")
+end
 
 mainTab=Window:AddTab("Main")
 miscTab=Window:AddTab("Misc")
@@ -866,7 +911,8 @@ do
 
             -- One bad frame (target or root destroyed mid-write) must not kill the loop.
             local okStep,stepError=pcall(function()
-            if MagnetSettings.farmMode=="player" or MagnetSettings.farmMode=="enemy" then
+            -- writesPaused: CommF_ quiet window (quietInvoke in 00_core).
+            if (MagnetSettings.farmMode=="player" or MagnetSettings.farmMode=="enemy") and not writesPaused() then
                 local character=LocalPlayer.Character
                 local playerRoot=magnetGetRoot(character)
                 local targetModel,targetRoot=nil,nil
@@ -954,7 +1000,7 @@ do
             end
             end)
             if not okStep then warnThrottled("magnetFarm","[laced.club] Magnet farm step failed: "..tostring(stepError),10) end
-            frameWait()
+            idleWait(MagnetSettings.farmMode~=nil)
         end
     end)
 
@@ -992,7 +1038,8 @@ do
                 end
             end
             -- Back off while the remote keeps failing (non-Pro build) instead of firing every frame.
-            if remoteFailing("Magnet M1") then task.wait(1) else frameWait() end
+            if remoteFailing("Magnet M1") then task.wait(1)
+            else idleWait(MagnetSettings.enabled or MagnetSettings.farmMode~=nil) end
         end
     end)
 end
@@ -1041,3 +1088,5 @@ mainTab:AddToggle("dungeon_vent_skills",{
     Callback=function(value) S.dungeonUseMoves=value end
 })
 
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["10_ui"] = true end

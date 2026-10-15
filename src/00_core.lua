@@ -1,4 +1,9 @@
 -- @chunk 00_core  (lines 1-783 of the single-file build)
+-- Load marker (loader.lua): proves this chunk started and, at the end of the
+-- file, that it finished. Matcha's loadstring reports a syntax error only by
+-- printing when the chunk is called, so the loader cannot rely on errors.
+local LACED_LOAD = type(_G.__lacedLoad) == "table" and _G.__lacedLoad or nil
+if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["00_core"] = true end
 --[[
     laced.club - Blox Fruits menu for the Matcha LuaVM (bug-fix rewrite).
     Full per-bug list with original line numbers: CHANGES.md.
@@ -52,6 +57,20 @@ clock = (type(os) == "table" and type(os.clock) == "function") and os.clock or t
 -- CFrame/Position) at that rate. frameWait() yields one 60 Hz frame instead.
 FRAME_TIME = 1 / 60
 function frameWait() task.wait(FRAME_TIME) end
+-- Idle cadence for loops whose feature is off: about 30 loops used to wake at
+-- 60 Hz with every toggle off (~1,800 resumes/s). idleWait(active) yields one
+-- frame while the feature is on and IDLE_POLL s while it is off.
+IDLE_POLL = 0.25
+function idleWait(active)
+    if active then task.wait(FRAME_TIME) else task.wait(IDLE_POLL) end
+end
+-- True unless Matcha says Roblox is not the foreground window. Synthetic keys
+-- and clicks go to whatever window has focus, so every input path checks it.
+function robloxFocused()
+    if type(isrbxactive) ~= "function" then return true end
+    local okActive, active = pcall(isrbxactive)
+    return not (okActive and active == false)
+end
 
 Players = game:GetService("Players")
 LocalPlayer = Players.LocalPlayer
@@ -135,10 +154,7 @@ function menuUnderMouse()
     return okOver and over == true
 end
 function farmClick()
-    if type(isrbxactive) == "function" then
-        local okActive, active = pcall(isrbxactive)
-        if okActive and active == false then return false end
-    end
+    if not robloxFocused() then return false end
     if menuUnderMouse() then return false end
     return (pcall(mouse1click))
 end
@@ -166,6 +182,9 @@ RemoteFailures = {}
 REMOTE_FAILURE_LIMIT = 8
 function safeRemote(tag, remote, method, ...)
     if not remote then return false, nil end
+    -- Serialised with CommF_ invokes (see quietInvoke): a FireServer while an
+    -- invoke is pending is skipped, not counted as a failure.
+    if method ~= "InvokeServer" and remoteInvokePending() then return false, "CommF_ invoke pending" end
     local count = select("#", ...)
     local args = { ... }
     local ok, result = pcall(function()
@@ -198,8 +217,53 @@ function rootRotation(part)
     return rotation
 end
 
+-- Bridge write budget (crash mitigation, see CRASH_FINDINGS.md). Every root
+-- CFrame/velocity write goes through Matcha's external memory bridge; the
+-- hard-lock, holdAt and tween loops used to write 180-300 times a second.
+-- AFQ_DEBUG.safeMode = true doubles every interval that uses writeInterval()
+-- (halves those rates) for A/B crash testing.
+ROOT_WRITE_HZ = 30
+ROOT_SKIP_DIST_SQ = 0.05 * 0.05
+-- WRITE_BUDGET.debug is linked to the AFQ_DEBUG table by 20_ui2 (pair P08),
+-- so AFQ_DEBUG.safeMode = true switches safe mode on at runtime.
+WRITE_BUDGET = { debug = nil }
+function safeModeOn()
+    local debug = WRITE_BUDGET.debug
+    return type(debug) == "table" and debug.safeMode == true
+end
+function writeInterval(base)
+    return safeModeOn() and base * 2 or base
+end
+
+-- Remote quiet window (stability pass, Oct 15 2026). The user reports the
+-- client crashing consistently when the remote quest pickup (CommF_
+-- InvokeServer "StartQuest") fires, often at the end of a long AFQ flight.
+-- quietInvoke() below sets S.remoteQuiet for the duration of every CommF_
+-- invoke plus AFQ_REMOTE_QUIET_BEFORE/AFTER around it; while it is set, the
+-- shared write helpers (moveRoot, setPartPosition, zeroVelocity, and through
+-- them tweenTo/afq_holdAt/hardLockNpcCFrame) and the loops that write parts
+-- directly write nothing. S.remoteInvokeBusy serialises the remotes: no
+-- FireServer (RegisterAttack/RegisterHit, auras, Magnet M1) goes out while a
+-- CommF_ invoke is pending. runGate is this run's S (assigned once S exists).
+local runGate = nil
+function writesPaused()
+    return runGate ~= nil and runGate.remoteQuiet == true
+end
+function remoteInvokePending()
+    return runGate ~= nil and runGate.remoteInvokeBusy == true
+end
+
 function moveRoot(part, x, y, z, rotation)
     if not part then return false end
+    if writesPaused() then return false end
+    -- Never write to a root that left the DataModel (died, respawned, streamed
+    -- out); skip the write when it already sits on the target.
+    local okState, parent, current = pcall(function() return part.Parent, part.Position end)
+    if not okState or parent == nil then return false end
+    if current and current.X then
+        local dx, dy, dz = current.X - x, current.Y - y, current.Z - z
+        if dx * dx + dy * dy + dz * dz <= ROOT_SKIP_DIST_SQ then return true end
+    end
     local okCFrame = pcall(function()
         local positionCF = CFrame.new(x, y, z)
         part.CFrame = rotation and (positionCF * rotation) or positionCF
@@ -210,13 +274,26 @@ end
 
 function setPartPosition(part, position)
     if not part or not position then return false end
+    if writesPaused() then return false end
     return (pcall(function() part.Position = position end))
 end
 
+local function nearZeroVector(v)
+    return v ~= nil and v.X ~= nil and math.abs(v.X) + math.abs(v.Y) + math.abs(v.Z) < 0.01
+end
 function zeroVelocity(part)
     if not part then return end
-    pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
-    pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    if writesPaused() then return end
+    local okState, parent, velocity, assembly = pcall(function()
+        return part.Parent, part.Velocity, part.AssemblyLinearVelocity
+    end)
+    if okState and parent == nil then return end
+    if not (okState and nearZeroVector(velocity)) then
+        pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
+    end
+    if not (okState and nearZeroVector(assembly)) then
+        pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    end
 end
 
 -- Drawing helpers: every object is created, updated and removed defensively.
@@ -436,17 +513,129 @@ S = {
     lastRaidIslandCount = 0,
     berryScanGeneration = 0,
     unloaded       = false,
+    remoteQuiet    = false, -- set by quietInvoke: no part writes (see writesPaused)
+    remoteInvokeBusy = false, -- set by quietInvoke: a CommF_ invoke is pending
 }
+runGate = S
 
 -- Every background loop runs while alive(); unloading the UI stops them all.
--- S is a global, so a re-run replaces it. SCRIPT_STATE keeps this execution's
--- table: re-running the script unloads the previous UE copy, and the previous
--- copy's shutdown (and its loops) must act on its own table, not the new one.
--- (Seen live: the old shutdown set the NEW S.unloaded = true, so the fresh copy
--- loaded with every loop already stopped.)
-SCRIPT_STATE = S
-function alive()
-    return not SCRIPT_STATE.unloaded
+-- S is a global, so a re-run replaces it. Each run's own table is bound here,
+-- once: alive(), onShutdown() and shutdownScript() are closures over it, and
+-- every later chunk captures them (and S) as chunk locals at load time
+-- (`local alive = alive`). alive() used to read the GLOBAL SCRIPT_STATE on
+-- every call, so after a re-run the old run's ~60 loops read the new run's
+-- flag and could never be stopped (stability pass, Oct 15 2026). (Seen live
+-- earlier: the old shutdown set the NEW S.unloaded = true.)
+do
+    local state = S
+    local hooks = {}
+    local removeDrawingFn, clearEspCacheFn = removeDrawing, clearEspCache
+    SCRIPT_STATE = state
+    function alive()
+        return not state.unloaded
+    end
+    -- Cleanup hooks registered by the chunks at load time (restore heads and
+    -- collisions, release held input, ...). They run once, newest first.
+    function onShutdown(fn)
+        if type(fn) == "function" then hooks[#hooks + 1] = fn end
+    end
+    local ESP_CACHES = { "espLabelCache", "chamBoxCache", "chestEspLabelCache",
+        "berryEspLabelCache", "boatEspCache", "flowerEspCache" }
+    local ESP_LISTS = { "espLabels", "chamBoxes", "chestEspLabels", "berryEspLabels",
+        "boatEspEntries", "flowerEspEntries" }
+    -- Idempotent; safe before the later chunks exist (it only touches this
+    -- run's own table, its registered hooks and its own UE copy).
+    -- reason: "ui" (UE OnUnload: the menu is already going away), "loader"
+    -- (a later chunk failed to load; the menu is unloaded too), nil (by hand).
+    function shutdownScript(reason)
+        if state.shutdownStarted then return end
+        state.shutdownStarted = true
+        -- Toggles off through their own callbacks (each feature's normal "off"
+        -- path) only while this run is the current one. During a re-run the
+        -- new run is already loading; this run's loops stop on alive().
+        local library = state.library
+        if SCRIPT_STATE == state and type(library) == "table" and type(library.Controls) == "table" then
+            for _, control in pairs(library.Controls) do
+                if type(control) == "table" and control.Type == "Toggle" and control.Value == true then
+                    pcall(function() control:SetValue(false) end)
+                end
+            end
+        end
+        state.unloaded = true
+        state.boatTweening = false
+        state.boatTween = nil
+        for index = #hooks, 1, -1 do pcall(hooks[index], reason) end
+        -- This run's Drawings, straight from its own caches (the global clear
+        -- functions act on whichever run defined them last).
+        state.berryScanGeneration = (tonumber(state.berryScanGeneration) or 0) + 1
+        for _, key in ipairs(ESP_CACHES) do
+            if type(state[key]) == "table" then pcall(clearEspCacheFn, state[key]) end
+        end
+        for _, key in ipairs(ESP_LISTS) do state[key] = {} end
+        if state.mirageEspLabel then
+            pcall(removeDrawingFn, state.mirageEspLabel)
+            state.mirageEspLabel = nil
+        end
+        pcall(mouse1release)
+        if type(setrobloxinput) == "function" then pcall(setrobloxinput, true) end
+        if reason ~= "ui" then
+            local ue = state.ue
+            if type(ue) == "table" and not ue._unloaded and type(ue.Unload) == "function" then
+                pcall(function() ue:Unload() end)
+            end
+        end
+    end
+end
+-- This run's S for every function defined below (as in the single-file build,
+-- where S was a top-level local).
+local S = S
+
+-- One CommF_ InvokeServer with the quiet window around it (see writesPaused
+-- above). Every CommF_ call of the script goes through here: StartQuest,
+-- AbandonQuest (Auto Farm Quest, Level Farm), AddPoint (Auto Stat), the
+-- Legendary Sword Dealer check. Order: wait for any pending invoke (at most
+-- 5 s), raise S.remoteInvokeBusy and S.remoteQuiet, wait
+-- AFQ_REMOTE_QUIET_BEFORE s plus up to 0.5 s more for the root to stop moving
+-- (no writes happen meanwhile, so a falling character keeps falling; it is
+-- not held), invoke, keep the quiet window AFQ_REMOTE_QUIET_AFTER s, clear
+-- both flags. AFQ_DEBUG.quietAccept = false skips the quiet window (A/B
+-- test); the serialisation stays. Returns what safeRemote returns. Call it
+-- from a step thread after its own hold/tween loops have returned, never
+-- from inside a per-frame loop.
+AFQ_REMOTE_QUIET_BEFORE = 0.3
+AFQ_REMOTE_QUIET_AFTER = 0.3
+local function rootSpeed()
+    local okSpeed, speed = pcall(function()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local v = hrp and hrp.AssemblyLinearVelocity
+        return v and v.Magnitude
+    end)
+    return okSpeed and tonumber(speed) or 0
+end
+function quietInvoke(tag, remote, ...)
+    if not remote then return false, nil end
+    local count = select("#", ...)
+    local args = { ... }
+    local waitUntil = clock() + 5
+    while S.remoteInvokeBusy and clock() < waitUntil do task.wait(0.05) end
+    if S.remoteInvokeBusy then return false, "another CommF_ invoke is still pending" end
+    S.remoteInvokeBusy = true
+    local debug = WRITE_BUDGET.debug -- the AFQ_DEBUG table (linked by 20_ui2)
+    local quiet = not (type(debug) == "table" and debug.quietAccept == false)
+    local okCall, ok, result = true, false, nil
+    if quiet then
+        S.remoteQuiet = true
+        task.wait(AFQ_REMOTE_QUIET_BEFORE)
+        local settleUntil = clock() + 0.5
+        while rootSpeed() > 1 and clock() < settleUntil do task.wait(0.05) end
+    end
+    okCall, ok, result = pcall(safeRemote, tag, remote, "InvokeServer", table.unpack(args, 1, count))
+    if quiet then task.wait(AFQ_REMOTE_QUIET_AFTER) end
+    S.remoteQuiet = false
+    S.remoteInvokeBusy = false
+    if not okCall then return false, ok end
+    return ok, result
 end
 
 -- Priority features that every farm yields to (Auto Farm Quest checks this
@@ -783,3 +972,5 @@ islandList = {
 -- ---------------------------------------------------------------------------
 -- UE UI library: download, validate, run, wrap in the adapter
 -- ---------------------------------------------------------------------------
+-- Load marker: this chunk ran to the end.
+if LACED_LOAD and type(LACED_LOAD.done) == "table" then LACED_LOAD.done["00_core"] = true end
