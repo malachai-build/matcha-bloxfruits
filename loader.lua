@@ -35,7 +35,12 @@ for index, name in ipairs(CHUNKS) do
     local url = BASE .. name .. ".lua"
     local src = fetch(url)
     local marker = "-- @chunk " .. name
-    local looksHtml = string.find(src, "<html", 1, true) or string.find(src, "<!DOCTYPE", 1, true)
+    -- Only the START of the body is checked for an error page: the chunks
+    -- themselves legitimately contain the strings "<html" / "<!DOCTYPE" (the
+    -- UE download validator in 10_ui), which is why a whole-body search
+    -- rejected a good download.
+    local head = string.sub(src, 1, 256)
+    local looksHtml = string.find(head, "<html", 1, true) or string.find(head, "<!DOCTYPE", 1, true)
     assert(#src > 100 and not looksHtml and string.sub(src, 1, #marker) == marker,
         "[laced.club] chunk " .. name .. " (" .. index .. "/" .. #CHUNKS .. ") failed to download from " .. url
         .. " (got " .. #src .. " bytes)")

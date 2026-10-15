@@ -6,20 +6,25 @@ Matcha VM compiles pieces of 30-1,400 lines instead of one 8,500-line chunk.
 
 ## Load (one line)
 
-```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua"))()
-```
-
-Matcha's global `httpget` works the same way:
+Use Matcha's own `httpget` global for the outer fetch. Matcha lists `game:HttpGet` as unsupported for
+this purpose, and `loadstring(game:HttpGet(...))()` does not work from the Matcha paste box.
 
 ```lua
 loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua"))()
 ```
 
+Verbose form that reports a failed download instead of running an empty chunk:
+
+```lua
+local src = httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua")
+assert(type(src) == "string" and #src > 100 and string.sub(src, 1, 2) == "--", "loader download failed (" .. tostring(#src) .. " bytes)")
+loadstring(src, "laced.loader")()
+```
+
 Single-file fallback (same code, one chunk):
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/dist/test.full.lua"))()
+loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/dist/test.full.lua"))()
 ```
 
 To load from a mirror or a dev build, set `_G.LACED_BASE = "https://.../src/"` before running the loader.

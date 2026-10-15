@@ -24,22 +24,24 @@ cd "/d/matcha laods/Blox Fruits" && gh repo create matcha-bloxfruits --public --
 curl -sI https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua | head -1
 ```
 
-## 4. The one-line loadstring
-
-```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua"))()
-```
-
-Matcha's global `httpget` works too:
+## 4. The one-line loadstring (use Matcha's `httpget`, not `game:HttpGet`)
 
 ```lua
 loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua"))()
 ```
 
+Verbose form that reports a failed download:
+
+```lua
+local src = httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/loader.lua")
+assert(type(src) == "string" and #src > 100 and string.sub(src, 1, 2) == "--", "loader download failed (" .. tostring(#src) .. " bytes)")
+loadstring(src, "laced.loader")()
+```
+
 Single-chunk fallback:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/dist/test.full.lua"))()
+loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/dist/test.full.lua"))()
 ```
 
 ## Updating later
