@@ -525,3 +525,98 @@ Deferred, with reasons:
 ### Checks
 
 `bash check.sh`: 0 SyntaxError in every chunk, `dist/test.full.lua`, `loader.lua` and `dist/loader_harness.luau`; no unknown globals in the concatenation beyond the baseline; 12/12 static stability rules pass. The harness (`tests/make_loader_harness.py`) covers five loader scenarios (all chunks fine; runtime error in 20_ui2; Matcha-style syntax error in 30_esp; truncated 40_combat; failure in 00_core with an older copy running) but **was only syntax-checked: no Luau runtime is installed, so it was not executed.**
+
+## Speed restore and remote accept default (Oct 15 2026)
+
+**Not live-tested.** Static changes only: no Matcha tool was called, nothing was loaded into the client, git was not run. Checked with `bash build.sh` and `bash check.sh` (output under "Checks" below). Pre-edit copies of `src/`, `README.md`, `CHANGES.md` and `loader.lua` are in the agent scratchpad (`before/`).
+
+### Live results this pass is based on (user reports, taken as facts)
+
+1. **A/B result: the remote quest accept is the crash trigger.** With `AFQ_DEBUG.remoteAcceptOff = true` (no `CommF_` `StartQuest`/`AbandonQuest` invoke from the script) the client stopped crashing. So the script's `InvokeServer` of StartQuest/AbandonQuest under Matcha Hybrid mode is the trigger the stability pass suspected.
+2. **"The new script is too slow at killing enemies and moving between them."** The stability pass's rate caps overshot (remote M1 4 swings/s, hard lock and hold 30 Hz, 0.3 s between Auto Farm Quest steps, quiet windows from Auto Stat in the middle of fights).
+3. **"The camera bugs out and teleports quickly, which is uncomfortable on the eyes."**
+4. **"Tweening is causing the character to be flung."**
+
+### A. Remote quest accept off by default; the dialogue is the normal path
+
+- **New default.** `afl_remote_quest` ("Remote quest accept", Main tab) defaults to **off**, and so does `AFL.useRemoteQuest` (`src/00_core.lua`). New tooltip: "Accept quests with the StartQuest remote. OFF by default: on Matcha Hybrid this remote was found to crash the client (Oct 15 2026). Needs Roblox focused when off." The control ID and the config format are unchanged. A config saved earlier stores `afl_remote_quest = true` and turns the remote back on when loaded (switch it off and re-save).
+- **One switch for both features.** New `afq_remoteQuestOff()` (`src/60_afq.lua`): true when `AFQ_DEBUG.remoteAcceptOff == true` (hard override, still default false) or when the toggle is off. While it is true the script sends **no StartQuest and no AbandonQuest**:
+  - `afl_startQuestRemote` refuses first thing, for every caller.
+  - `afq_abandon` refuses (kept as a guard; `afq_step` no longer calls it on this path).
+  - Auto Farm Quest takes the giver path (`viaGiver = afq_remoteQuestOff()`; before, the toggle-off giver path still sent StartQuest at the giver, and only `remoteAcceptOff` used the dialogue). Accepts go through `afq_acceptByDialogue`, then the tracker must show the quest (`afq_waitTrackerFor`, unchanged).
+  - **Level Farm's remote branch follows the same default**: `afl_setQuest` uses the remote only when the toggle is on (and `remoteAcceptOff` is false), otherwise its dialogue clicks.
+- **Level-up quest switch without an abandon.** How the dialogue replaces an active quest, as far as it can be checked offline: the game's dialogue accept option is the game's own client code (`DialoguesList.Util.generateQuest` -> `CommF_:InvokeServer("StartQuest", giverKey, index)` from the game's LocalScript, CHANGES "Quest remote" note), not the script's Matcha bridge invoke. The game keeps one active quest; per the wiki (user's statement) a new accept overrides the active one, and the old Level Farm click flow in `afl_setQuest` relied on exactly that (it never abandoned, it just accepted the new quest). The decompiled `DialoguesList` source is not in the repo, so whether the dialogue shows an extra "replace quest?" step could not be read here. *Implementation:* in `afq_step`'s switch branch, with the remote off, the switch logs "switching A -> B (the dialogue accept replaces the old quest)", sets `AFQ.lastSwitch`, clears `AFQ.entry` and goes straight to the accept (no `afq_abandon`, no backoff). `preAccept()` keeps the level re-check but skips the abandon guard on this path. The held quest stays in `AFQ.current` until the tracker shows the new one, so a failed dialogue keeps it on record and the failure status says "(the old quest may still be active)". The switch cooldown (`AFQ_SWITCH_COOLDOWN` 6 s, at the switch decision) and the level re-check before every accept are unchanged. The accept itself has no gate on the dialogue path (`afq_acceptWait` is for the remote rate limit and the cooldown; the dialogue sends nothing from the script).
+- **Focus.** The dialogue clicks need Roblox in front. With the remote off and Roblox not focused, Auto Farm Quest no longer flies to the giver for a click it cannot send: it stays put, shows "accept waiting: focus the Roblox window (dialogue accept)", warns once per 30 s and looks again every second.
+- **`AFQ_DEBUG.noAccept`** now wins over the dialogue (no clicks in an isolation run).
+- **Remaining CommF_ invokes keep the quiet window** (`quietInvoke`): the remote path when the toggle is on, Auto Stat `AddPoint`, and the Legendary Sword Dealer button.
+- **Auto Stat no longer stalls fights** (`src/80_misc2.lua`, `src/00_core.lua`). Points are queued and an `AddPoint` is sent only at a calm moment: no travel mark for `AUTO_STAT_CALM_SECS` (1.5 s) and no combat mark for 1.5 s, i.e. farms off, waiting for a spawn, or at a quest giver. During a fight with no calm moment: at most one spend per `AUTO_STAT_BUSY_INTERVAL` (60 s), and only while not travelling, so never mid-flight. Marks: `markTravel()` in every `tweenTo` step (also while paused), `masteryTweenTo`, `boatTweenTo` and on the Underwater City pads; `markFight()` in the hard lock, `BasicM1.fire` and `farmClick`. The invoke is **deferrable**: Auto Stat sets `S.quietDefer` ("any" for a calm spend, "travel" for the 60 s spend) and `quietInvoke` abandons the call during its lead-in (0.3 s + up to 0.5 s settle) as soon as travel (or combat, for "any") starts, releasing the window within 0.05 s and returning `QUIET_POSTPONED`; Auto Stat retries at the next calm moment without a warning, and `invokeEnhancedComm` keeps its cached remote. The label shows " (queued: fighting/travelling)" while points wait. The confirmation logic (pending, floor, 15 s timeout, caps) is unchanged.
+
+### B. Kill and movement speed
+
+- **tweenTo finding: the per-step distance was not wrong.** The stability pass changed the step from 0.01 s to `writeInterval(TWEEN_STEP_TIME)` = 1/60 s, but the position was always interpolated as `start + (target - start) * (clock() - startTime) / duration`, both before and after that pass (the pre-split `test.txt` has the same formula), so the flight speed was `speed` studs/s at any step size; there was no fixed per-step distance that a longer step could have cut to ~60%. What did slow or break flights: (1) the quiet-window pause (`startTime` shifted, the character free-fell for the pause and was snapped back onto the line when it resumed, see C), (2) the 0.3 s gap between Auto Farm Quest steps and the 0.05 s hold after every enemy scan (below), not the tween itself. The tween now interpolates from a fixed base point and the `clock()` time since the base (so `S.FARM_SPEED` / `AFL.tweenSpeed` studs/s is the real speed at any frame rate; a late frame catches up on the straight line), re-bases from the root's current position after a pause, and has a write floor of one write per frame (`FRAME_TIME` minus 4 ms jitter slack, doubled in safe mode; was 90% of the step). The root is still re-fetched by key each step, the tween still stops on respawn/detach, and nothing is written to a root that left the DataModel.
+- **Remote M1:** `BasicM1.minInterval` 0.25 s -> **0.1 s** (4 -> **10 swings/s** per attack source). New Main-tab slider **`attack_rate`** "Remote M1 swings/s" (2-20, default 10, Column 1, right under Remote M1). It writes `S.attackRate`; `40_combat` applies it through `BasicM1.setRate` (installed as `S.onAttackRate`, and read once when the chunk loads, because the slider can fire before `BasicM1` exists). Safe mode still halves it. Unchanged: the rig re-check before `RegisterHit`, no swing while a CommF_ invoke is pending (`remoteInvokePending`), the tool requirement and the no-damage watchdog.
+- **Root writes:** `ROOT_WRITE_HZ` 30 -> **60** (one write per frame) for the hard lock and `afq_holdAt`; 30 Hz with `AFQ_DEBUG.safeMode`.
+- **Target acquisition:**
+  - Auto Farm Quest spawner: `wait(0.3)` after every step -> `idleWait(active)`: one frame while the farm runs (every step path yields by itself), 0.25 s (`IDLE_POLL`) only while it is off or blocked.
+  - Scan: `afq_nearestEnemy` runs first and the 0.05 s hold only happens while nothing is found (it ran after a successful pick too). Same for Level Farm's `afl_getNextNpc` loop (0.05 s wait only while nothing is found).
+  - Waiting for a spawn: the hold at the wait spot is 0.25 s (was 0.5 s), so a new spawn is seen at 4 Hz or better.
+  - Auto Farm Nearest, NPC Farm and Raid: one frame after a fight (was 0.1 s); 0.1 s only when nothing was in range. Boss and Material farms: no-target re-scan 0.35 s -> 0.25 s (4 Hz); after a fight they already continued after one frame.
+  - Head expander: unchanged at 4 Hz; a new target gets a fresh `headExpander` with `nextApply = 0`, so its head is enlarged on the first fight iteration (click mode only, as before).
+- **Travel:** with the remote off by default, Auto Farm Quest sends no CommF_ invoke at all, so no quiet window comes from it. Auto Stat cannot start one mid-flight (travel mark check plus the lead-in abort above). The quiet window of an `AddPoint` that was already past its lead-in when a flight starts still pauses that flight for at most the invoke's round trip plus `AFQ_REMOTE_QUIET_AFTER` (0.3 s); the tween then resumes from where the root is.
+- **Kept:** the dying-part guards (no write to a detached/dead root or head, rig re-check), the accept limits (no separate 30 s per-quest accept limit exists in the code; the limits are `AFQ_REMOTE_MIN_INTERVAL` = 10 s per quest on the remote path, the 3-60 s accept backoff and the 30 s warn throttles, all unchanged), the 50 s per-target fight cap.
+
+**Active fight path, every wait after this change** (Auto Farm Quest, Remote M1 on, 60 fps, normal mode):
+
+| Where | Wait | Duration |
+|---|---|---|
+| `afq_fight` loop, each iteration | `frameWait()` | 1/60 s |
+| `BasicM1.fire`, between RegisterAttack and RegisterHit (once per swing, every 0.1 s at 10/s) | `frameWait()` | 1/60 s |
+| Hard lock (`hardLockNpcCFrame`) | rate gate, no wait | writes every frame (60 Hz) |
+| Level check in the fight | none (every 3 s, one table scan) | 0 |
+| `afq_fight` end | `frameWait()` | 1/60 s |
+| After the fight (`afq_trackerProgress`, cached) | none | 0 |
+| Spawner between steps | `idleWait(true)` | 1/60 s |
+| `afq_step` select / tracker checks | none | 0 |
+| Scan, target found | none | 0 |
+| Scan, nothing yet (up to 16 tries) | `afq_holdAt(scanPos, 0.05)` each | ~0.05 s each (3-4 frames) |
+| No target after the scan | `afq_goToWait` tween + `afq_holdAt(spot, 0.25)` | flight time + 0.25 s |
+| Fight tween to the next target | `tweenTo` `task.wait(1/60)` per write | distance / `S.FARM_SPEED` |
+| Tween arrival settle | 2 x `task.wait(1/60)` | 2/60 s |
+| Head expander (click mode) | gate, no wait | first apply at once, then every 0.25 s |
+
+So from one kill to the first swing at the next target: about 3 frames (0.05 s) + the fight-tween flight + 2 arrival frames. Before: 0.3 s spawner + 0.05 s scan hold + the same frames + the flight, and then swings at 4/s and a 30 Hz lock. Quest completion (dialogue path, not the fight path): tween to the giver, 0.5 s hold, the dialogue clicks (0.5 + 0.08 + 1 s + up to 3 s per option + 0.35 s), the tracker check (2 Hz, up to 3 s), 0.5 s hold, tween to the wait spot. `farmAttack` (Boss, Material, Sea Event, Nearest, NPC, Raid): `frameWait()` per iteration, the head loop `frameWait()`, an attack every 0.05 s through `task.spawn` (limited to 10 swings/s by `BasicM1`), one frame after a fight.
+
+### C. Smooth, fling-free movement (camera jumps and flings)
+
+Causes found by reading the stability-pass code:
+- **Camera jumps.** (1) The hard lock and `afq_holdAt` wrote at 30 Hz while frames render at 60 Hz: on every other frame physics moved the root (gravity) and the next write snapped it back, a 30 Hz shake. (2) During a quiet window the tween wrote nothing, so the character free-fell (up to ~100 studs in a 1 s window) and the first write after it put the character back onto the line: one large jump. (3) `afq_holdAt` and the hard lock re-read the root's rotation every frame (`rootRotation(root)`), so any rotation physics added between writes was kept and the facing (and the camera behind it) drifted; tween, hold and hard lock each captured their own rotation, so a hand-over between them could turn the camera. (4) Checked and not a cause: the tween's root re-fetch writes only to the root it started with (key match), never to another or a nil handle.
+- **Flings.** `tweenTo` never zeroed velocity while flying (only `afq_teleportTo` did, after arrival), so gravity built up over the whole flight (-540 studs/s was seen live earlier); the fight tween in `afq_fight` and Level Farm had no zeroing at all on arrival, and the hard lock then zeroed only a non-zero vertical component at 30 Hz. `moveRoot` also skips writes within 0.05 studs and `zeroVelocity` writes only non-zero values. A second mover (Freeze Position, void/sky pull, a hold or a lock from another thread) could write the root during a tween.
+
+Fixes:
+- **`placeRoot(part, x, y, z, rotation)`** (`00_core`): CFrame (Position fallback), then `Velocity` and `AssemblyLinearVelocity` = 0, on every call: no skip distance, no read-before-write. Same guards as `moveRoot` (quiet window, detached root). Used by `tweenTo`, `masteryTweenTo`, `afq_holdAt` and the hard lock. `moveRoot`/`zeroVelocity` are unchanged for the other callers.
+- **`lockedRotation(root)`**: one rotation for the local root, read once and reused by every tween/hold/lock write, re-read after a respawn or when unused for 1 s (`ROOT_ROTATION_TTL`, so a turn the player made by hand is taken over).
+- **Single owner:** `claimRoot()` / `holdsRoot` / `refreshRoot` / `releaseRoot` / `rootTweenOwned()` (owner token like the boat tween's; it expires 0.5 s after its last refresh, so an errored tween cannot block the root). `tweenTo` and `masteryTweenTo` claim it, refresh it every step (also while paused) and release it when they return; a newer tween takes over and the older one stops. `afq_holdAt`, the hard lock, Freeze Position and the void/sky pulls skip their writes while a tween owns the root. (The enemy pull loops move enemies, not the player, and were not changed.)
+- **`tweenTo`:** exactly one write per frame; position from a fixed base point and elapsed time (never from the last written position); constant rotation; after a pause the interpolation is re-based from the current position and time (no jump); on arrival the final CFrame with zero velocity for three consecutive frames, then the caller restores CanCollide (unchanged in `afq_teleportTo` / `afl_teleportTo` / pads; the fight tweens never changed CanCollide).
+- **Hard lock:** CFrame with the held rotation and the whole velocity zeroed on every written frame (it zeroed only a non-zero Y and kept X/Z), 60 Hz.
+- **`afq_holdAt`:** one `placeRoot` per frame with the held rotation, 60 Hz, no write while a tween owns the root.
+
+### Intentional behaviour changes
+
+- Remote quest accept is off by default: quests are accepted through the giver dialogue, which needs Roblox focused (unfocused: Auto Farm Quest waits instead of flying to the giver). Every quest completion now means a trip to the giver.
+- A quest switch on level-up accepts the new quest at the new giver without abandoning the old one (dialogue replace); if the old quest is still shown afterwards, the accept counts as failed and is retried with the usual backoff.
+- Remote M1 10 swings/s by default (adjustable 2-20); hard lock and hold 60 Hz; no 0.3 s gap between Auto Farm Quest steps; next target right after a kill.
+- Auto Stat spends only at calm moments (or once per 60 s during fights, never while travelling); points can stay unspent for a while during a long farm.
+- The hard lock now zeroes horizontal velocity as well; the character's facing is held while the script places it.
+- Freeze Position and the void/sky pulls pause while a tween is in flight.
+- A tween arrival takes two extra frames (settle).
+
+### Not done / remaining risks
+
+- **Not live-tested.** The dialogue path for Auto Farm Quest givers was never run live in the current game UI (it reuses the Level Farm click flow; it moves the user's cursor). Whether a dialogue accept really replaces an active quest is the wiki/user statement; the script verifies it through the tracker.
+- The write rates are back to the pre-stability levels or above (now 3 bridge writes per frame for a placed root: CFrame, Velocity, AssemblyLinearVelocity). This relies on the A/B result that the remote, not the write rate, was the crash trigger. `AFQ_DEBUG.safeMode = true` halves the rates if crashes come back with the remote off.
+- Movers other than the ones listed (raid travel, boat seat, Magnet farm) do not check the root owner.
+- `test.txt` (legacy single file) was not changed.
+
+### Checks
+
+`bash build.sh`; `bash check.sh`: see the output pasted in the report of this pass (0 SyntaxError in every chunk, `dist/test.full.lua`, `loader.lua` and the loader harness; no unknown globals beyond `dist/ug_baseline.txt`; 12/12 static stability rules). Line counts: 00_core 1,081, 10_ui 1,092, 20_ui2 1,228, 30_esp 844, 40_combat 701, 50_farms 796, 60_afq 1,759, 70_misc 1,149, 80_misc2 1,169, 90_main 25; `dist/test.full.lua` 9,844. Every src chunk is still CRLF; no control ID, config format field or `QUEST_LEVELS` row changed.

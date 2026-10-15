@@ -18,25 +18,20 @@ end
 HARD_LOCK_LAST = 0
 function hardLockNpcCFrame(hrp,targetPos)
     if not hrp or not targetPos then return end
-    -- 30 Hz cap (was every frame, 60 Hz). 4 ms slack so 60 Hz frame jitter
-    -- does not turn every other frame into every third.
+    markFight()
+    -- ROOT_WRITE_HZ cap: 60 Hz = one write per frame (30 Hz with
+    -- AFQ_DEBUG.safeMode; the stability pass had 30 Hz always, restored on
+    -- Oct 15 2026). 4 ms slack so frame jitter does not skip a frame.
+    -- A tween in flight owns the root (claimRoot in 00_core): no second mover.
+    if rootTweenOwned() then return end
     local now=clock()
     if now-HARD_LOCK_LAST<writeInterval(1/ROOT_WRITE_HZ)-0.004 then return end
     HARD_LOCK_LAST=now
-    if not moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rootRotation(hrp)) then return end
-
-    pcall(function()
-        local velocity=hrp.Velocity
-        if velocity and velocity.X and velocity.Z and math.abs(velocity.Y)>0.01 then
-            hrp.Velocity=Vector3.new(velocity.X,0,velocity.Z)
-        end
-    end)
-    pcall(function()
-        local assemblyVelocity=hrp.AssemblyLinearVelocity
-        if assemblyVelocity and assemblyVelocity.X and assemblyVelocity.Z and math.abs(assemblyVelocity.Y)>0.01 then
-            hrp.AssemblyLinearVelocity=Vector3.new(assemblyVelocity.X,0,assemblyVelocity.Z)
-        end
-    end)
+    -- Smooth/fling-free (Oct 15 2026): CFrame with the held rotation
+    -- (lockedRotation, not re-read every frame, so the camera does not turn)
+    -- and the whole velocity zeroed on every written frame (placeRoot). It
+    -- used to zero only a non-zero vertical component and keep X/Z.
+    placeRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,lockedRotation(hrp))
 end
 
 function getNormalFarmOffsets()
@@ -249,7 +244,11 @@ BasicM1 = {
     comboReset   = 0.75,  -- client resets the combo after 0.75 s without a swing
     maxExtra     = 9,     -- extra rigs per swing (client cap: 10 rigs total, Buddha only)
     maxDist      = REMOTE_MAX_DIST,
-    minInterval  = 0.25,  -- per caller tag (was 0.045: ~20 swings = 40 FireServer/s); the client's own M1 is ~3-4/s
+    -- per caller tag. 0.1 s = 10 swings/s (slider attack_rate, 2-20/s; synced
+    -- from S.attackRate below). History: 0.045 (~20 swings = 40 FireServer/s)
+    -- -> 0.25 in the stability pass (4/s, too slow at killing) -> 0.1 on Oct 15
+    -- 2026 once the crash trigger was found to be the remote quest pickup.
+    minInterval  = 0.1,
     noDamageSecs = 2.0,   -- watchdog: advance profile after this long with no HP loss
     requireTool  = true,  -- the server-side M1 needs an equipped weapon
     hitParts     = { "Head", "UpperTorso", "LowerTorso", "LeftLowerLeg", "RightLowerLeg",
@@ -273,6 +272,16 @@ BasicM1 = {
     watchHp      = 0,
     watchSince   = 0,
 }
+
+-- Remote M1 rate from the slider (20_ui2 attack_rate -> S.attackRate). The
+-- slider can fire before this chunk loads (UE config), so read the value now
+-- and install the hook the slider calls from here on.
+function BasicM1.setRate(rate)
+    rate = math.max(2, math.min(20, math.floor(tonumber(rate) or 10)))
+    BasicM1.minInterval = 1 / rate
+end
+BasicM1.setRate(S.attackRate)
+S.onAttackRate = BasicM1.setRate
 
 -- Client: tostring(UserId):sub(2,4) .. tostring(coroutine.running()):sub(11,15)
 -- (3 digits of the UserId + 5 hex digits). The script's hard-coded
@@ -380,6 +389,7 @@ function BasicM1.fire(tagPrefix, primaryPart, extras)
     -- pending: the remotes are serialised (see quietInvoke in 00_core).
     if remoteInvokePending() then return false end
     if not BasicM1.ready(tagPrefix) then return false end
+    markFight()
     local now = clock()
     BasicM1.lastFireBy[tagPrefix] = now
     local prof = BasicM1.profiles[BasicM1.profile] or BasicM1.profiles[1]

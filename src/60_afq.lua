@@ -149,8 +149,22 @@ function afl_questRemoteWait(giverKey,questIndex)
     if not last then return 0 end
     return math.max(0,AFQ_REMOTE_MIN_INTERVAL-(clock()-last))
 end
+-- Remote quest accept default (Oct 15 2026). The user's A/B run confirmed
+-- the CommF_ StartQuest/AbandonQuest invoke as the crash trigger under
+-- Matcha Hybrid (AFQ_DEBUG.remoteAcceptOff = true stopped the crashes), so
+-- the "Remote quest accept" toggle (afl_remote_quest -> AFL.useRemoteQuest)
+-- is OFF by default. Off = no StartQuest and no AbandonQuest from this
+-- script at all: Auto Farm Quest accepts through the giver dialogue
+-- (afq_acceptByDialogue) and switches quests by accepting the new one there
+-- (the game keeps one active quest; a dialogue accept replaces it), Level
+-- Farm clicks its dialogue. AFQ_DEBUG.remoteAcceptOff = true forces the same
+-- even with the toggle on.
+function afq_remoteQuestOff()
+    if AFQ_DEBUG and AFQ_DEBUG.remoteAcceptOff==true then return true end
+    return AFL.useRemoteQuest~=true
+end
 function afl_startQuestRemote(giverKey,questIndex)
-    if AFQ_DEBUG and AFQ_DEBUG.remoteAcceptOff then return false,"remote accept disabled (AFQ_DEBUG.remoteAcceptOff)" end
+    if afq_remoteQuestOff() then return false,"remote quest accept is off (toggle Remote quest accept / AFQ_DEBUG.remoteAcceptOff)" end
     if remoteFailing("StartQuest") then return false,"StartQuest remote keeps failing" end
     local left=afl_questRemoteWait(giverKey,questIndex)
     if left>0 then return false,"StartQuest for this quest was sent less than "..AFQ_REMOTE_MIN_INTERVAL.."s ago" end
@@ -311,7 +325,13 @@ function afl_farmNpcs()
         end
         if not AFL.selectedNpc or not partStillThere(AFL.selectedNpc) then
             local attempts=0
-            repeat AFL.selectedNpc=afl_getNextNpc(); attempts=attempts+1; wait(0.05) until AFL.selectedNpc or attempts>15
+            -- Speed restore: the 0.05 s wait only while nothing is found (it
+            -- also ran after a successful pick, delaying every next target).
+            repeat
+                AFL.selectedNpc=afl_getNextNpc(); attempts=attempts+1
+                if AFL.selectedNpc then break end
+                wait(0.05)
+            until attempts>15
             if not AFL.selectedNpc then
                 if AFL.waitPositions[AFL.npcToFarm] then afl_teleportToWait(AFL.npcToFarm) end
                 wait(0.5); continue
@@ -612,6 +632,7 @@ function afq_usePad(padCenter,wantInside,checkFn)
         -- legs inside the pad (root 1 stud above it) and just above it, which
         -- makes a fresh contact each time. Re-placed every 0.8 s so a teleport
         -- in flight is not undone.
+        markTravel() -- no background CommF_ invoke while on a pad
         if clock()>=nextPlace then
             local y=sink and padCenter.Y+1 or padCenter.Y+4
             moveRoot(root,padCenter.X,y,padCenter.Z,rootRotation(root))
@@ -996,8 +1017,10 @@ end
 function afq_abandon()
     if AFQ_DEBUG.noAccept then afq_clearHeld(); return true end
     if not afq_trackerFrame() then afq_clearHeld(); return true end
-    if AFQ_DEBUG.remoteAcceptOff then
-        return false,"AbandonQuest is off with AFQ_DEBUG.remoteAcceptOff (finish or abandon the quest by hand)"
+    if afq_remoteQuestOff() then
+        -- Never reached from afq_step while the remote is off (the dialogue
+        -- accept replaces the held quest); kept as a guard.
+        return false,"AbandonQuest is not sent while remote quest accept is off"
     end
     local since=clock()-(AFQ.lastAbandonAt or -1e9)
     if since<AFQ_REMOTE_MIN_INTERVAL then
@@ -1053,9 +1076,16 @@ function afq_acceptWait(q)
     return math.max(0,cooldown,afl_questRemoteWait(q.giverKey,q.questIndex))
 end
 
--- No-remote accept for the A/B test (AFQ_DEBUG.remoteAcceptOff): the Level
--- Farm dialogue clicks at the giver (questButton = questIndex for every
--- quest, checked against the Quests module). Needs Roblox in front.
+-- No-remote accept, the normal path since Oct 15 2026 (Remote quest accept
+-- off by default; also AFQ_DEBUG.remoteAcceptOff): the Level Farm dialogue
+-- clicks at the giver (questButton = questIndex for every quest, checked
+-- against the Quests module). Needs Roblox in front. The dialogue's accept
+-- option is the game's own client call (DialoguesList.Util.generateQuest ->
+-- CommF_ StartQuest from the game's LocalScript, not through Matcha's
+-- InvokeServer bridge). A quest that is still active is replaced by the new
+-- accept (one active quest; the wiki says a new accept overrides it, and
+-- the old Level Farm click flow in afl_setQuest relied on that); afq_step
+-- verifies it through the tracker showing the new quest.
 function afq_acceptByDialogue(q)
     if not robloxFocused() then return false,"the dialogue accept needs the Roblox window in front" end
     wait(0.5)
@@ -1115,13 +1145,15 @@ end
 -- every frame, so a wait spot in the air is held instead of free-falling
 -- (seen live: wait spot over open air -> fell to the sea, tweened back up,
 -- every ~3.3 s). Only while afq_farming(); always yields at least one frame.
+-- Oct 15 2026: 60 Hz (ROOT_WRITE_HZ; 30 Hz in safe mode), one placeRoot per
+-- frame (CFrame with the held rotation + zero velocity, no skip), and no
+-- write while a tween owns the root.
 function afq_holdAt(position,seconds)
     local deadline=clock()+(seconds or 0)
     repeat
         local _,root=afl_getCharacter()
-        if root and position and afq_farming() then
-            moveRoot(root,position.X,position.Y,position.Z,rootRotation(root))
-            zeroVelocity(root)
+        if root and position and afq_farming() and not rootTweenOwned() then
+            placeRoot(root,position.X,position.Y,position.Z,lockedRotation(root))
         end
         task.wait(writeInterval(1/ROOT_WRITE_HZ))
     until clock()>=deadline or not afq_farming()
@@ -1323,6 +1355,16 @@ function afq_step()
                 AFQ.status="Lv "..level..": quest switch cooldown ("..math.ceil(left).."s)"
                 afq_updateLabel(); wait(0.5); return
             end
+        elseif afq_remoteQuestOff() then
+            -- Remote quest accept off (the default): no AbandonQuest. The
+            -- dialogue accept at the new giver replaces the held quest; the
+            -- held quest stays in AFQ.current until the tracker shows the new
+            -- one (markAccepted), so a failed dialogue keeps it on record.
+            AFQ_DEBUG.phase="switch"
+            afq_logSwitch("Lv "..level..": switching "..held.giverKey.." #"..held.questIndex
+                .." -> "..q.giverKey.." #"..q.questIndex.." (the dialogue accept replaces the old quest)")
+            AFQ.lastSwitch=clock()
+            AFQ.entry=nil
         else
             AFQ_DEBUG.phase="switch"
             afq_logSwitch("Lv "..level..": switching "..held.giverKey.." #"..held.questIndex
@@ -1407,6 +1449,9 @@ function afq_step()
                 AFQ.entry=nil
                 return false
             end
+            -- Dialogue path (remote off): the accept replaces whatever quest
+            -- is active, so there is nothing to abandon first.
+            if afq_remoteQuestOff() then return true end
             if afq_trackerQuestIs(q)=="other" or (AFQ.current and not afq_sameQuest(AFQ.current,q)) then
                 AFQ_DEBUG.phase="abandon"
                 afq_logSwitch("Lv "..tostring(freshLevel or level)..": another quest is active, abandoning it before "
@@ -1449,10 +1494,10 @@ function afq_step()
         -- tracker showing q (afq_waitTrackerFor) is the proof of acceptance.
         -- No proof within AFQ_REMOTE_ACCEPT_WAIT: fall back once to the giver
         -- trip below.
-        -- AFQ_DEBUG.remoteAcceptOff (A/B test of the reported crash trigger):
-        -- no StartQuest from where the character stands; accept at the giver
-        -- through the dialogue instead.
-        local viaGiver=not AFL.useRemoteQuest or AFQ_DEBUG.remoteAcceptOff==true
+        -- Remote quest accept off (the default since Oct 15 2026, or
+        -- AFQ_DEBUG.remoteAcceptOff): no StartQuest at all; accept at the
+        -- giver through the dialogue instead.
+        local viaGiver=afq_remoteQuestOff()
         local fallback=false
         if not viaGiver then
             setStatus(" accepting (remote)")
@@ -1485,12 +1530,21 @@ function afq_step()
             end
         end
         if viaGiver then
-            -- Remote accept off (unchanged), or the fallback above: travel to
-            -- the giver and accept there.
-            if not fallback then setStatus(" accepting") end
+            -- Remote accept off (the default: dialogue accept), or the remote
+            -- fallback above: travel to the giver and accept there.
+            local dialogue=afq_remoteQuestOff()
+            if not fallback then setStatus(dialogue and " accepting (dialogue)" or " accepting") end
+            -- The dialogue clicks need Roblox in front: do not fly to the giver
+            -- for a click that cannot be sent; look again in a second.
+            if dialogue and not AFQ_DEBUG.noAccept and not robloxFocused() then
+                setStatus(" accept waiting: focus the Roblox window (dialogue accept)")
+                warnThrottled("questDialogueFocus","[laced.club] Auto Farm Quest: Remote quest accept is off, so the quest is "
+                    .."accepted through the giver dialogue, which needs the Roblox window in front",30)
+                afq_sleep(1); return
+            end
             -- No travel while the remote is known to be failing: wait for the
             -- next probe (one call per backoff period, see below) instead.
-            if not AFQ_DEBUG.remoteAcceptOff and not AFQ_DEBUG.noAccept and remoteFailing("StartQuest") then
+            if not dialogue and not AFQ_DEBUG.noAccept and remoteFailing("StartQuest") then
                 AFQ.acceptFails=(AFQ.acceptFails or 0)+1
                 local backoff=afq_backoff(AFQ.acceptFails)
                 setStatus(" accept failed: StartQuest remote keeps failing (retry in "..math.ceil(backoff).."s)")
@@ -1507,7 +1561,9 @@ function afq_step()
             if adoptIfShown() then return end
             -- Wait out the rate limit / switch cooldown at the giver (holding)
             -- rather than failing the fallback right after the remote try.
-            local gate=afq_acceptWait(q)
+            -- The dialogue sends no remote from this script: no gate (the
+            -- switch cooldown still applies to the switch decision itself).
+            local gate=dialogue and 0 or afq_acceptWait(q)
             if gate>0 then
                 setStatus(" accepting at the giver in "..math.ceil(gate).."s")
                 if atGiver then afq_holdAt(giverPos,gate) else afq_sleep(gate) end
@@ -1517,8 +1573,9 @@ function afq_step()
             AFQ_DEBUG.phase=fallback and "accept-fallback" or "accept"
             local beforeKey=afq_trackerKey()
             local ok,reason=true,nil
-            if AFQ_DEBUG.remoteAcceptOff then ok,reason=afq_acceptByDialogue(q)
-            elseif not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
+            if AFQ_DEBUG.noAccept then -- isolation run: no accept at all
+            elseif dialogue then ok,reason=afq_acceptByDialogue(q)
+            else ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
             -- The boolean result is not proof: the tracker has to show q (the
             -- giver path used to mark the quest accepted without any check).
             local shown=AFQ_DEBUG.noAccept or (ok and afq_waitTrackerFor(q,AFQ_REMOTE_ACCEPT_WAIT,beforeKey))
@@ -1527,7 +1584,8 @@ function afq_step()
                 AFQ.accepted=false
                 AFQ.acceptFails=(AFQ.acceptFails or 0)+1
                 local backoff=afq_backoff(AFQ.acceptFails)
-                local why=ok and ("the tracker did not show "..q.enemy) or tostring(reason)
+                local why=ok and ("the tracker did not show "..q.enemy
+                    ..((dialogue and AFQ.current and not afq_sameQuest(AFQ.current,q)) and " (the old quest may still be active)" or "")) or tostring(reason)
                 setStatus(" accept failed: "..why.." (retry in "..math.ceil(backoff).."s)")
                 warnThrottled("questFarm","[laced.club] Auto Farm Quest: accept of "..q.giverKey.." #"..q.questIndex
                     .." failed ("..why.."); retry in "..math.ceil(backoff).."s",30)
@@ -1562,10 +1620,13 @@ function afq_step()
         local _,scanRoot=afl_getCharacter()
         local okScan,scanPos=pcall(function() return scanRoot and scanRoot.Position end)
         if not okScan or not scanPos or not scanPos.X then scanPos=nil end
+        -- Speed restore: the 0.05 s hold only while nothing is found (it
+        -- also ran after a successful pick, delaying every next target).
         repeat
             AFQ.selectedNpc=afq_nearestEnemy(q); attempts=attempts+1
+            if AFQ.selectedNpc then break end
             if scanPos then afq_holdAt(scanPos,0.05) else wait(0.05) end
-        until AFQ.selectedNpc or attempts>15 or not afq_farming()
+        until attempts>15 or not afq_farming()
         if not AFQ.selectedNpc then
             setStatus(" waiting for spawn")
             local arrived,spot=false,nil
@@ -1582,7 +1643,9 @@ function afq_step()
             else
                 arrived,spot=afq_goToWait(q)
             end
-            if arrived and spot then afq_holdAt(spot,0.5) else wait(0.5) end
+            -- 0.25 s (was 0.5): the next step scans again, so a spawn is seen
+            -- at 4 Hz or better while waiting.
+            if arrived and spot then afq_holdAt(spot,0.25) else wait(0.25) end
             return
         end
     end
@@ -1618,7 +1681,10 @@ task.spawn(function()
         elseif AFQ.activeHead then
             pcall(AFQ.activeHead.restore); AFQ.activeHead=nil
         end
-        wait(0.3)
+        -- Speed restore: one frame between steps while the farm runs (the
+        -- next target is picked right after a kill; every step path yields
+        -- by itself), IDLE_POLL (0.25 s) only while it is off. Was 0.3 s.
+        idleWait(S.autoFarmQuest==true and not farmPriorityFeatureActive())
     end
 end)
 

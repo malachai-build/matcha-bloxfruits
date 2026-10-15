@@ -68,16 +68,34 @@ function masteryTweenTo(hrp,targetPos,lookVector,checkFn)
     local duration=math.max(distance/speed,0.01)
     local startTime=clock()
     local facingCF=facingCFrame(masteryLookVector)
+    -- Oct 15 2026: owns the root while in flight (claimRoot), zero velocity
+    -- on every written frame (placeRoot), re-based after a quiet-window pause
+    -- (no jump on resume), constant facing for the whole flight.
+    local token=claimRoot()
     while alive() do
+        if not holdsRoot(token) then return end -- another tween took the root
+        refreshRoot(token)
+        markTravel()
         if checkFn then
             local okCheck,keepGoing=pcall(checkFn)
-            if not okCheck or not keepGoing then return end
+            if not okCheck or not keepGoing then releaseRoot(token); return end
         end
-        local alpha=distance<0.1 and 1 or math.min((clock()-startTime)/duration,1)
-        local okMove=moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,facingCF)
-        if not okMove or alpha>=1 then return end
-        frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based
+        if writesPaused() then
+            task.wait(0.05)
+            local okNow,now=pcall(function() return hrp.Position end)
+            if okNow and now and now.X then startPos=now end
+            dx=targetPos.X-startPos.X; dy=targetPos.Y-startPos.Y; dz=targetPos.Z-startPos.Z
+            distance=math.sqrt(dx*dx+dy*dy+dz*dz)
+            duration=math.max(distance/speed,0.01)
+            startTime=clock()
+        else
+            local alpha=distance<0.1 and 1 or math.min((clock()-startTime)/duration,1)
+            local okMove=placeRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,facingCF)
+            if (not okMove and not writesPaused()) or alpha>=1 then releaseRoot(token); return end
+            frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based
+        end
     end
+    releaseRoot(token)
 end
 
 function masteryGetTargets(hrp)
@@ -605,7 +623,8 @@ function invokeEnhancedComm(first,second,third,fourth)
     elseif first~=nil then ok,result=quietInvoke("CommF_",remote,first)
     else ok,result=quietInvoke("CommF_",remote) end
     if not ok then
-        enhancedComm=nil
+        -- A postponed (deferrable) invoke was never sent: keep the remote.
+        if result~=QUIET_POSTPONED then enhancedComm=nil end
         return false,nil,tostring(result)
     end
     return true,result,nil
@@ -909,7 +928,7 @@ task.spawn(function()
                 end,target,true,5000,useRemote and remoteAttack or nil,useRemote and 0.05 or 0.06)
                 frameWait()
             else
-                task.wait(0.35)
+                task.wait(0.25) -- re-scan at 4 Hz while no target is up (was 0.35 s)
             end
         else
             task.wait(0.1)
@@ -938,7 +957,7 @@ task.spawn(function()
                         return S.autoMaterialFarm and not S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedMaterial==material
                     end)
                 end
-                task.wait(0.35)
+                task.wait(0.25) -- re-scan at 4 Hz while no target is up (was 0.35 s)
             else
                 task.wait(0.35)
             end
@@ -968,10 +987,36 @@ end)
 --   * the cap switches a toggle off only against the confirmed (live) level;
 --   * one spend per pass, and the pass is pcall'd with a back-off on error.
 AUTO_STAT_CONFIRM_SECS=15
+-- Speed restore (Oct 15 2026): every AddPoint goes through quietInvoke, whose
+-- quiet window (~0.6-1.1 s without root writes or M1 swings) used to land in
+-- the middle of fights and flights. Spends are now queued (points stay
+-- unspent) and sent only at a calm moment: no travel mark (tweenTo, mastery
+-- and boat tweens, pads) for AUTO_STAT_CALM_SECS and no combat mark (hard
+-- lock, remote M1 swing, farm click) for AUTO_STAT_CALM_SECS. That is: farms
+-- off, waiting for a spawn at a wait spot, or at a quest giver. During a
+-- farm with no calm moment, at most one spend per AUTO_STAT_BUSY_INTERVAL s,
+-- and only while not travelling (never mid-flight). The invoke is
+-- deferrable (S.quietDefer): if travel (or, for a calm spend, combat) starts
+-- during the quiet window's lead-in, the AddPoint is not sent and is retried
+-- at the next calm moment.
+AUTO_STAT_CALM_SECS=1.5
+AUTO_STAT_BUSY_INTERVAL=60
 task.spawn(function()
     -- {toggle state key, AddPoint / Data.Stats name, cap state key, toggle id, label}
     local statEntries={{"autoStatMelee","Melee","statCapMelee","stat_melee","Melee"},{"autoStatDefense","Defense","statCapDefense","stat_defense","Def"},{"autoStatSword","Sword","statCapSword","stat_sword","Sword"},{"autoStatGun","Gun","statCapGun","stat_gun","Gun"},{"autoStatFruit","Demon Fruit","statCapFruit","stat_fruit","Fruit"}}
     local pending={}   -- name -> {base, lvl, pts, t, entry}: one AddPoint not yet proven by Data
+    local lastSpendAt=-1e9 -- clock() of the last AddPoint sent
+    local queued=false     -- points are waiting for a calm moment (label)
+    -- nil = wait (travel, or combat inside AUTO_STAT_BUSY_INTERVAL); "any" =
+    -- calm spend (postponed by travel or combat); "travel" = the once per
+    -- AUTO_STAT_BUSY_INTERVAL s spend during combat (postponed by travel).
+    local function spendMode()
+        local now=clock()
+        if now-ACTIVITY.travelAt<AUTO_STAT_CALM_SECS then return nil end
+        if now-ACTIVITY.fightAt>=AUTO_STAT_CALM_SECS then return "any" end
+        if now-lastSpendAt>=AUTO_STAT_BUSY_INTERVAL then return "travel" end
+        return nil
+    end
     local floor={}     -- name -> expected level of proven (or unproven, stopped) spends not replicated yet
     local wasOn={}     -- name -> toggle state last pass (a fresh "on" clears the floor)
     local function readValue(parent,name)
@@ -1016,7 +1061,8 @@ task.spawn(function()
             elseif pending[e[2]] then s=s.."(wait)" end
             parts[#parts+1]=s
         end
-        pcall(function() label.Text="Pts "..(pts and tostring(pts) or "?").." | "..table.concat(parts," ") end)
+        local suffix=queued and " (queued: fighting/travelling)" or ""
+        pcall(function() label.Text="Pts "..(pts and tostring(pts) or "?").." | "..table.concat(parts," ")..suffix end)
     end
     local function switchOff(e)
         if not S[e[1]] then return end
@@ -1058,8 +1104,11 @@ task.spawn(function()
             if on and not wasOn[e[2]] then floor[e[2]]=nil end
             wasOn[e[2]]=on
         end
+        if not pts or pts<=0 or remoteFailing("CommF_") or next(pending)~=nil then queued=false; updateLabel(pts); return end
+        local mode=spendMode()
+        queued=mode==nil
         updateLabel(pts)
-        if not pts or pts<=0 or remoteFailing("CommF_") or next(pending)~=nil then return end
+        if not mode then return end -- queued until a calm moment
         for _,e in ipairs(statEntries) do
             if not alive() then return end
             if S[e[1]] then
@@ -1076,7 +1125,15 @@ task.spawn(function()
                     local amount=math.max(1,math.floor(tonumber(S.statAmount) or 10))
                     local n=math.floor(math.min(amount,remaining,pts))
                     if n>0 then
+                        S.quietDefer=mode -- read (and cleared) by quietInvoke
                         local ok,_,err=invokeEnhancedComm("AddPoint",e[2],n)
+                        S.quietDefer=nil
+                        if not ok and err==QUIET_POSTPONED then
+                            -- Travel/combat started in the lead-in: not sent,
+                            -- not a failure; retried at the next calm moment.
+                            return
+                        end
+                        lastSpendAt=clock()
                         if not ok then
                             warnThrottled("autostat:remote","[laced.club] Auto Stat: AddPoint failed: "..tostring(err),20)
                             return

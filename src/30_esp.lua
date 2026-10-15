@@ -340,17 +340,39 @@ function buildBerryEspLabels(force)
     end)
 end
 
-TWEEN_STEP_TIME=1/60 -- was 0.01 (~100 CFrame writes/s through the bridge); safe mode doubles it
+TWEEN_STEP_TIME=FRAME_TIME -- one CFrame write per frame (was 0.01 before the stability pass); safe mode doubles it
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
--- target was reached, false when stopped (checkFn false, part gone, unload).
+-- target was reached, false when stopped (checkFn false, part gone, unload,
+-- or another tween took the root).
+--
+-- Speed restore + smooth flight (Oct 15 2026). Live symptoms after the
+-- stability pass: "the camera bugs out and teleports quickly" and "tweening
+-- is causing the character to be flung". Rules now:
+--   * exactly one write per frame: CFrame, then Velocity and
+--     AssemblyLinearVelocity = 0 (placeRoot, every written frame, no
+--     "only when non-zero" or 0.05-stud skip), so physics cannot build up
+--     speed between writes and launch the character;
+--   * the position is interpolated from a fixed base point and the clock()
+--     time since the base (never from the last written position), so a
+--     late frame catches up on the straight line and the real speed is
+--     `speed` studs/s at any frame rate;
+--   * the rotation is captured once (lockedRotation: shared with
+--     afq_holdAt and the hard lock while they keep running) and held for
+--     the whole flight, so the camera does not turn;
+--   * after a pause (CommF_ quiet window) the interpolation is re-based from
+--     the root's current position and the current time: no jump on resume;
+--   * the tween owns the root (claimRoot token): afq_holdAt, the hard lock,
+--     Freeze Position and the void/sky pulls do not write the root while it
+--     is in flight; a newer tween takes the root over and this one stops;
+--   * on arrival the final CFrame is written with zero velocity for three
+--     consecutive frames (the callers then restore CanCollide).
+-- The local character's root is re-fetched every step and compared by key:
+-- after a death or respawn the old root (possibly freed) is never touched.
 function tweenTo(hrp, targetPos, speed, checkFn)
     if not hrp or not targetPos then return false end
     local okStart,startPos=pcall(function() return hrp.Position end)
     if not okStart or not startPos then return false end
-    local rotationCF=rootRotation(hrp)
-    -- The local character's root is re-fetched every step and compared by key:
-    -- after a death or respawn the old root (possibly freed) is never touched.
     local rootKey=instKey(hrp)
     local isLocalRoot=false
     pcall(function()
@@ -358,6 +380,7 @@ function tweenTo(hrp, targetPos, speed, checkFn)
         local cur=char and char:FindFirstChild("HumanoidRootPart")
         isLocalRoot=cur~=nil and instKey(cur)==rootKey
     end)
+    local rotationCF=isLocalRoot and lockedRotation(hrp) or rootRotation(hrp)
     local function currentPart()
         if not isLocalRoot then
             local okParent,parent=pcall(function() return hrp.Parent end)
@@ -382,39 +405,78 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local dx=targetPos.X-startPos.X; local dy=targetPos.Y-startPos.Y; local dz=targetPos.Z-startPos.Z
     local distance=math.sqrt(dx*dx+dy*dy+dz*dz)
     if distance<=1 then
-        return moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rotationCF)
+        return placeRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rotationCF)
     end
     local moveSpeed=tonumber(speed) or 320
     if moveSpeed<=0 then moveSpeed=320 end
-    local duration=distance/moveSpeed; local startTime=clock()
-    -- Write-rate cap: never two CFrame writes closer than 90% of the step,
-    -- even if task.wait resumes early (a bare task.wait() resumes ~2,400
-    -- times a second in Matcha), however long the flight is.
+    local token=isLocalRoot and claimRoot() or nil
+    local function finish(result)
+        if token then releaseRoot(token) end
+        return result
+    end
+    local function ownsRoot()
+        if not token then return true end
+        if not holdsRoot(token) then return false end
+        refreshRoot(token)
+        return true
+    end
+    -- Interpolation base: a fixed point and the time the flight left it.
+    local baseX,baseY,baseZ=startPos.X,startPos.Y,startPos.Z
+    local duration=distance/moveSpeed
+    local baseTime=clock()
+    local function rebase()
+        local part=currentPart()
+        local okPos,pos=pcall(function() return part and part.Position end)
+        if okPos and pos and pos.X then baseX,baseY,baseZ=pos.X,pos.Y,pos.Z end
+        dx=targetPos.X-baseX; dy=targetPos.Y-baseY; dz=targetPos.Z-baseZ
+        duration=math.max(math.sqrt(dx*dx+dy*dy+dz*dz)/moveSpeed,FRAME_TIME)
+        baseTime=clock()
+    end
     local lastWrite=-1e9
     while keepGoing() do
+        if not ownsRoot() then return false end -- a newer tween owns the root
+        markTravel() -- a background CommF_ invoke (Auto Stat) waits until the flight is over
         local step=writeInterval(TWEEN_STEP_TIME)
-        local since=clock()-lastWrite
+        local now=clock()
         if writesPaused() then
-            -- CommF_ quiet window (quietInvoke): no write; the flight resumes
-            -- where it stopped (startTime moves by the pause).
-            local pausedAt=clock()
-            task.wait(0.05)
-            startTime=startTime+(clock()-pausedAt)
-        elseif since<step*0.9 then
-            task.wait(step-since)
+            -- CommF_ quiet window (quietInvoke): no write. Resume from where
+            -- the root is when the window closes (no jump back onto the line).
+            repeat
+                if not ownsRoot() then return false end
+                markTravel()
+                task.wait(0.05)
+            until not writesPaused() or not keepGoing()
+            rebase()
+        elseif now-lastWrite<step-0.004 then
+            -- Write floor: one write per frame (4 ms jitter slack), even when
+            -- task.wait resumes early.
+            task.wait(step-(now-lastWrite))
         else
             local part=currentPart()
-            if not part then return false end
-            local alpha=math.min((clock()-startTime)/duration,1)
-            if not moveRoot(part,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,rotationCF) then
-                return false
+            if not part then return finish(false) end
+            local alpha=math.min((now-baseTime)/duration,1)
+            if placeRoot(part,baseX+dx*alpha,baseY+dy*alpha,baseZ+dz*alpha,rotationCF) then
+                lastWrite=now
+                if alpha>=1 then
+                    -- Arrival: final CFrame with zero velocity for three
+                    -- consecutive frames (this one plus two), then hand over.
+                    for _=1,2 do
+                        task.wait(step)
+                        local last=currentPart()
+                        if not last or not ownsRoot() then break end
+                        placeRoot(last,targetPos.X,targetPos.Y,targetPos.Z,rotationCF)
+                    end
+                    return finish(true)
+                end
+                task.wait(step)
+            elseif not writesPaused() then
+                return finish(false) -- the root left the DataModel
             end
-            lastWrite=clock()
-            if alpha>=1 then return true end
-            task.wait(step)
+            -- else: a quiet window began between the check and the write;
+            -- the pause branch above handles it on the next pass.
         end
     end
-    return false
+    return finish(false)
 end
 
 espFolderSnapshots={}

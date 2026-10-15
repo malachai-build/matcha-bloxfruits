@@ -72,6 +72,20 @@ function robloxFocused()
     return not (okActive and active == false)
 end
 
+-- Activity marks (speed restore, Oct 15 2026). Travel (tweenTo, the mastery
+-- and boat tweens, the Underwater City pads) and combat (hard lock, remote M1
+-- swing, farm click) stamp the time here, so a background CommF_ invoke
+-- (Auto Stat AddPoint) can wait for a calm moment instead of freezing a fight
+-- or a flight with its quiet window (quietInvoke below).
+ACTIVITY = { travelAt = -1e9, fightAt = -1e9 }
+function markTravel() ACTIVITY.travelAt = clock() end
+function markFight() ACTIVITY.fightAt = clock() end
+-- True when travel ("travel") or travel/combat ("any") was marked at or after t.
+function activitySince(t, kind)
+    if ACTIVITY.travelAt >= t then return true end
+    return kind == "any" and ACTIVITY.fightAt >= t
+end
+
 Players = game:GetService("Players")
 LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -154,6 +168,7 @@ function menuUnderMouse()
     return okOver and over == true
 end
 function farmClick()
+    markFight()
     if not robloxFocused() then return false end
     if menuUnderMouse() then return false end
     return (pcall(mouse1click))
@@ -222,7 +237,10 @@ end
 -- hard-lock, holdAt and tween loops used to write 180-300 times a second.
 -- AFQ_DEBUG.safeMode = true doubles every interval that uses writeInterval()
 -- (halves those rates) for A/B crash testing.
-ROOT_WRITE_HZ = 30
+-- Speed restore (Oct 15 2026): the remote quest pickup was found to be the
+-- crash trigger (CHANGES.md), so the hard lock and afq_holdAt are back to one
+-- write per frame (60 Hz; 30 Hz with AFQ_DEBUG.safeMode). Was 30 Hz.
+ROOT_WRITE_HZ = 60
 ROOT_SKIP_DIST_SQ = 0.05 * 0.05
 -- WRITE_BUDGET.debug is linked to the AFQ_DEBUG table by 20_ui2 (pair P08),
 -- so AFQ_DEBUG.safeMode = true switches safe mode on at runtime.
@@ -294,6 +312,72 @@ function zeroVelocity(part)
     if not (okState and nearZeroVector(assembly)) then
         pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
     end
+end
+
+-- Smooth, fling-free root control (Oct 15 2026; live symptoms after the
+-- stability pass: "the camera bugs out and teleports quickly" and "tweening
+-- is causing the character to be flung"). Used by tweenTo, afq_holdAt,
+-- masteryTweenTo and the fight hard lock.
+--
+-- placeRoot writes the CFrame and then Velocity and AssemblyLinearVelocity
+-- = 0 on EVERY call: no 0.05-stud skip and no "only when non-zero" read, so
+-- gravity/physics cannot build up speed between two writes (the cause of the
+-- launch at the end of a tween). Same guards as moveRoot: nothing while a
+-- CommF_ quiet window is open, nothing on a root that left the DataModel.
+function placeRoot(part, x, y, z, rotation)
+    if not part then return false end
+    if writesPaused() then return false end
+    local okParent, parent = pcall(function() return part.Parent end)
+    if not okParent or parent == nil then return false end
+    local okCFrame = pcall(function()
+        local positionCF = CFrame.new(x, y, z)
+        part.CFrame = rotation and (positionCF * rotation) or positionCF
+    end)
+    if not okCFrame and not pcall(function() part.Position = Vector3.new(x, y, z) end) then return false end
+    pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
+    pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    return true
+end
+
+-- One rotation for the local root while the script keeps placing it: read
+-- once, then reused by every tween / hold / hard-lock write, so the facing
+-- (and the camera behind it) never changes frame to frame because physics
+-- nudged the CFrame between writes. Re-read after a respawn (other root) or
+-- when no placement used it for ROOT_ROTATION_TTL s (the player turned the
+-- character by hand in between).
+ROOT_ROTATION_TTL = 1
+ROOT_ROTATION = { key = nil, rotation = nil, at = -1e9 }
+function lockedRotation(part)
+    local key = instKey(part)
+    local now = clock()
+    local cache = ROOT_ROTATION
+    if cache.key ~= key or now - cache.at > ROOT_ROTATION_TTL then
+        cache.key = key
+        cache.rotation = rootRotation(part)
+    end
+    cache.at = now
+    return cache.rotation
+end
+
+-- Single owner of the local root while a tween is in flight. tweenTo claims
+-- a token, refreshes it every step (also while paused) and releases it when
+-- it returns; a newer claim wins and the older tween stops. afq_holdAt, the
+-- hard lock, Freeze Position and the void/sky pulls skip their writes while
+-- rootTweenOwned() is true. The owner times out after ROOT_OWNER_TTL s
+-- without a refresh, so an errored tween cannot block the root for good.
+ROOT_OWNER_TTL = 0.5
+ROOT_OWNER = { token = nil, at = -1e9 }
+function claimRoot()
+    local token = {}
+    ROOT_OWNER.token = token
+    ROOT_OWNER.at = clock()
+    return token
+end
+function holdsRoot(token) return token ~= nil and ROOT_OWNER.token == token end
+function refreshRoot(token) if ROOT_OWNER.token == token then ROOT_OWNER.at = clock() end end
+function releaseRoot(token) if ROOT_OWNER.token == token then ROOT_OWNER.token = nil end end
+function rootTweenOwned()
+    return ROOT_OWNER.token ~= nil and clock() - ROOT_OWNER.at < ROOT_OWNER_TTL
 end
 
 -- Drawing helpers: every object is created, updated and removed defensively.
@@ -433,6 +517,7 @@ S = {
     selectedBoatSeat = nil,
     selectedBoatSeatLabel = nil,
     remoteMode      = true,
+    attackRate      = 10,  -- remote M1 swings/s (slider attack_rate; BasicM1.minInterval = 1/attackRate)
     weaponSlot      = 1,
     selectedBoss    = "The Gorilla King",
     autoBossFarm    = false,
@@ -613,7 +698,16 @@ local function rootSpeed()
     end)
     return okSpeed and tonumber(speed) or 0
 end
+-- Deferrable invokes (speed restore, Oct 15 2026): a caller that can retry
+-- later (Auto Stat) sets S.quietDefer = "travel" or "any" right before its
+-- call. When travel (or travel/combat for "any") starts during the lead-in,
+-- the invoke is not sent: the window is released at once (within 0.05 s) and
+-- the call returns false, QUIET_POSTPONED. The caller retries at its next
+-- calm moment. StartQuest/AbandonQuest never set it.
+QUIET_POSTPONED = "postponed: travel or combat started"
 function quietInvoke(tag, remote, ...)
+    local defer = S.quietDefer
+    S.quietDefer = nil
     if not remote then return false, nil end
     local count = select("#", ...)
     local args = { ... }
@@ -626,9 +720,20 @@ function quietInvoke(tag, remote, ...)
     local okCall, ok, result = true, false, nil
     if quiet then
         S.remoteQuiet = true
-        task.wait(AFQ_REMOTE_QUIET_BEFORE)
-        local settleUntil = clock() + 0.5
-        while rootSpeed() > 1 and clock() < settleUntil do task.wait(0.05) end
+        local startedAt = clock()
+        local leadEnd = startedAt + AFQ_REMOTE_QUIET_BEFORE
+        local settleUntil = leadEnd + 0.5
+        -- Lead-in: AFQ_REMOTE_QUIET_BEFORE s, then up to 0.5 s more while the
+        -- root still moves (same as before, polled every 0.05 s).
+        while clock() < settleUntil do
+            if defer and activitySince(startedAt, defer) then
+                S.remoteQuiet = false
+                S.remoteInvokeBusy = false
+                return false, QUIET_POSTPONED
+            end
+            if clock() >= leadEnd and rootSpeed() <= 1 then break end
+            task.wait(0.05)
+        end
     end
     okCall, ok, result = pcall(safeRemote, tag, remote, "InvokeServer", table.unpack(args, 1, count))
     if quiet then task.wait(AFQ_REMOTE_QUIET_AFTER) end
@@ -661,7 +766,7 @@ AFL = {
     autoV3           = false,
     autoV4           = true,
     enableGetQuest   = true,
-    useRemoteQuest   = true,   -- accept quests with CommF_ "StartQuest" (toggle afl_remote_quest); clicks are the fallback
+    useRemoteQuest   = false,  -- accept quests with CommF_ "StartQuest" (toggle afl_remote_quest, OFF by default since Oct 15 2026: the remote was found to crash the client on Matcha Hybrid); off = dialogue clicks
     usePortalTeleport = true,
     activeTweens     = {},
     lastTween        = clock(),

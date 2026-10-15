@@ -115,6 +115,20 @@ mainTab:AddToggle("remote_mode", {
     end
 })
 
+-- Speed restore (Oct 15 2026): remote M1 rate, 10 swings/s by default (the
+-- stability pass had capped it at 4). BasicM1 (40_combat) is defined after
+-- this chunk, so the value goes through S: S.onAttackRate is installed by
+-- 40_combat and applies it to BasicM1.minInterval; 40_combat also reads
+-- S.attackRate when it loads.
+mainTab:AddSlider("attack_rate", {
+    Text="Remote M1 swings/s", Description="Remote M1 swing rate (RegisterAttack + RegisterHit per swing), per attack source. Default 10. Safe mode (AFQ_DEBUG.safeMode) halves it.",
+    Min=2, Max=20, Step=1, Default=10, Integer=true, Column=1,
+    Callback=function(v)
+        S.attackRate=math.max(2,math.min(20,math.floor(tonumber(v) or 10)))
+        if type(S.onAttackRate)=="function" then pcall(S.onAttackRate,S.attackRate) end
+    end
+})
+
 mainTab:AddToggle("auto_farm_chest", {
     Text="Auto Farm Chest", Description="Automatically farms chests (load them in first!)",
     Default=false, Column=1,
@@ -194,8 +208,8 @@ mainTab:AddToggle("auto_farm_level", {
 })
 
 mainTab:AddToggle("afl_remote_quest", {
-    Text="Remote quest accept", Description="Accepts the level-farm quest with the game's StartQuest remote after teleporting to the giver (Matcha Pro / Hybrid). Off, or when the remote fails: clicks the dialogue as before.",
-    Default=true, Column=1,
+    Text="Remote quest accept", Description="Accept quests with the StartQuest remote. OFF by default: on Matcha Hybrid this remote was found to crash the client (Oct 15 2026). Needs Roblox focused when off.",
+    Default=false, Column=1,
     Callback=function(v)
         AFL.useRemoteQuest=v
         -- Give a manual re-enable a fresh chance before the click fallback trips again.
@@ -255,7 +269,12 @@ AFQ_STATUS_LABEL=nil   -- set when the UI builds the status line below
 -- remoteAcceptOff (false in normal use): true sends no StartQuest and no
 -- AbandonQuest at all: Auto Farm Quest accepts at the giver through the
 -- dialogue (needs Roblox in front), Level Farm clicks its dialogue. A/B test
--- for the user-reported crash on the remote quest pickup (CHANGES.md).
+-- for the user-reported crash on the remote quest pickup (CHANGES.md); the
+-- user's A/B run (Oct 15 2026) confirmed the remote as the crash trigger.
+-- Since then the user-facing switch is the "Remote quest accept" toggle
+-- (afl_remote_quest, AFL.useRemoteQuest), OFF by default, which does the
+-- same; remoteAcceptOff stays as a hard override that wins even when the
+-- toggle is on (afq_remoteQuestOff in 60_afq).
 AFQ_DEBUG={noAccept=false,noFight=false,noHead=false,noLock=false,noClick=false,forceLevel=nil,forceBossAlive=nil,phase="idle",safeMode=false,
     quietAccept=true,remoteAcceptOff=false}
 WRITE_BUDGET.debug=AFQ_DEBUG -- writeInterval() (00_core) reads safeMode through this link
@@ -1123,8 +1142,11 @@ function boatTweenTo(targetPos)
     local t0=clock()
     local arrived=false
     while active() do
+        -- Marked before the pause too, so a deferrable invoke (Auto Stat)
+        -- that started its lead-in releases the quiet window at once.
+        markTravel() -- a background CommF_ invoke waits until the flight is over
         -- CommF_ quiet window: no write; the flight resumes where it stopped.
-        while writesPaused() and active() do local pausedAt=clock(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
+        while writesPaused() and active() do local pausedAt=clock(); markTravel(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
         local alpha=math.min((clock()-t0)/duration,1)
         local okMove=pcall(function()
             primary.Position=Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha)

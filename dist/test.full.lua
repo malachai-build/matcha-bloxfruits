@@ -72,6 +72,20 @@ function robloxFocused()
     return not (okActive and active == false)
 end
 
+-- Activity marks (speed restore, Oct 15 2026). Travel (tweenTo, the mastery
+-- and boat tweens, the Underwater City pads) and combat (hard lock, remote M1
+-- swing, farm click) stamp the time here, so a background CommF_ invoke
+-- (Auto Stat AddPoint) can wait for a calm moment instead of freezing a fight
+-- or a flight with its quiet window (quietInvoke below).
+ACTIVITY = { travelAt = -1e9, fightAt = -1e9 }
+function markTravel() ACTIVITY.travelAt = clock() end
+function markFight() ACTIVITY.fightAt = clock() end
+-- True when travel ("travel") or travel/combat ("any") was marked at or after t.
+function activitySince(t, kind)
+    if ACTIVITY.travelAt >= t then return true end
+    return kind == "any" and ACTIVITY.fightAt >= t
+end
+
 Players = game:GetService("Players")
 LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -154,6 +168,7 @@ function menuUnderMouse()
     return okOver and over == true
 end
 function farmClick()
+    markFight()
     if not robloxFocused() then return false end
     if menuUnderMouse() then return false end
     return (pcall(mouse1click))
@@ -222,7 +237,10 @@ end
 -- hard-lock, holdAt and tween loops used to write 180-300 times a second.
 -- AFQ_DEBUG.safeMode = true doubles every interval that uses writeInterval()
 -- (halves those rates) for A/B crash testing.
-ROOT_WRITE_HZ = 30
+-- Speed restore (Oct 15 2026): the remote quest pickup was found to be the
+-- crash trigger (CHANGES.md), so the hard lock and afq_holdAt are back to one
+-- write per frame (60 Hz; 30 Hz with AFQ_DEBUG.safeMode). Was 30 Hz.
+ROOT_WRITE_HZ = 60
 ROOT_SKIP_DIST_SQ = 0.05 * 0.05
 -- WRITE_BUDGET.debug is linked to the AFQ_DEBUG table by 20_ui2 (pair P08),
 -- so AFQ_DEBUG.safeMode = true switches safe mode on at runtime.
@@ -294,6 +312,72 @@ function zeroVelocity(part)
     if not (okState and nearZeroVector(assembly)) then
         pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
     end
+end
+
+-- Smooth, fling-free root control (Oct 15 2026; live symptoms after the
+-- stability pass: "the camera bugs out and teleports quickly" and "tweening
+-- is causing the character to be flung"). Used by tweenTo, afq_holdAt,
+-- masteryTweenTo and the fight hard lock.
+--
+-- placeRoot writes the CFrame and then Velocity and AssemblyLinearVelocity
+-- = 0 on EVERY call: no 0.05-stud skip and no "only when non-zero" read, so
+-- gravity/physics cannot build up speed between two writes (the cause of the
+-- launch at the end of a tween). Same guards as moveRoot: nothing while a
+-- CommF_ quiet window is open, nothing on a root that left the DataModel.
+function placeRoot(part, x, y, z, rotation)
+    if not part then return false end
+    if writesPaused() then return false end
+    local okParent, parent = pcall(function() return part.Parent end)
+    if not okParent or parent == nil then return false end
+    local okCFrame = pcall(function()
+        local positionCF = CFrame.new(x, y, z)
+        part.CFrame = rotation and (positionCF * rotation) or positionCF
+    end)
+    if not okCFrame and not pcall(function() part.Position = Vector3.new(x, y, z) end) then return false end
+    pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
+    pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    return true
+end
+
+-- One rotation for the local root while the script keeps placing it: read
+-- once, then reused by every tween / hold / hard-lock write, so the facing
+-- (and the camera behind it) never changes frame to frame because physics
+-- nudged the CFrame between writes. Re-read after a respawn (other root) or
+-- when no placement used it for ROOT_ROTATION_TTL s (the player turned the
+-- character by hand in between).
+ROOT_ROTATION_TTL = 1
+ROOT_ROTATION = { key = nil, rotation = nil, at = -1e9 }
+function lockedRotation(part)
+    local key = instKey(part)
+    local now = clock()
+    local cache = ROOT_ROTATION
+    if cache.key ~= key or now - cache.at > ROOT_ROTATION_TTL then
+        cache.key = key
+        cache.rotation = rootRotation(part)
+    end
+    cache.at = now
+    return cache.rotation
+end
+
+-- Single owner of the local root while a tween is in flight. tweenTo claims
+-- a token, refreshes it every step (also while paused) and releases it when
+-- it returns; a newer claim wins and the older tween stops. afq_holdAt, the
+-- hard lock, Freeze Position and the void/sky pulls skip their writes while
+-- rootTweenOwned() is true. The owner times out after ROOT_OWNER_TTL s
+-- without a refresh, so an errored tween cannot block the root for good.
+ROOT_OWNER_TTL = 0.5
+ROOT_OWNER = { token = nil, at = -1e9 }
+function claimRoot()
+    local token = {}
+    ROOT_OWNER.token = token
+    ROOT_OWNER.at = clock()
+    return token
+end
+function holdsRoot(token) return token ~= nil and ROOT_OWNER.token == token end
+function refreshRoot(token) if ROOT_OWNER.token == token then ROOT_OWNER.at = clock() end end
+function releaseRoot(token) if ROOT_OWNER.token == token then ROOT_OWNER.token = nil end end
+function rootTweenOwned()
+    return ROOT_OWNER.token ~= nil and clock() - ROOT_OWNER.at < ROOT_OWNER_TTL
 end
 
 -- Drawing helpers: every object is created, updated and removed defensively.
@@ -433,6 +517,7 @@ S = {
     selectedBoatSeat = nil,
     selectedBoatSeatLabel = nil,
     remoteMode      = true,
+    attackRate      = 10,  -- remote M1 swings/s (slider attack_rate; BasicM1.minInterval = 1/attackRate)
     weaponSlot      = 1,
     selectedBoss    = "The Gorilla King",
     autoBossFarm    = false,
@@ -613,7 +698,16 @@ local function rootSpeed()
     end)
     return okSpeed and tonumber(speed) or 0
 end
+-- Deferrable invokes (speed restore, Oct 15 2026): a caller that can retry
+-- later (Auto Stat) sets S.quietDefer = "travel" or "any" right before its
+-- call. When travel (or travel/combat for "any") starts during the lead-in,
+-- the invoke is not sent: the window is released at once (within 0.05 s) and
+-- the call returns false, QUIET_POSTPONED. The caller retries at its next
+-- calm moment. StartQuest/AbandonQuest never set it.
+QUIET_POSTPONED = "postponed: travel or combat started"
 function quietInvoke(tag, remote, ...)
+    local defer = S.quietDefer
+    S.quietDefer = nil
     if not remote then return false, nil end
     local count = select("#", ...)
     local args = { ... }
@@ -626,9 +720,20 @@ function quietInvoke(tag, remote, ...)
     local okCall, ok, result = true, false, nil
     if quiet then
         S.remoteQuiet = true
-        task.wait(AFQ_REMOTE_QUIET_BEFORE)
-        local settleUntil = clock() + 0.5
-        while rootSpeed() > 1 and clock() < settleUntil do task.wait(0.05) end
+        local startedAt = clock()
+        local leadEnd = startedAt + AFQ_REMOTE_QUIET_BEFORE
+        local settleUntil = leadEnd + 0.5
+        -- Lead-in: AFQ_REMOTE_QUIET_BEFORE s, then up to 0.5 s more while the
+        -- root still moves (same as before, polled every 0.05 s).
+        while clock() < settleUntil do
+            if defer and activitySince(startedAt, defer) then
+                S.remoteQuiet = false
+                S.remoteInvokeBusy = false
+                return false, QUIET_POSTPONED
+            end
+            if clock() >= leadEnd and rootSpeed() <= 1 then break end
+            task.wait(0.05)
+        end
     end
     okCall, ok, result = pcall(safeRemote, tag, remote, "InvokeServer", table.unpack(args, 1, count))
     if quiet then task.wait(AFQ_REMOTE_QUIET_AFTER) end
@@ -661,7 +766,7 @@ AFL = {
     autoV3           = false,
     autoV4           = true,
     enableGetQuest   = true,
-    useRemoteQuest   = true,   -- accept quests with CommF_ "StartQuest" (toggle afl_remote_quest); clicks are the fallback
+    useRemoteQuest   = false,  -- accept quests with CommF_ "StartQuest" (toggle afl_remote_quest, OFF by default since Oct 15 2026: the remote was found to crash the client on Matcha Hybrid); off = dialogue clicks
     usePortalTeleport = true,
     activeTweens     = {},
     lastTween        = clock(),
@@ -2183,6 +2288,20 @@ mainTab:AddToggle("remote_mode", {
     end
 })
 
+-- Speed restore (Oct 15 2026): remote M1 rate, 10 swings/s by default (the
+-- stability pass had capped it at 4). BasicM1 (40_combat) is defined after
+-- this chunk, so the value goes through S: S.onAttackRate is installed by
+-- 40_combat and applies it to BasicM1.minInterval; 40_combat also reads
+-- S.attackRate when it loads.
+mainTab:AddSlider("attack_rate", {
+    Text="Remote M1 swings/s", Description="Remote M1 swing rate (RegisterAttack + RegisterHit per swing), per attack source. Default 10. Safe mode (AFQ_DEBUG.safeMode) halves it.",
+    Min=2, Max=20, Step=1, Default=10, Integer=true, Column=1,
+    Callback=function(v)
+        S.attackRate=math.max(2,math.min(20,math.floor(tonumber(v) or 10)))
+        if type(S.onAttackRate)=="function" then pcall(S.onAttackRate,S.attackRate) end
+    end
+})
+
 mainTab:AddToggle("auto_farm_chest", {
     Text="Auto Farm Chest", Description="Automatically farms chests (load them in first!)",
     Default=false, Column=1,
@@ -2262,8 +2381,8 @@ mainTab:AddToggle("auto_farm_level", {
 })
 
 mainTab:AddToggle("afl_remote_quest", {
-    Text="Remote quest accept", Description="Accepts the level-farm quest with the game's StartQuest remote after teleporting to the giver (Matcha Pro / Hybrid). Off, or when the remote fails: clicks the dialogue as before.",
-    Default=true, Column=1,
+    Text="Remote quest accept", Description="Accept quests with the StartQuest remote. OFF by default: on Matcha Hybrid this remote was found to crash the client (Oct 15 2026). Needs Roblox focused when off.",
+    Default=false, Column=1,
     Callback=function(v)
         AFL.useRemoteQuest=v
         -- Give a manual re-enable a fresh chance before the click fallback trips again.
@@ -2323,7 +2442,12 @@ AFQ_STATUS_LABEL=nil   -- set when the UI builds the status line below
 -- remoteAcceptOff (false in normal use): true sends no StartQuest and no
 -- AbandonQuest at all: Auto Farm Quest accepts at the giver through the
 -- dialogue (needs Roblox in front), Level Farm clicks its dialogue. A/B test
--- for the user-reported crash on the remote quest pickup (CHANGES.md).
+-- for the user-reported crash on the remote quest pickup (CHANGES.md); the
+-- user's A/B run (Oct 15 2026) confirmed the remote as the crash trigger.
+-- Since then the user-facing switch is the "Remote quest accept" toggle
+-- (afl_remote_quest, AFL.useRemoteQuest), OFF by default, which does the
+-- same; remoteAcceptOff stays as a hard override that wins even when the
+-- toggle is on (afq_remoteQuestOff in 60_afq).
 AFQ_DEBUG={noAccept=false,noFight=false,noHead=false,noLock=false,noClick=false,forceLevel=nil,forceBossAlive=nil,phase="idle",safeMode=false,
     quietAccept=true,remoteAcceptOff=false}
 WRITE_BUDGET.debug=AFQ_DEBUG -- writeInterval() (00_core) reads safeMode through this link
@@ -3191,8 +3315,11 @@ function boatTweenTo(targetPos)
     local t0=clock()
     local arrived=false
     while active() do
+        -- Marked before the pause too, so a deferrable invoke (Auto Stat)
+        -- that started its lead-in releases the quiet window at once.
+        markTravel() -- a background CommF_ invoke waits until the flight is over
         -- CommF_ quiet window: no write; the flight resumes where it stopped.
-        while writesPaused() and active() do local pausedAt=clock(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
+        while writesPaused() and active() do local pausedAt=clock(); markTravel(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
         local alpha=math.min((clock()-t0)/duration,1)
         local okMove=pcall(function()
             primary.Position=Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha)
@@ -3614,17 +3741,39 @@ function buildBerryEspLabels(force)
     end)
 end
 
-TWEEN_STEP_TIME=1/60 -- was 0.01 (~100 CFrame writes/s through the bridge); safe mode doubles it
+TWEEN_STEP_TIME=FRAME_TIME -- one CFrame write per frame (was 0.01 before the stability pass); safe mode doubles it
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
--- target was reached, false when stopped (checkFn false, part gone, unload).
+-- target was reached, false when stopped (checkFn false, part gone, unload,
+-- or another tween took the root).
+--
+-- Speed restore + smooth flight (Oct 15 2026). Live symptoms after the
+-- stability pass: "the camera bugs out and teleports quickly" and "tweening
+-- is causing the character to be flung". Rules now:
+--   * exactly one write per frame: CFrame, then Velocity and
+--     AssemblyLinearVelocity = 0 (placeRoot, every written frame, no
+--     "only when non-zero" or 0.05-stud skip), so physics cannot build up
+--     speed between writes and launch the character;
+--   * the position is interpolated from a fixed base point and the clock()
+--     time since the base (never from the last written position), so a
+--     late frame catches up on the straight line and the real speed is
+--     `speed` studs/s at any frame rate;
+--   * the rotation is captured once (lockedRotation: shared with
+--     afq_holdAt and the hard lock while they keep running) and held for
+--     the whole flight, so the camera does not turn;
+--   * after a pause (CommF_ quiet window) the interpolation is re-based from
+--     the root's current position and the current time: no jump on resume;
+--   * the tween owns the root (claimRoot token): afq_holdAt, the hard lock,
+--     Freeze Position and the void/sky pulls do not write the root while it
+--     is in flight; a newer tween takes the root over and this one stops;
+--   * on arrival the final CFrame is written with zero velocity for three
+--     consecutive frames (the callers then restore CanCollide).
+-- The local character's root is re-fetched every step and compared by key:
+-- after a death or respawn the old root (possibly freed) is never touched.
 function tweenTo(hrp, targetPos, speed, checkFn)
     if not hrp or not targetPos then return false end
     local okStart,startPos=pcall(function() return hrp.Position end)
     if not okStart or not startPos then return false end
-    local rotationCF=rootRotation(hrp)
-    -- The local character's root is re-fetched every step and compared by key:
-    -- after a death or respawn the old root (possibly freed) is never touched.
     local rootKey=instKey(hrp)
     local isLocalRoot=false
     pcall(function()
@@ -3632,6 +3781,7 @@ function tweenTo(hrp, targetPos, speed, checkFn)
         local cur=char and char:FindFirstChild("HumanoidRootPart")
         isLocalRoot=cur~=nil and instKey(cur)==rootKey
     end)
+    local rotationCF=isLocalRoot and lockedRotation(hrp) or rootRotation(hrp)
     local function currentPart()
         if not isLocalRoot then
             local okParent,parent=pcall(function() return hrp.Parent end)
@@ -3656,39 +3806,78 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local dx=targetPos.X-startPos.X; local dy=targetPos.Y-startPos.Y; local dz=targetPos.Z-startPos.Z
     local distance=math.sqrt(dx*dx+dy*dy+dz*dz)
     if distance<=1 then
-        return moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rotationCF)
+        return placeRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rotationCF)
     end
     local moveSpeed=tonumber(speed) or 320
     if moveSpeed<=0 then moveSpeed=320 end
-    local duration=distance/moveSpeed; local startTime=clock()
-    -- Write-rate cap: never two CFrame writes closer than 90% of the step,
-    -- even if task.wait resumes early (a bare task.wait() resumes ~2,400
-    -- times a second in Matcha), however long the flight is.
+    local token=isLocalRoot and claimRoot() or nil
+    local function finish(result)
+        if token then releaseRoot(token) end
+        return result
+    end
+    local function ownsRoot()
+        if not token then return true end
+        if not holdsRoot(token) then return false end
+        refreshRoot(token)
+        return true
+    end
+    -- Interpolation base: a fixed point and the time the flight left it.
+    local baseX,baseY,baseZ=startPos.X,startPos.Y,startPos.Z
+    local duration=distance/moveSpeed
+    local baseTime=clock()
+    local function rebase()
+        local part=currentPart()
+        local okPos,pos=pcall(function() return part and part.Position end)
+        if okPos and pos and pos.X then baseX,baseY,baseZ=pos.X,pos.Y,pos.Z end
+        dx=targetPos.X-baseX; dy=targetPos.Y-baseY; dz=targetPos.Z-baseZ
+        duration=math.max(math.sqrt(dx*dx+dy*dy+dz*dz)/moveSpeed,FRAME_TIME)
+        baseTime=clock()
+    end
     local lastWrite=-1e9
     while keepGoing() do
+        if not ownsRoot() then return false end -- a newer tween owns the root
+        markTravel() -- a background CommF_ invoke (Auto Stat) waits until the flight is over
         local step=writeInterval(TWEEN_STEP_TIME)
-        local since=clock()-lastWrite
+        local now=clock()
         if writesPaused() then
-            -- CommF_ quiet window (quietInvoke): no write; the flight resumes
-            -- where it stopped (startTime moves by the pause).
-            local pausedAt=clock()
-            task.wait(0.05)
-            startTime=startTime+(clock()-pausedAt)
-        elseif since<step*0.9 then
-            task.wait(step-since)
+            -- CommF_ quiet window (quietInvoke): no write. Resume from where
+            -- the root is when the window closes (no jump back onto the line).
+            repeat
+                if not ownsRoot() then return false end
+                markTravel()
+                task.wait(0.05)
+            until not writesPaused() or not keepGoing()
+            rebase()
+        elseif now-lastWrite<step-0.004 then
+            -- Write floor: one write per frame (4 ms jitter slack), even when
+            -- task.wait resumes early.
+            task.wait(step-(now-lastWrite))
         else
             local part=currentPart()
-            if not part then return false end
-            local alpha=math.min((clock()-startTime)/duration,1)
-            if not moveRoot(part,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,rotationCF) then
-                return false
+            if not part then return finish(false) end
+            local alpha=math.min((now-baseTime)/duration,1)
+            if placeRoot(part,baseX+dx*alpha,baseY+dy*alpha,baseZ+dz*alpha,rotationCF) then
+                lastWrite=now
+                if alpha>=1 then
+                    -- Arrival: final CFrame with zero velocity for three
+                    -- consecutive frames (this one plus two), then hand over.
+                    for _=1,2 do
+                        task.wait(step)
+                        local last=currentPart()
+                        if not last or not ownsRoot() then break end
+                        placeRoot(last,targetPos.X,targetPos.Y,targetPos.Z,rotationCF)
+                    end
+                    return finish(true)
+                end
+                task.wait(step)
+            elseif not writesPaused() then
+                return finish(false) -- the root left the DataModel
             end
-            lastWrite=clock()
-            if alpha>=1 then return true end
-            task.wait(step)
+            -- else: a quiet window began between the check and the write;
+            -- the pause branch above handles it on the next pass.
         end
     end
-    return false
+    return finish(false)
 end
 
 espFolderSnapshots={}
@@ -4074,25 +4263,20 @@ end
 HARD_LOCK_LAST = 0
 function hardLockNpcCFrame(hrp,targetPos)
     if not hrp or not targetPos then return end
-    -- 30 Hz cap (was every frame, 60 Hz). 4 ms slack so 60 Hz frame jitter
-    -- does not turn every other frame into every third.
+    markFight()
+    -- ROOT_WRITE_HZ cap: 60 Hz = one write per frame (30 Hz with
+    -- AFQ_DEBUG.safeMode; the stability pass had 30 Hz always, restored on
+    -- Oct 15 2026). 4 ms slack so frame jitter does not skip a frame.
+    -- A tween in flight owns the root (claimRoot in 00_core): no second mover.
+    if rootTweenOwned() then return end
     local now=clock()
     if now-HARD_LOCK_LAST<writeInterval(1/ROOT_WRITE_HZ)-0.004 then return end
     HARD_LOCK_LAST=now
-    if not moveRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,rootRotation(hrp)) then return end
-
-    pcall(function()
-        local velocity=hrp.Velocity
-        if velocity and velocity.X and velocity.Z and math.abs(velocity.Y)>0.01 then
-            hrp.Velocity=Vector3.new(velocity.X,0,velocity.Z)
-        end
-    end)
-    pcall(function()
-        local assemblyVelocity=hrp.AssemblyLinearVelocity
-        if assemblyVelocity and assemblyVelocity.X and assemblyVelocity.Z and math.abs(assemblyVelocity.Y)>0.01 then
-            hrp.AssemblyLinearVelocity=Vector3.new(assemblyVelocity.X,0,assemblyVelocity.Z)
-        end
-    end)
+    -- Smooth/fling-free (Oct 15 2026): CFrame with the held rotation
+    -- (lockedRotation, not re-read every frame, so the camera does not turn)
+    -- and the whole velocity zeroed on every written frame (placeRoot). It
+    -- used to zero only a non-zero vertical component and keep X/Z.
+    placeRoot(hrp,targetPos.X,targetPos.Y,targetPos.Z,lockedRotation(hrp))
 end
 
 function getNormalFarmOffsets()
@@ -4305,7 +4489,11 @@ BasicM1 = {
     comboReset   = 0.75,  -- client resets the combo after 0.75 s without a swing
     maxExtra     = 9,     -- extra rigs per swing (client cap: 10 rigs total, Buddha only)
     maxDist      = REMOTE_MAX_DIST,
-    minInterval  = 0.25,  -- per caller tag (was 0.045: ~20 swings = 40 FireServer/s); the client's own M1 is ~3-4/s
+    -- per caller tag. 0.1 s = 10 swings/s (slider attack_rate, 2-20/s; synced
+    -- from S.attackRate below). History: 0.045 (~20 swings = 40 FireServer/s)
+    -- -> 0.25 in the stability pass (4/s, too slow at killing) -> 0.1 on Oct 15
+    -- 2026 once the crash trigger was found to be the remote quest pickup.
+    minInterval  = 0.1,
     noDamageSecs = 2.0,   -- watchdog: advance profile after this long with no HP loss
     requireTool  = true,  -- the server-side M1 needs an equipped weapon
     hitParts     = { "Head", "UpperTorso", "LowerTorso", "LeftLowerLeg", "RightLowerLeg",
@@ -4329,6 +4517,16 @@ BasicM1 = {
     watchHp      = 0,
     watchSince   = 0,
 }
+
+-- Remote M1 rate from the slider (20_ui2 attack_rate -> S.attackRate). The
+-- slider can fire before this chunk loads (UE config), so read the value now
+-- and install the hook the slider calls from here on.
+function BasicM1.setRate(rate)
+    rate = math.max(2, math.min(20, math.floor(tonumber(rate) or 10)))
+    BasicM1.minInterval = 1 / rate
+end
+BasicM1.setRate(S.attackRate)
+S.onAttackRate = BasicM1.setRate
 
 -- Client: tostring(UserId):sub(2,4) .. tostring(coroutine.running()):sub(11,15)
 -- (3 digits of the UserId + 5 hex digits). The script's hard-coded
@@ -4436,6 +4634,7 @@ function BasicM1.fire(tagPrefix, primaryPart, extras)
     -- pending: the remotes are serialised (see quietInvoke in 00_core).
     if remoteInvokePending() then return false end
     if not BasicM1.ready(tagPrefix) then return false end
+    markFight()
     local now = clock()
     BasicM1.lastFireBy[tagPrefix] = now
     local prof = BasicM1.profiles[BasicM1.profile] or BasicM1.profiles[1]
@@ -5174,7 +5373,7 @@ task.spawn(function()
             if hrp then
 
                 local useRemote=S.remoteMode
-                farmAttack(
+                local fought=farmAttack(
                     hrp,
                     function()
                         return S.autoFarmNearest and S.remoteMode==useRemote and not farmPriorityBlocked()
@@ -5185,8 +5384,12 @@ task.spawn(function()
                     useRemote and remoteAttack or nil,
                     useRemote and 0.05 or 0.06
                 )
+                -- Speed restore: next target one frame after a fight (0.1 s
+                -- only when nothing was in range).
+                if fought then frameWait() else task.wait(0.1) end
+            else
+                task.wait(0.1)
             end
-            task.wait(0.1)
         else task.wait(0.1) end
     end
 end)
@@ -5213,10 +5416,11 @@ task.spawn(function()
                     -- Remote and click mode share farmAttack (the remote branch was a
                     -- hand-copied duplicate of it).
                     local useRemote=S.remoteMode
-                    farmAttack(hrp2, function()
+                    local fought=farmAttack(hrp2, function()
                         return S.autoNpcFarm and S.remoteMode==useRemote and not farmPriorityBlocked()
                     end, nil, true, 1000, useRemote and remoteAttack or nil, useRemote and 0.05 or 0.06)
-                    task.wait(0.1)
+                    -- Speed restore: next target one frame after a fight.
+                    if fought then frameWait() else task.wait(0.1) end
                 end
             end
             end)
@@ -5687,8 +5891,22 @@ function afl_questRemoteWait(giverKey,questIndex)
     if not last then return 0 end
     return math.max(0,AFQ_REMOTE_MIN_INTERVAL-(clock()-last))
 end
+-- Remote quest accept default (Oct 15 2026). The user's A/B run confirmed
+-- the CommF_ StartQuest/AbandonQuest invoke as the crash trigger under
+-- Matcha Hybrid (AFQ_DEBUG.remoteAcceptOff = true stopped the crashes), so
+-- the "Remote quest accept" toggle (afl_remote_quest -> AFL.useRemoteQuest)
+-- is OFF by default. Off = no StartQuest and no AbandonQuest from this
+-- script at all: Auto Farm Quest accepts through the giver dialogue
+-- (afq_acceptByDialogue) and switches quests by accepting the new one there
+-- (the game keeps one active quest; a dialogue accept replaces it), Level
+-- Farm clicks its dialogue. AFQ_DEBUG.remoteAcceptOff = true forces the same
+-- even with the toggle on.
+function afq_remoteQuestOff()
+    if AFQ_DEBUG and AFQ_DEBUG.remoteAcceptOff==true then return true end
+    return AFL.useRemoteQuest~=true
+end
 function afl_startQuestRemote(giverKey,questIndex)
-    if AFQ_DEBUG and AFQ_DEBUG.remoteAcceptOff then return false,"remote accept disabled (AFQ_DEBUG.remoteAcceptOff)" end
+    if afq_remoteQuestOff() then return false,"remote quest accept is off (toggle Remote quest accept / AFQ_DEBUG.remoteAcceptOff)" end
     if remoteFailing("StartQuest") then return false,"StartQuest remote keeps failing" end
     local left=afl_questRemoteWait(giverKey,questIndex)
     if left>0 then return false,"StartQuest for this quest was sent less than "..AFQ_REMOTE_MIN_INTERVAL.."s ago" end
@@ -5849,7 +6067,13 @@ function afl_farmNpcs()
         end
         if not AFL.selectedNpc or not partStillThere(AFL.selectedNpc) then
             local attempts=0
-            repeat AFL.selectedNpc=afl_getNextNpc(); attempts=attempts+1; wait(0.05) until AFL.selectedNpc or attempts>15
+            -- Speed restore: the 0.05 s wait only while nothing is found (it
+            -- also ran after a successful pick, delaying every next target).
+            repeat
+                AFL.selectedNpc=afl_getNextNpc(); attempts=attempts+1
+                if AFL.selectedNpc then break end
+                wait(0.05)
+            until attempts>15
             if not AFL.selectedNpc then
                 if AFL.waitPositions[AFL.npcToFarm] then afl_teleportToWait(AFL.npcToFarm) end
                 wait(0.5); continue
@@ -6150,6 +6374,7 @@ function afq_usePad(padCenter,wantInside,checkFn)
         -- legs inside the pad (root 1 stud above it) and just above it, which
         -- makes a fresh contact each time. Re-placed every 0.8 s so a teleport
         -- in flight is not undone.
+        markTravel() -- no background CommF_ invoke while on a pad
         if clock()>=nextPlace then
             local y=sink and padCenter.Y+1 or padCenter.Y+4
             moveRoot(root,padCenter.X,y,padCenter.Z,rootRotation(root))
@@ -6534,8 +6759,10 @@ end
 function afq_abandon()
     if AFQ_DEBUG.noAccept then afq_clearHeld(); return true end
     if not afq_trackerFrame() then afq_clearHeld(); return true end
-    if AFQ_DEBUG.remoteAcceptOff then
-        return false,"AbandonQuest is off with AFQ_DEBUG.remoteAcceptOff (finish or abandon the quest by hand)"
+    if afq_remoteQuestOff() then
+        -- Never reached from afq_step while the remote is off (the dialogue
+        -- accept replaces the held quest); kept as a guard.
+        return false,"AbandonQuest is not sent while remote quest accept is off"
     end
     local since=clock()-(AFQ.lastAbandonAt or -1e9)
     if since<AFQ_REMOTE_MIN_INTERVAL then
@@ -6591,9 +6818,16 @@ function afq_acceptWait(q)
     return math.max(0,cooldown,afl_questRemoteWait(q.giverKey,q.questIndex))
 end
 
--- No-remote accept for the A/B test (AFQ_DEBUG.remoteAcceptOff): the Level
--- Farm dialogue clicks at the giver (questButton = questIndex for every
--- quest, checked against the Quests module). Needs Roblox in front.
+-- No-remote accept, the normal path since Oct 15 2026 (Remote quest accept
+-- off by default; also AFQ_DEBUG.remoteAcceptOff): the Level Farm dialogue
+-- clicks at the giver (questButton = questIndex for every quest, checked
+-- against the Quests module). Needs Roblox in front. The dialogue's accept
+-- option is the game's own client call (DialoguesList.Util.generateQuest ->
+-- CommF_ StartQuest from the game's LocalScript, not through Matcha's
+-- InvokeServer bridge). A quest that is still active is replaced by the new
+-- accept (one active quest; the wiki says a new accept overrides it, and
+-- the old Level Farm click flow in afl_setQuest relied on that); afq_step
+-- verifies it through the tracker showing the new quest.
 function afq_acceptByDialogue(q)
     if not robloxFocused() then return false,"the dialogue accept needs the Roblox window in front" end
     wait(0.5)
@@ -6653,13 +6887,15 @@ end
 -- every frame, so a wait spot in the air is held instead of free-falling
 -- (seen live: wait spot over open air -> fell to the sea, tweened back up,
 -- every ~3.3 s). Only while afq_farming(); always yields at least one frame.
+-- Oct 15 2026: 60 Hz (ROOT_WRITE_HZ; 30 Hz in safe mode), one placeRoot per
+-- frame (CFrame with the held rotation + zero velocity, no skip), and no
+-- write while a tween owns the root.
 function afq_holdAt(position,seconds)
     local deadline=clock()+(seconds or 0)
     repeat
         local _,root=afl_getCharacter()
-        if root and position and afq_farming() then
-            moveRoot(root,position.X,position.Y,position.Z,rootRotation(root))
-            zeroVelocity(root)
+        if root and position and afq_farming() and not rootTweenOwned() then
+            placeRoot(root,position.X,position.Y,position.Z,lockedRotation(root))
         end
         task.wait(writeInterval(1/ROOT_WRITE_HZ))
     until clock()>=deadline or not afq_farming()
@@ -6861,6 +7097,16 @@ function afq_step()
                 AFQ.status="Lv "..level..": quest switch cooldown ("..math.ceil(left).."s)"
                 afq_updateLabel(); wait(0.5); return
             end
+        elseif afq_remoteQuestOff() then
+            -- Remote quest accept off (the default): no AbandonQuest. The
+            -- dialogue accept at the new giver replaces the held quest; the
+            -- held quest stays in AFQ.current until the tracker shows the new
+            -- one (markAccepted), so a failed dialogue keeps it on record.
+            AFQ_DEBUG.phase="switch"
+            afq_logSwitch("Lv "..level..": switching "..held.giverKey.." #"..held.questIndex
+                .." -> "..q.giverKey.." #"..q.questIndex.." (the dialogue accept replaces the old quest)")
+            AFQ.lastSwitch=clock()
+            AFQ.entry=nil
         else
             AFQ_DEBUG.phase="switch"
             afq_logSwitch("Lv "..level..": switching "..held.giverKey.." #"..held.questIndex
@@ -6945,6 +7191,9 @@ function afq_step()
                 AFQ.entry=nil
                 return false
             end
+            -- Dialogue path (remote off): the accept replaces whatever quest
+            -- is active, so there is nothing to abandon first.
+            if afq_remoteQuestOff() then return true end
             if afq_trackerQuestIs(q)=="other" or (AFQ.current and not afq_sameQuest(AFQ.current,q)) then
                 AFQ_DEBUG.phase="abandon"
                 afq_logSwitch("Lv "..tostring(freshLevel or level)..": another quest is active, abandoning it before "
@@ -6987,10 +7236,10 @@ function afq_step()
         -- tracker showing q (afq_waitTrackerFor) is the proof of acceptance.
         -- No proof within AFQ_REMOTE_ACCEPT_WAIT: fall back once to the giver
         -- trip below.
-        -- AFQ_DEBUG.remoteAcceptOff (A/B test of the reported crash trigger):
-        -- no StartQuest from where the character stands; accept at the giver
-        -- through the dialogue instead.
-        local viaGiver=not AFL.useRemoteQuest or AFQ_DEBUG.remoteAcceptOff==true
+        -- Remote quest accept off (the default since Oct 15 2026, or
+        -- AFQ_DEBUG.remoteAcceptOff): no StartQuest at all; accept at the
+        -- giver through the dialogue instead.
+        local viaGiver=afq_remoteQuestOff()
         local fallback=false
         if not viaGiver then
             setStatus(" accepting (remote)")
@@ -7023,12 +7272,21 @@ function afq_step()
             end
         end
         if viaGiver then
-            -- Remote accept off (unchanged), or the fallback above: travel to
-            -- the giver and accept there.
-            if not fallback then setStatus(" accepting") end
+            -- Remote accept off (the default: dialogue accept), or the remote
+            -- fallback above: travel to the giver and accept there.
+            local dialogue=afq_remoteQuestOff()
+            if not fallback then setStatus(dialogue and " accepting (dialogue)" or " accepting") end
+            -- The dialogue clicks need Roblox in front: do not fly to the giver
+            -- for a click that cannot be sent; look again in a second.
+            if dialogue and not AFQ_DEBUG.noAccept and not robloxFocused() then
+                setStatus(" accept waiting: focus the Roblox window (dialogue accept)")
+                warnThrottled("questDialogueFocus","[laced.club] Auto Farm Quest: Remote quest accept is off, so the quest is "
+                    .."accepted through the giver dialogue, which needs the Roblox window in front",30)
+                afq_sleep(1); return
+            end
             -- No travel while the remote is known to be failing: wait for the
             -- next probe (one call per backoff period, see below) instead.
-            if not AFQ_DEBUG.remoteAcceptOff and not AFQ_DEBUG.noAccept and remoteFailing("StartQuest") then
+            if not dialogue and not AFQ_DEBUG.noAccept and remoteFailing("StartQuest") then
                 AFQ.acceptFails=(AFQ.acceptFails or 0)+1
                 local backoff=afq_backoff(AFQ.acceptFails)
                 setStatus(" accept failed: StartQuest remote keeps failing (retry in "..math.ceil(backoff).."s)")
@@ -7045,7 +7303,9 @@ function afq_step()
             if adoptIfShown() then return end
             -- Wait out the rate limit / switch cooldown at the giver (holding)
             -- rather than failing the fallback right after the remote try.
-            local gate=afq_acceptWait(q)
+            -- The dialogue sends no remote from this script: no gate (the
+            -- switch cooldown still applies to the switch decision itself).
+            local gate=dialogue and 0 or afq_acceptWait(q)
             if gate>0 then
                 setStatus(" accepting at the giver in "..math.ceil(gate).."s")
                 if atGiver then afq_holdAt(giverPos,gate) else afq_sleep(gate) end
@@ -7055,8 +7315,9 @@ function afq_step()
             AFQ_DEBUG.phase=fallback and "accept-fallback" or "accept"
             local beforeKey=afq_trackerKey()
             local ok,reason=true,nil
-            if AFQ_DEBUG.remoteAcceptOff then ok,reason=afq_acceptByDialogue(q)
-            elseif not AFQ_DEBUG.noAccept then ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
+            if AFQ_DEBUG.noAccept then -- isolation run: no accept at all
+            elseif dialogue then ok,reason=afq_acceptByDialogue(q)
+            else ok,reason=afl_startQuestRemote(q.giverKey,q.questIndex) end
             -- The boolean result is not proof: the tracker has to show q (the
             -- giver path used to mark the quest accepted without any check).
             local shown=AFQ_DEBUG.noAccept or (ok and afq_waitTrackerFor(q,AFQ_REMOTE_ACCEPT_WAIT,beforeKey))
@@ -7065,7 +7326,8 @@ function afq_step()
                 AFQ.accepted=false
                 AFQ.acceptFails=(AFQ.acceptFails or 0)+1
                 local backoff=afq_backoff(AFQ.acceptFails)
-                local why=ok and ("the tracker did not show "..q.enemy) or tostring(reason)
+                local why=ok and ("the tracker did not show "..q.enemy
+                    ..((dialogue and AFQ.current and not afq_sameQuest(AFQ.current,q)) and " (the old quest may still be active)" or "")) or tostring(reason)
                 setStatus(" accept failed: "..why.." (retry in "..math.ceil(backoff).."s)")
                 warnThrottled("questFarm","[laced.club] Auto Farm Quest: accept of "..q.giverKey.." #"..q.questIndex
                     .." failed ("..why.."); retry in "..math.ceil(backoff).."s",30)
@@ -7100,10 +7362,13 @@ function afq_step()
         local _,scanRoot=afl_getCharacter()
         local okScan,scanPos=pcall(function() return scanRoot and scanRoot.Position end)
         if not okScan or not scanPos or not scanPos.X then scanPos=nil end
+        -- Speed restore: the 0.05 s hold only while nothing is found (it
+        -- also ran after a successful pick, delaying every next target).
         repeat
             AFQ.selectedNpc=afq_nearestEnemy(q); attempts=attempts+1
+            if AFQ.selectedNpc then break end
             if scanPos then afq_holdAt(scanPos,0.05) else wait(0.05) end
-        until AFQ.selectedNpc or attempts>15 or not afq_farming()
+        until attempts>15 or not afq_farming()
         if not AFQ.selectedNpc then
             setStatus(" waiting for spawn")
             local arrived,spot=false,nil
@@ -7120,7 +7385,9 @@ function afq_step()
             else
                 arrived,spot=afq_goToWait(q)
             end
-            if arrived and spot then afq_holdAt(spot,0.5) else wait(0.5) end
+            -- 0.25 s (was 0.5): the next step scans again, so a spawn is seen
+            -- at 4 Hz or better while waiting.
+            if arrived and spot then afq_holdAt(spot,0.25) else wait(0.25) end
             return
         end
     end
@@ -7156,7 +7423,10 @@ task.spawn(function()
         elseif AFQ.activeHead then
             pcall(AFQ.activeHead.restore); AFQ.activeHead=nil
         end
-        wait(0.3)
+        -- Speed restore: one frame between steps while the farm runs (the
+        -- next target is picked right after a kill; every step path yields
+        -- by itself), IDLE_POLL (0.25 s) only while it is off. Was 0.3 s.
+        idleWait(S.autoFarmQuest==true and not farmPriorityFeatureActive())
     end
 end)
 
@@ -7336,7 +7606,8 @@ task.spawn(function()
                     local okPos,pos=pcall(function() return hrp.Position end)
                     if okPos and pos then S.freezePosition=pos end
                 end
-                if S.freezePosition then
+                -- No second mover while a tween owns the root (Oct 15 2026).
+                if S.freezePosition and not rootTweenOwned() then
                     setPartPosition(hrp,S.freezePosition)
                     zeroVelocity(hrp)
                 end
@@ -7686,7 +7957,7 @@ task.spawn(function()
             local hrp=char and char:FindFirstChild("HumanoidRootPart")
             if hrp then
                 local useRemote=S.remoteMode
-                farmAttack(
+                local fought=farmAttack(
                     hrp,
                     function()
                         return S.autoRaid and S.raidDetected and not S.raidTweenActive and not farmPriorityBlocked() and S.remoteMode==useRemote
@@ -7697,15 +7968,18 @@ task.spawn(function()
                     useRemote and remoteAttack or nil,
                     useRemote and 0.05 or 0.06
                 )
+                -- Speed restore: next target one frame after a fight.
+                if fought then frameWait() else task.wait(0.1) end
+            else
+                task.wait(0.1)
             end
-            task.wait(0.1)
         else task.wait(0.1) end
     end
 end)
 
 task.spawn(function()
     while alive() do
-        if S.voidPull and not writesPaused() then
+        if S.voidPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,100000,hrp.Position.Z) end)
@@ -7718,7 +7992,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.skyPull and not writesPaused() then
+        if S.skyPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,1000,hrp.Position.Z) end)
@@ -8444,16 +8718,34 @@ function masteryTweenTo(hrp,targetPos,lookVector,checkFn)
     local duration=math.max(distance/speed,0.01)
     local startTime=clock()
     local facingCF=facingCFrame(masteryLookVector)
+    -- Oct 15 2026: owns the root while in flight (claimRoot), zero velocity
+    -- on every written frame (placeRoot), re-based after a quiet-window pause
+    -- (no jump on resume), constant facing for the whole flight.
+    local token=claimRoot()
     while alive() do
+        if not holdsRoot(token) then return end -- another tween took the root
+        refreshRoot(token)
+        markTravel()
         if checkFn then
             local okCheck,keepGoing=pcall(checkFn)
-            if not okCheck or not keepGoing then return end
+            if not okCheck or not keepGoing then releaseRoot(token); return end
         end
-        local alpha=distance<0.1 and 1 or math.min((clock()-startTime)/duration,1)
-        local okMove=moveRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,facingCF)
-        if not okMove or alpha>=1 then return end
-        frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based
+        if writesPaused() then
+            task.wait(0.05)
+            local okNow,now=pcall(function() return hrp.Position end)
+            if okNow and now and now.X then startPos=now end
+            dx=targetPos.X-startPos.X; dy=targetPos.Y-startPos.Y; dz=targetPos.Z-startPos.Z
+            distance=math.sqrt(dx*dx+dy*dy+dz*dz)
+            duration=math.max(distance/speed,0.01)
+            startTime=clock()
+        else
+            local alpha=distance<0.1 and 1 or math.min((clock()-startTime)/duration,1)
+            local okMove=placeRoot(hrp,startPos.X+dx*alpha,startPos.Y+dy*alpha,startPos.Z+dz*alpha,facingCF)
+            if (not okMove and not writesPaused()) or alpha>=1 then releaseRoot(token); return end
+            frameWait() -- was task.wait(0.01), ~100 writes/s; alpha is time-based
+        end
     end
+    releaseRoot(token)
 end
 
 function masteryGetTargets(hrp)
@@ -8981,7 +9273,8 @@ function invokeEnhancedComm(first,second,third,fourth)
     elseif first~=nil then ok,result=quietInvoke("CommF_",remote,first)
     else ok,result=quietInvoke("CommF_",remote) end
     if not ok then
-        enhancedComm=nil
+        -- A postponed (deferrable) invoke was never sent: keep the remote.
+        if result~=QUIET_POSTPONED then enhancedComm=nil end
         return false,nil,tostring(result)
     end
     return true,result,nil
@@ -9285,7 +9578,7 @@ task.spawn(function()
                 end,target,true,5000,useRemote and remoteAttack or nil,useRemote and 0.05 or 0.06)
                 frameWait()
             else
-                task.wait(0.35)
+                task.wait(0.25) -- re-scan at 4 Hz while no target is up (was 0.35 s)
             end
         else
             task.wait(0.1)
@@ -9314,7 +9607,7 @@ task.spawn(function()
                         return S.autoMaterialFarm and not S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedMaterial==material
                     end)
                 end
-                task.wait(0.35)
+                task.wait(0.25) -- re-scan at 4 Hz while no target is up (was 0.35 s)
             else
                 task.wait(0.35)
             end
@@ -9344,10 +9637,36 @@ end)
 --   * the cap switches a toggle off only against the confirmed (live) level;
 --   * one spend per pass, and the pass is pcall'd with a back-off on error.
 AUTO_STAT_CONFIRM_SECS=15
+-- Speed restore (Oct 15 2026): every AddPoint goes through quietInvoke, whose
+-- quiet window (~0.6-1.1 s without root writes or M1 swings) used to land in
+-- the middle of fights and flights. Spends are now queued (points stay
+-- unspent) and sent only at a calm moment: no travel mark (tweenTo, mastery
+-- and boat tweens, pads) for AUTO_STAT_CALM_SECS and no combat mark (hard
+-- lock, remote M1 swing, farm click) for AUTO_STAT_CALM_SECS. That is: farms
+-- off, waiting for a spawn at a wait spot, or at a quest giver. During a
+-- farm with no calm moment, at most one spend per AUTO_STAT_BUSY_INTERVAL s,
+-- and only while not travelling (never mid-flight). The invoke is
+-- deferrable (S.quietDefer): if travel (or, for a calm spend, combat) starts
+-- during the quiet window's lead-in, the AddPoint is not sent and is retried
+-- at the next calm moment.
+AUTO_STAT_CALM_SECS=1.5
+AUTO_STAT_BUSY_INTERVAL=60
 task.spawn(function()
     -- {toggle state key, AddPoint / Data.Stats name, cap state key, toggle id, label}
     local statEntries={{"autoStatMelee","Melee","statCapMelee","stat_melee","Melee"},{"autoStatDefense","Defense","statCapDefense","stat_defense","Def"},{"autoStatSword","Sword","statCapSword","stat_sword","Sword"},{"autoStatGun","Gun","statCapGun","stat_gun","Gun"},{"autoStatFruit","Demon Fruit","statCapFruit","stat_fruit","Fruit"}}
     local pending={}   -- name -> {base, lvl, pts, t, entry}: one AddPoint not yet proven by Data
+    local lastSpendAt=-1e9 -- clock() of the last AddPoint sent
+    local queued=false     -- points are waiting for a calm moment (label)
+    -- nil = wait (travel, or combat inside AUTO_STAT_BUSY_INTERVAL); "any" =
+    -- calm spend (postponed by travel or combat); "travel" = the once per
+    -- AUTO_STAT_BUSY_INTERVAL s spend during combat (postponed by travel).
+    local function spendMode()
+        local now=clock()
+        if now-ACTIVITY.travelAt<AUTO_STAT_CALM_SECS then return nil end
+        if now-ACTIVITY.fightAt>=AUTO_STAT_CALM_SECS then return "any" end
+        if now-lastSpendAt>=AUTO_STAT_BUSY_INTERVAL then return "travel" end
+        return nil
+    end
     local floor={}     -- name -> expected level of proven (or unproven, stopped) spends not replicated yet
     local wasOn={}     -- name -> toggle state last pass (a fresh "on" clears the floor)
     local function readValue(parent,name)
@@ -9392,7 +9711,8 @@ task.spawn(function()
             elseif pending[e[2]] then s=s.."(wait)" end
             parts[#parts+1]=s
         end
-        pcall(function() label.Text="Pts "..(pts and tostring(pts) or "?").." | "..table.concat(parts," ") end)
+        local suffix=queued and " (queued: fighting/travelling)" or ""
+        pcall(function() label.Text="Pts "..(pts and tostring(pts) or "?").." | "..table.concat(parts," ")..suffix end)
     end
     local function switchOff(e)
         if not S[e[1]] then return end
@@ -9434,8 +9754,11 @@ task.spawn(function()
             if on and not wasOn[e[2]] then floor[e[2]]=nil end
             wasOn[e[2]]=on
         end
+        if not pts or pts<=0 or remoteFailing("CommF_") or next(pending)~=nil then queued=false; updateLabel(pts); return end
+        local mode=spendMode()
+        queued=mode==nil
         updateLabel(pts)
-        if not pts or pts<=0 or remoteFailing("CommF_") or next(pending)~=nil then return end
+        if not mode then return end -- queued until a calm moment
         for _,e in ipairs(statEntries) do
             if not alive() then return end
             if S[e[1]] then
@@ -9452,7 +9775,15 @@ task.spawn(function()
                     local amount=math.max(1,math.floor(tonumber(S.statAmount) or 10))
                     local n=math.floor(math.min(amount,remaining,pts))
                     if n>0 then
+                        S.quietDefer=mode -- read (and cleared) by quietInvoke
                         local ok,_,err=invokeEnhancedComm("AddPoint",e[2],n)
+                        S.quietDefer=nil
+                        if not ok and err==QUIET_POSTPONED then
+                            -- Travel/combat started in the lead-in: not sent,
+                            -- not a failure; retried at the next calm moment.
+                            return
+                        end
+                        lastSpendAt=clock()
                         if not ok then
                             warnThrottled("autostat:remote","[laced.club] Auto Stat: AddPoint failed: "..tostring(err),20)
                             return

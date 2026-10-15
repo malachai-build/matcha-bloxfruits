@@ -427,7 +427,7 @@ task.spawn(function()
             if hrp then
 
                 local useRemote=S.remoteMode
-                farmAttack(
+                local fought=farmAttack(
                     hrp,
                     function()
                         return S.autoFarmNearest and S.remoteMode==useRemote and not farmPriorityBlocked()
@@ -438,8 +438,12 @@ task.spawn(function()
                     useRemote and remoteAttack or nil,
                     useRemote and 0.05 or 0.06
                 )
+                -- Speed restore: next target one frame after a fight (0.1 s
+                -- only when nothing was in range).
+                if fought then frameWait() else task.wait(0.1) end
+            else
+                task.wait(0.1)
             end
-            task.wait(0.1)
         else task.wait(0.1) end
     end
 end)
@@ -466,10 +470,11 @@ task.spawn(function()
                     -- Remote and click mode share farmAttack (the remote branch was a
                     -- hand-copied duplicate of it).
                     local useRemote=S.remoteMode
-                    farmAttack(hrp2, function()
+                    local fought=farmAttack(hrp2, function()
                         return S.autoNpcFarm and S.remoteMode==useRemote and not farmPriorityBlocked()
                     end, nil, true, 1000, useRemote and remoteAttack or nil, useRemote and 0.05 or 0.06)
-                    task.wait(0.1)
+                    -- Speed restore: next target one frame after a fight.
+                    if fought then frameWait() else task.wait(0.1) end
                 end
             end
             end)

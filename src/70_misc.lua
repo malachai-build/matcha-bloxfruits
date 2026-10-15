@@ -105,7 +105,8 @@ task.spawn(function()
                     local okPos,pos=pcall(function() return hrp.Position end)
                     if okPos and pos then S.freezePosition=pos end
                 end
-                if S.freezePosition then
+                -- No second mover while a tween owns the root (Oct 15 2026).
+                if S.freezePosition and not rootTweenOwned() then
                     setPartPosition(hrp,S.freezePosition)
                     zeroVelocity(hrp)
                 end
@@ -455,7 +456,7 @@ task.spawn(function()
             local hrp=char and char:FindFirstChild("HumanoidRootPart")
             if hrp then
                 local useRemote=S.remoteMode
-                farmAttack(
+                local fought=farmAttack(
                     hrp,
                     function()
                         return S.autoRaid and S.raidDetected and not S.raidTweenActive and not farmPriorityBlocked() and S.remoteMode==useRemote
@@ -466,15 +467,18 @@ task.spawn(function()
                     useRemote and remoteAttack or nil,
                     useRemote and 0.05 or 0.06
                 )
+                -- Speed restore: next target one frame after a fight.
+                if fought then frameWait() else task.wait(0.1) end
+            else
+                task.wait(0.1)
             end
-            task.wait(0.1)
         else task.wait(0.1) end
     end
 end)
 
 task.spawn(function()
     while alive() do
-        if S.voidPull and not writesPaused() then
+        if S.voidPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,100000,hrp.Position.Z) end)
@@ -487,7 +491,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.skyPull and not writesPaused() then
+        if S.skyPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
                 pcall(function() hrp.Position=Vector3.new(hrp.Position.X,1000,hrp.Position.Z) end)
