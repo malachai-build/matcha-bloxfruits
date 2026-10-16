@@ -536,6 +536,10 @@ S = {
     statCapGun      = 0,
     statCapFruit    = 0,
     statStatusLabel = nil,
+    -- Auto Fruit Gacha (80_misc2): one random-fruit roll per 2 h cooldown.
+    autoGachaRoll   = false,
+    gachaRollNow    = false, -- set by the "Roll Now" button, cleared by the loop
+    gachaStatusLabel = nil,
     selectedSeaEvent = "Shark",
     autoSeaEvent    = false,
     mirageEsp       = false,
