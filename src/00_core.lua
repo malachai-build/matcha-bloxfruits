@@ -539,6 +539,8 @@ S = {
     -- Auto Fruit Gacha (80_misc2): one random-fruit roll per 2 h cooldown.
     autoGachaRoll   = false,
     gachaRollNow    = false, -- set by the "Roll Now" button, cleared by the loop
+    gachaStoreFruit = true,  -- equip the rolled fruit by its hotbar key and store it
+    gachaPaused     = false, -- every farm yields while the rolled fruit is stored (at most GACHA_PAUSE_SECS)
     gachaStatusLabel = nil,
     selectedSeaEvent = "Shark",
     autoSeaEvent    = false,
@@ -750,7 +752,7 @@ end
 -- Priority features that every farm yields to (Auto Farm Quest checks this
 -- itself; the other farms also yield to Auto Farm Quest, see below).
 function farmPriorityFeatureActive()
-    return S.fruitPriorityActive == true or S.autoDinoBone == true or S.autoBossFarm == true or S.autoMaterialFarm == true
+    return S.fruitPriorityActive == true or S.gachaPaused == true or S.autoDinoBone == true or S.autoBossFarm == true or S.autoMaterialFarm == true
         or S.autoSeaEvent == true
         or S.dungeonEnabled == true
         or S.autoMirageTween == true or S.autoMirageGear == true
