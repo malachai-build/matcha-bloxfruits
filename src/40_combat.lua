@@ -204,6 +204,7 @@ _remoteNet        = nil
 _remoteRegAtk     = nil
 _remoteRegHit     = nil
 _lastRemoteFire   = 0
+remoteRetryAt     = 0 -- ensureRemotes: next WaitForChild retry (clock)
 
 function ensureRemotes()
     if _remoteRegAtk and _remoteRegHit then return true end
@@ -213,8 +214,26 @@ function ensureRemotes()
     end)
     if not okNet or not net then return false end
     _remoteNet    = net
-    _remoteRegAtk = net:FindFirstChild("RE/RegisterAttack")
-    _remoteRegHit = net:FindFirstChild("RE/RegisterHit")
+    _remoteRegAtk = _remoteRegAtk or net:FindFirstChild("RE/RegisterAttack")
+    _remoteRegHit = _remoteRegHit or net:FindFirstChild("RE/RegisterHit")
+    -- Live Oct 15 2026: Matcha intermittently reads Net child names longer
+    -- than 15 characters as "Unreadable_name" ("RE/RegisterAttack" is 17;
+    -- "RE/RegisterHit" is 14 and always resolves), so FindFirstChild can miss
+    -- RegisterAttack for a while and every swing is skipped. WaitForChild
+    -- found it in the same state: try it at most once per 3 s (it yields),
+    -- and say so instead of failing silently.
+    if not (_remoteRegAtk and _remoteRegHit) and clock() >= remoteRetryAt then
+        remoteRetryAt = clock() + 3
+        pcall(function()
+            _remoteRegAtk = _remoteRegAtk or net:WaitForChild("RE/RegisterAttack", 1)
+            _remoteRegHit = _remoteRegHit or net:WaitForChild("RE/RegisterHit", 1)
+        end)
+        if not (_remoteRegAtk and _remoteRegHit) then
+            warnThrottled("remoteLookup", "[laced.club] Remote M1: "
+                .. (_remoteRegAtk and "RE/RegisterHit" or "RE/RegisterAttack")
+                .. " not found yet (Matcha name read); retrying, no swings until it resolves", 15)
+        end
+    end
     return _remoteRegAtk ~= nil and _remoteRegHit ~= nil
 end
 
