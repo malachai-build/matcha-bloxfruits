@@ -651,3 +651,18 @@ Hot patch of `tweenTo`, `afq_goToWait` and helpers, `afq_nearestEnemy` and `afq_
 - The live test was a hot patch, not a fresh load; the "no weapon held" status note was not part of it.
 - That run used Remote quest accept, so the long giver trips of the dialogue path (the flights that triggered the snap-backs) were not exercised after the fix; they rely on the 250 studs/s cap and the snap-back re-base.
 - 250 studs/s was measured on one route in one server; the snap-back handling lowers it further where needed but never raises it again in a session.
+
+---
+
+## Auto Fruit Gacha (Oct 15 2026)
+
+New Misc-tab section **Fruit Gacha** (column 2): toggle **Auto Gacha Roll** (`auto_gacha_roll`, off by default), button **Roll Gacha Now** (`gacha_roll_now`) and a status label (`gacha_status`). Loop at the end of `src/80_misc2.lua`.
+
+- Roll = CommF_ `"Cousin","Buy"` through `invokeEnhancedComm` (quiet window, serialised with every other CommF_ invoke, postponed while a flight starts). No travel: the NPC (Sea 1 Middle Town, Sea 2 Cafe, Sea 3 Mansion) is not in the client's NPC folders when far away, and the server answered `"Cousin","Check"` live from ~4,000 studs off the Sea 2 Cafe.
+- Matcha's InvokeServer returns only a boolean, so a roll is proven by `Data.Beli` dropping or a new `... Fruit` tool within 4 s. Proven: next roll in 2 h. Not proven (cooldown running from a roll made elsewhere, not enough Beli, level too low): retried in 10 min.
+- Next-roll time is `os.time()` based and saved to `laced_club_configs/gacha_<UserId>.txt`, so a re-run or rejoin keeps the 2 h timer.
+
+### Live
+
+- Probed: `"Cousin","Check"` invoke returns `true` in Sea 2 (Matcha boolean only). `os.time`, `readfile`/`writefile`/`isfile` present; `Data.Beli` readable.
+- **Not live tested:** `"Cousin","Buy"` (spends Beli) was not sent from this session; whether the server still accepts it from range, and whether the fruit lands as a Backpack tool, is unconfirmed.

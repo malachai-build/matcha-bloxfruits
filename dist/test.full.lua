@@ -536,6 +536,10 @@ S = {
     statCapGun      = 0,
     statCapFruit    = 0,
     statStatusLabel = nil,
+    -- Auto Fruit Gacha (80_misc2): one random-fruit roll per 2 h cooldown.
+    autoGachaRoll   = false,
+    gachaRollNow    = false, -- set by the "Roll Now" button, cleared by the loop
+    gachaStatusLabel = nil,
     selectedSeaEvent = "Shark",
     autoSeaEvent    = false,
     mirageEsp       = false,
@@ -2257,6 +2261,14 @@ miscTab:AddToggle("auto_mirage_gear",{
     Text="Collect Mirage Gear",Description="Finds and tweens to the visible Mirage gear",Default=false,Column=2,
     Callback=function(v) S.autoMirageGear=v end
 })
+
+miscTab:AddSection("Fruit Gacha",{Column=2})
+miscTab:AddToggle("auto_gacha_roll",{
+    Text="Auto Gacha Roll",Description="Rolls the Blox Fruit Gacha (random fruit, costs Beli) once per 2 h cooldown, from anywhere",Default=false,Column=2,
+    Callback=function(v) S.autoGachaRoll=v end
+})
+miscTab:AddButton("gacha_roll_now",{Text="Roll Gacha Now",Column=2,Callback=function() S.gachaRollNow=true end})
+S.gachaStatusLabel=miscTab:AddLabel("gacha_status",{Text="Gacha: idle",Column=2})
 
 miscTab:AddSection("World Status",{Column=2})
 miscTab:AddButton("check_events",{Text="Check Event Islands",Column=2,Callback=function() if type(showEventStatus)=="function" then showEventStatus() end end})
@@ -9965,6 +9977,146 @@ task.spawn(function()
             task.wait(2)
         end
         if remoteFailing("CommF_") then task.wait(5) else task.wait(0.5) end
+    end
+end)
+
+-- Auto Fruit Gacha (Oct 15 2026). The Blox Fruit Gacha NPC (Sea 1 Middle
+-- Town, Sea 2 Cafe, Sea 3 Mansion) still answers the classic CommF_
+-- "Cousin" call from anywhere on the map (live: "Cousin","Check" answered in
+-- Sea 2 about 4,000 studs from the Cafe), so no travel is needed: the roll is
+-- CommF_ "Cousin","Buy" through invokeEnhancedComm (quiet window,
+-- serialised with every other CommF_ invoke).
+-- Matcha's InvokeServer returns only a boolean, so the server's answer
+-- (fruit name, cooldown text) is not visible. A roll is proven by Data.Beli
+-- dropping or a new "... Fruit" tool appearing within GACHA_CONFIRM_SECS.
+--   * proven: the next roll is GACHA_COOLDOWN_SECS later;
+--   * not proven (cooldown still running from a roll made elsewhere, not
+--     enough Beli, level too low): retried after GACHA_RETRY_SECS, never
+--     spammed.
+-- The next-roll time is os.time() based and saved per account to
+-- laced_club_configs/gacha_<UserId>.txt, so a re-run or a rejoin keeps it.
+-- "Roll Gacha Now" ignores the saved time for one attempt.
+GACHA_COOLDOWN_SECS=2*60*60
+GACHA_RETRY_SECS=10*60
+GACHA_CONFIRM_SECS=4
+GACHA_CALM_SECS=1.5
+task.spawn(function()
+    local folder="laced_club_configs"
+    local userId=0
+    pcall(function() userId=tonumber(LocalPlayer.UserId) or 0 end)
+    local path=folder.."/gacha_"..tostring(userId)..".txt"
+    local function now() return os.time() end
+    local function loadNext()
+        local value=0
+        pcall(function()
+            if isfile(path) then value=tonumber(readfile(path)) or 0 end
+        end)
+        return value
+    end
+    local function saveNext(t)
+        pcall(function()
+            if not isfolder(folder) then makefolder(folder) end
+            writefile(path,tostring(math.floor(t)))
+        end)
+    end
+    local nextAt=loadNext()
+    local lastResult="idle"
+    local function setLabel()
+        local label=S.gachaStatusLabel
+        if type(label)~="table" then return end
+        local left=nextAt-now()
+        local timer
+        if left<=0 then timer="ready"
+        else timer=string.format("next in %dh %02dm",math.floor(left/3600),math.floor((left%3600)/60)) end
+        pcall(function() label.Text="Gacha: "..lastResult.." | "..timer end)
+    end
+    local function beli()
+        local data=LocalPlayer and LocalPlayer:FindFirstChild("Data")
+        local value=data and data:FindFirstChild("Beli")
+        if not value then return nil end
+        local ok,v=pcall(function() return value.Value end)
+        return ok and tonumber(v) or nil
+    end
+    -- Names of fruit tools held now (Backpack and Character), as a set.
+    local function fruitTools()
+        local out={}
+        for _,holder in ipairs({LocalPlayer and LocalPlayer:FindFirstChild("Backpack"),LocalPlayer and LocalPlayer.Character}) do
+            if holder then
+                local okChildren,children=pcall(function() return holder:GetChildren() end)
+                if okChildren and children then
+                    for _,child in ipairs(children) do
+                        local okName,name=pcall(function() return child.Name end)
+                        if okName and type(name)=="string" and string.find(name,"Fruit",1,true) then out[name]=(out[name] or 0)+1 end
+                    end
+                end
+            end
+        end
+        return out
+    end
+    local function newFruit(before,after)
+        for name,count in pairs(after) do
+            if count>(before[name] or 0) then return name end
+        end
+        return nil
+    end
+    local function roll(manual)
+        local beliBefore=beli()
+        local toolsBefore=fruitTools()
+        S.quietDefer="travel" -- read (and cleared) by quietInvoke: a flight starting in the lead-in postpones it
+        local ok,_,err=invokeEnhancedComm("Cousin","Buy")
+        S.quietDefer=nil
+        if not ok and err==QUIET_POSTPONED then return "postponed" end
+        if not ok then
+            lastResult="remote failed"
+            warnThrottled("gacha:remote","[laced.club] Gacha: Cousin Buy failed: "..tostring(err),30)
+            nextAt=now()+GACHA_RETRY_SECS
+            return "failed"
+        end
+        local waited=0
+        local fruit,spent=nil,false
+        repeat
+            task.wait(0.2)
+            waited=waited+0.2
+            local beliAfter=beli()
+            spent=beliBefore~=nil and beliAfter~=nil and beliAfter<beliBefore
+            fruit=newFruit(toolsBefore,fruitTools())
+        until not alive() or spent or fruit or waited>=GACHA_CONFIRM_SECS
+        if spent or fruit then
+            -- Give the fruit tool a moment to replicate after the Beli drop.
+            if not fruit then task.wait(0.6); fruit=newFruit(toolsBefore,fruitTools()) end
+            lastResult=fruit and ("got "..fruit) or "rolled"
+            nextAt=now()+GACHA_COOLDOWN_SECS
+            saveNext(nextAt)
+            notify(fruit and ("Gacha rolled: "..fruit) or "Gacha rolled (fruit sent to inventory)","Fruit Gacha",5)
+            return "rolled"
+        end
+        lastResult="no roll (cooldown/Beli?)"
+        nextAt=now()+GACHA_RETRY_SECS
+        if manual then notify("Gacha did not roll: cooldown running, not enough Beli, or level too low","Fruit Gacha",5) end
+        return "none"
+    end
+    while alive() do
+        local okPass,passError=pcall(function()
+            local manual=S.gachaRollNow==true
+            if (S.autoGachaRoll or manual) and not remoteFailing("CommF_") then
+                if manual or now()>=nextAt then
+                    if clock()-ACTIVITY.travelAt<GACHA_CALM_SECS then
+                        lastResult="waiting (travelling)"
+                    elseif roll(manual)~="postponed" then
+                        S.gachaRollNow=false
+                    end
+                end
+            else
+                S.gachaRollNow=false
+            end
+            setLabel()
+        end)
+        if not okPass then
+            S.gachaRollNow=false
+            warnThrottled("gacha:error","[laced.club] Gacha error: "..tostring(passError),30)
+            task.wait(2)
+        end
+        task.wait(1)
     end
 end)
 -- Load marker: this chunk ran to the end.

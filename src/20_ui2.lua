@@ -85,6 +85,14 @@ miscTab:AddToggle("auto_mirage_gear",{
     Callback=function(v) S.autoMirageGear=v end
 })
 
+miscTab:AddSection("Fruit Gacha",{Column=2})
+miscTab:AddToggle("auto_gacha_roll",{
+    Text="Auto Gacha Roll",Description="Rolls the Blox Fruit Gacha (random fruit, costs Beli) once per 2 h cooldown, from anywhere",Default=false,Column=2,
+    Callback=function(v) S.autoGachaRoll=v end
+})
+miscTab:AddButton("gacha_roll_now",{Text="Roll Gacha Now",Column=2,Callback=function() S.gachaRollNow=true end})
+S.gachaStatusLabel=miscTab:AddLabel("gacha_status",{Text="Gacha: idle",Column=2})
+
 miscTab:AddSection("World Status",{Column=2})
 miscTab:AddButton("check_events",{Text="Check Event Islands",Column=2,Callback=function() if type(showEventStatus)=="function" then showEventStatus() end end})
 miscTab:AddButton("check_bosses",{Text="Check Important Bosses",Column=2,Callback=function() if type(showBossStatus)=="function" then showBossStatus() end end})
