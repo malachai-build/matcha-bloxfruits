@@ -666,3 +666,15 @@ New Misc-tab section **Fruit Gacha** (column 2): toggle **Auto Gacha Roll** (`au
 
 - Probed: `"Cousin","Check"` invoke returns `true` in Sea 2 (Matcha boolean only). `os.time`, `readfile`/`writefile`/`isfile` present; `Data.Beli` readable.
 - **Not live tested:** `"Cousin","Buy"` (spends Beli) was not sent from this session; whether the server still accepts it from range, and whether the fruit lands as a Backpack tool, is unconfirmed.
+
+## Gacha: store the rolled fruit (Oct 15 2026)
+
+New Misc toggle **Store Rolled Fruit** (`gacha_store_fruit`, on by default). After a roll that produced a new `... Fruit` tool:
+
+1. Pause every farm for at most 5 s (`S.gachaPaused`, `GACHA_PAUSE_SECS`). Auto Farm Quest never leaves a calm moment, so waiting for one would never end. The pause is part of `farmPriorityFeatureActive()` (AFQ, Level Farm, Nearest/NPC farm, raid, mastery) and of the boss/material/sea/mirage/raid checks, so no farm click can eat the fruit while it's held.
+2. Press hotbar number keys until the fruit is the held tool, only while Roblox is focused. Matcha can't read the hotbar frames' names, so the first key tried is the slot after the last filled one, where a new tool lands, then 1-9. A wrong tool is put away by pressing its key again.
+3. Store it with CommF_ `"StoreFruit", <OriginalName or "X-X">, tool`, the call the Store button makes. This runs even if the key route couldn't equip it (Roblox not focused).
+4. Proven when the tool leaves Backpack and Character before the 5 s deadline. Otherwise the fruit is put away with its key and the status says "not stored" (storage full?).
+5. The pause is always released, stored or not, and AFQ's loop picks up again by itself on its next pass.
+
+**Not live tested:** no fruit was available to equip and store in this session. The `StoreFruit` argument shape is the one community scripts use, not one read from the game's own code (the fruit tool's scripts aren't loaded without a fruit).

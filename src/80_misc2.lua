@@ -837,7 +837,7 @@ end)
 -- range); every branch now yields so such a case cannot freeze the VM.
 task.spawn(function()
     while alive() do
-        if S.autoSeaEvent and not S.fruitPriorityActive and not S.autoMirageTween and not S.autoMirageGear then
+        if S.autoSeaEvent and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoMirageTween and not S.autoMirageGear then
             local character=LocalPlayer.Character
             local hrp=character and character:FindFirstChild("HumanoidRootPart")
             local target=S.selectedSeaEvent
@@ -845,7 +845,7 @@ task.spawn(function()
             if hrp and spawned then
                 local useRemote=S.remoteMode
                 pcall(farmAttack,hrp,function()
-                    return S.autoSeaEvent and not S.fruitPriorityActive and not S.autoMirageTween and not S.autoMirageGear and S.selectedSeaEvent==target and S.remoteMode==useRemote
+                    return S.autoSeaEvent and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoMirageTween and not S.autoMirageGear and S.selectedSeaEvent==target and S.remoteMode==useRemote
                 end,target,true,1000000,useRemote and remoteAttack or nil,useRemote and 0.05 or 0.06)
                 frameWait()
             else
@@ -859,14 +859,14 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.autoMirageTween and not S.fruitPriorityActive then
+        if S.autoMirageTween and not (S.fruitPriorityActive or S.gachaPaused) then
             local mirage=findMirageObject()
             local position=safeObjectPosition(mirage)
             local character=LocalPlayer.Character
             local hrp=character and character:FindFirstChild("HumanoidRootPart")
             if position and hrp then
                 tweenTo(hrp,Vector3.new(position.X,position.Y+300,position.Z),S.FARM_SPEED,function()
-                    return S.autoMirageTween and not S.fruitPriorityActive and findMirageObject()~=nil
+                    return S.autoMirageTween and not (S.fruitPriorityActive or S.gachaPaused) and findMirageObject()~=nil
                 end)
                 -- Once hovering above Mirage tweenTo returns at once; this loop used
                 -- to re-enter it without ever yielding.
@@ -882,14 +882,14 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.autoMirageGear and not S.fruitPriorityActive then
+        if S.autoMirageGear and not (S.fruitPriorityActive or S.gachaPaused) then
             local gear=findMirageGear()
             local position=safeObjectPosition(gear)
             local character=LocalPlayer.Character
             local hrp=character and character:FindFirstChild("HumanoidRootPart")
             if gear and position and hrp then
                 tweenTo(hrp,Vector3.new(position.X,position.Y+3,position.Z),S.FARM_SPEED,function()
-                    return S.autoMirageGear and not S.fruitPriorityActive and partStillThere(gear)
+                    return S.autoMirageGear and not (S.fruitPriorityActive or S.gachaPaused) and partStillThere(gear)
                 end)
                 task.wait(0.2)
             else
@@ -916,7 +916,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear then
+        if S.autoBossFarm and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear then
             local char=LocalPlayer.Character
             local hrp=char and char:FindFirstChild("HumanoidRootPart")
             local target=S.selectedBoss
@@ -924,7 +924,7 @@ task.spawn(function()
             if hrp and spawned then
                 local useRemote=S.remoteMode
                 pcall(farmAttack,hrp,function()
-                    return S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedBoss==target and S.remoteMode==useRemote
+                    return S.autoBossFarm and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedBoss==target and S.remoteMode==useRemote
                 end,target,true,5000,useRemote and remoteAttack or nil,useRemote and 0.05 or 0.06)
                 frameWait()
             else
@@ -938,7 +938,7 @@ end)
 
 task.spawn(function()
     while alive() do
-        if S.autoMaterialFarm and not S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear then
+        if S.autoMaterialFarm and not S.autoBossFarm and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear then
             local char=LocalPlayer.Character
             local hrp=char and char:FindFirstChild("HumanoidRootPart")
             local material=S.selectedMaterial
@@ -947,14 +947,14 @@ task.spawn(function()
             if hrp and target then
                 local useRemote=S.remoteMode
                 pcall(farmAttack,hrp,function()
-                    return S.autoMaterialFarm and not S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedMaterial==material and S.remoteMode==useRemote
+                    return S.autoMaterialFarm and not S.autoBossFarm and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedMaterial==material and S.remoteMode==useRemote
                 end,target,true,5000,useRemote and remoteAttack or nil,useRemote and 0.05 or 0.06)
                 frameWait()
             elseif hrp then
                 local waitPos=materialWaitPosition(material)
                 if waitPos then
                     tweenTo(hrp,waitPos,S.FARM_SPEED,function()
-                        return S.autoMaterialFarm and not S.autoBossFarm and not S.fruitPriorityActive and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedMaterial==material
+                        return S.autoMaterialFarm and not S.autoBossFarm and not (S.fruitPriorityActive or S.gachaPaused) and not S.autoSeaEvent and not S.autoMirageTween and not S.autoMirageGear and S.selectedMaterial==material
                     end)
                 end
                 task.wait(0.25) -- re-scan at 4 Hz while no target is up (was 0.35 s)
@@ -1182,10 +1182,14 @@ end)
 -- The next-roll time is os.time() based and saved per account to
 -- laced_club_configs/gacha_<UserId>.txt, so a re-run or a rejoin keeps it.
 -- "Roll Gacha Now" ignores the saved time for one attempt.
+-- Store Rolled Fruit (on by default): after a proven roll with a new fruit
+-- tool, the fruit is equipped by its hotbar number key and stored with
+-- CommF_ "StoreFruit" (storeFruit below).
 GACHA_COOLDOWN_SECS=2*60*60
 GACHA_RETRY_SECS=10*60
 GACHA_CONFIRM_SECS=4
 GACHA_CALM_SECS=1.5
+GACHA_PAUSE_SECS=5
 task.spawn(function()
     local folder="laced_club_configs"
     local userId=0
@@ -1245,6 +1249,101 @@ task.spawn(function()
         end
         return nil
     end
+    local function findFruitTool(name)
+        for _,holder in ipairs({LocalPlayer and LocalPlayer.Character,LocalPlayer and LocalPlayer:FindFirstChild("Backpack")}) do
+            local okTool,tool=pcall(function() return holder and holder:FindFirstChild(name) end)
+            if okTool and tool then return tool end
+        end
+        return nil
+    end
+    local function heldName()
+        local tool=getCurrentlyHeldTool()
+        local okName,name=pcall(function() return tool and tool.Name end)
+        return okName and name or nil
+    end
+    -- Hotbar key route (the user's ask): press number keys until the new
+    -- fruit is the held tool. The hotbar frames' names are not readable
+    -- through Matcha (WeaponEquip.hotbarName), so the slot is found by trying:
+    -- the slot after the last filled one first (a new tool lands there), then
+    -- 1-9. A wrong tool is put away again by pressing its key a second time.
+    -- Keys only while Roblox is focused and before the pause deadline (the
+    -- farms are paused, so no farm click can eat the fruit in hand).
+    local function equipFruitByKey(name,deadline)
+        if not robloxFocused() then return false,nil end
+        local kids=0
+        pcall(function()
+            for _,child in ipairs(LocalPlayer.Backpack:GetChildren()) do
+                if child.ClassName=="Tool" then kids=kids+1 end
+            end
+        end)
+        if getCurrentlyHeldTool() then kids=kids+1 end
+        local order={}
+        local guess=math.min(9,math.max(1,kids))
+        order[1]=guess
+        for slot=1,9 do if slot~=guess then order[#order+1]=slot end end
+        for _,slot in ipairs(order) do
+            if not alive() or not robloxFocused() then return false,nil end
+            if clock()>=deadline-1.5 then break end -- keep time for the store call
+            if heldName()==name then return true,nil end
+            local key=WeaponEquip.key(slot)
+            pcall(function()
+                setrobloxinput(true)
+                keyrelease(key); task.wait(0.02); keypress(key); task.wait(0.1); keyrelease(key)
+            end)
+            task.wait(0.35)
+            local held=heldName()
+            if held==name then return true,key end
+            if held~=nil then
+                -- Wrong tool: press the same key again to put it away.
+                pcall(function() keypress(key); task.wait(0.1); keyrelease(key) end)
+                task.wait(0.25)
+            end
+        end
+        return heldName()==name,nil
+    end
+    -- "Spin Fruit" -> "Spin-Spin" when the tool has no OriginalName attribute.
+    local function storeName(tool,name)
+        local okAttr,attr=pcall(function() return tool:GetAttribute("OriginalName") end)
+        if okAttr and type(attr)=="string" and attr~="" then return attr end
+        local base=string.match(name,"^(.-)%s+Fruit$") or name
+        return base.."-"..base
+    end
+    -- Equip the rolled fruit with its hotbar key, then store it (CommF_
+    -- "StoreFruit", the call the game's Store button makes). Auto Farm Quest
+    -- never leaves a calm moment, so instead of waiting for one every farm is
+    -- paused (S.gachaPaused, read by farmPriorityFeatureActive and the
+    -- boss/material/sea/mirage/raid loops) for at most GACHA_PAUSE_SECS. The
+    -- pause is always released, stored or not; the farms (AFQ's loop
+    -- included) pick up again on their own at their next pass.
+    -- Proven by the tool leaving Backpack and Character.
+    local function storeFruitPaused(name,deadline)
+        -- Let the farms see the pause and stop clicking/swinging.
+        local settleUntil=math.min(deadline-3,clock()+0.6)
+        while alive() and clock()<settleUntil do task.wait(0.05) end
+        local equipped,equipKey=equipFruitByKey(name,deadline)
+        local tool=findFruitTool(name)
+        if not tool then return true,"gone",nil end
+        local ok,_,err=invokeEnhancedComm("StoreFruit",storeName(tool,name),tool)
+        if not ok then return false,"StoreFruit failed: "..tostring(err),equipKey end
+        repeat
+            task.wait(0.2)
+        until not alive() or findFruitTool(name)==nil or clock()>=deadline
+        if findFruitTool(name)==nil then return true,equipped and "key" or "remote",nil end
+        return false,"still in backpack (storage full?)",equipKey
+    end
+    local function storeFruit(name)
+        local deadline=clock()+GACHA_PAUSE_SECS
+        S.gachaPaused=true
+        local okRun,stored,how,equipKey=pcall(storeFruitPaused,name,deadline)
+        -- Not stored: put the fruit away so the farm re-equips its weapon and
+        -- no click can eat it.
+        if not (okRun and stored) and equipKey and heldName()==name and robloxFocused() then
+            pcall(function() keypress(equipKey); task.wait(0.1); keyrelease(equipKey) end)
+        end
+        S.gachaPaused=false
+        if not okRun then return false,tostring(stored) end
+        return stored,how
+    end
     local function roll(manual)
         local beliBefore=beli()
         local toolsBefore=fruitTools()
@@ -1274,6 +1373,17 @@ task.spawn(function()
             nextAt=now()+GACHA_COOLDOWN_SECS
             saveNext(nextAt)
             notify(fruit and ("Gacha rolled: "..fruit) or "Gacha rolled (fruit sent to inventory)","Fruit Gacha",5)
+            if fruit and S.gachaStoreFruit then
+                local stored,how=storeFruit(fruit)
+                if stored then
+                    lastResult="stored "..fruit
+                    notify("Stored "..fruit,"Fruit Gacha",4)
+                else
+                    lastResult="got "..fruit.." (not stored)"
+                    warnThrottled("gacha:store","[laced.club] Gacha: could not store "..fruit..": "..tostring(how),30)
+                    notify("Could not store "..fruit..": "..tostring(how),"Fruit Gacha",5)
+                end
+            end
             return "rolled"
         end
         lastResult="no roll (cooldown/Beli?)"

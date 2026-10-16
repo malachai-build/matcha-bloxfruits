@@ -305,7 +305,7 @@ end)
 task.spawn(function()
     while alive() do
         task.wait(0.5)
-        if not S.autoRaid or S.autoBossFarm or S.autoMaterialFarm or S.autoSeaEvent or S.autoMirageTween or S.autoMirageGear or S.fruitPriorityActive then
+        if not S.autoRaid or S.autoBossFarm or S.autoMaterialFarm or S.autoSeaEvent or S.autoMirageTween or S.autoMirageGear or S.fruitPriorityActive or S.gachaPaused then
             S.raidDetected=false
             S.raidTweenActive=false
             S.raidLastIslandNum=0
