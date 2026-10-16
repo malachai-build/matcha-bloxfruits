@@ -3893,9 +3893,13 @@ function tweenTo(hrp, targetPos, speed, checkFn)
             if snappedBack(part) then
                 -- Follow the server instead of writing on along the old line
                 -- (it refuses every write that far ahead): slow down and
-                -- re-base from where it put the root.
-                moveSpeed=math.max(TWEEN_SERVER_FLOOR,moveSpeed*TWEEN_SNAP_SLOWDOWN)
-                TWEEN_SERVER_CAP=math.max(TWEEN_SERVER_FLOOR,math.min(TWEEN_SERVER_CAP,moveSpeed))
+                -- re-base from where it put the root. A drift after a long
+                -- gap since the last write (frame hitch: gravity) only
+                -- re-bases; it says nothing about the server's limit.
+                if now-lastWrite<0.25 then
+                    moveSpeed=math.max(TWEEN_SERVER_FLOOR,moveSpeed*TWEEN_SNAP_SLOWDOWN)
+                    TWEEN_SERVER_CAP=math.max(TWEEN_SERVER_FLOOR,math.min(TWEEN_SERVER_CAP,moveSpeed))
+                end
                 rebase()
                 now=clock()
             end
