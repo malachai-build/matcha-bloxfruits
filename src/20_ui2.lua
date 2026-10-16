@@ -241,12 +241,20 @@ AFQ = {
     -- trackerMissingSince debounces "tracker gone = quest completed".
     gen=0, stepGen=0, acceptFails=0, abandonFails=0, retryAt=0, npcBlock={},
     trackerMissingSince=nil,
+    -- anchors: "<giverKey>#<questIndex>" -> where that quest's enemies were
+    -- last seen (spawn centroid or a kill), for the wait spot when the
+    -- EnemySpawns markers are streamed out (afq_questAnchor).
+    anchors={},
 }
 local AFQ = AFQ -- this run's table for the callbacks below
 AFQ_SWITCH_COOLDOWN=6       -- s between two quest switches (stops a flapping selection)
 AFQ_LEVEL_CHECK_INTERVAL=3  -- s between the level reads inside a fight
 AFQ_WAIT_HEIGHT=24          -- studs a derived wait spot sits above the spawn centroid
 AFQ_WAIT_STALE_DIST=500     -- a static wait spot this far from the spawn centroid is stale
+AFQ_RELOCK_DIST=40          -- studs off the hover spot at which the fight re-tweens instead of snapping
+AFQ_NO_DAMAGE_SECS=6        -- s of swings without HP loss before the fight re-approaches, then skips the enemy
+AFQ_NO_DAMAGE_SWINGS=15     -- swings that must have gone out in that time (no blame while unfocused)
+AFQ_NO_DAMAGE_BLOCK=30      -- s an enemy that took no damage is skipped
 AFQ_BOSS_POLL=5             -- s between two boss presence scans (boss interleave)
 AFQ_BOSS_MAX_WAIT=180       -- s an unfinished quest may delay the switch to a respawned boss
 S.autoFarmQuest=false

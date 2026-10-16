@@ -2414,12 +2414,20 @@ AFQ = {
     -- trackerMissingSince debounces "tracker gone = quest completed".
     gen=0, stepGen=0, acceptFails=0, abandonFails=0, retryAt=0, npcBlock={},
     trackerMissingSince=nil,
+    -- anchors: "<giverKey>#<questIndex>" -> where that quest's enemies were
+    -- last seen (spawn centroid or a kill), for the wait spot when the
+    -- EnemySpawns markers are streamed out (afq_questAnchor).
+    anchors={},
 }
 local AFQ = AFQ -- this run's table for the callbacks below
 AFQ_SWITCH_COOLDOWN=6       -- s between two quest switches (stops a flapping selection)
 AFQ_LEVEL_CHECK_INTERVAL=3  -- s between the level reads inside a fight
 AFQ_WAIT_HEIGHT=24          -- studs a derived wait spot sits above the spawn centroid
 AFQ_WAIT_STALE_DIST=500     -- a static wait spot this far from the spawn centroid is stale
+AFQ_RELOCK_DIST=40          -- studs off the hover spot at which the fight re-tweens instead of snapping
+AFQ_NO_DAMAGE_SECS=6        -- s of swings without HP loss before the fight re-approaches, then skips the enemy
+AFQ_NO_DAMAGE_SWINGS=15     -- swings that must have gone out in that time (no blame while unfocused)
+AFQ_NO_DAMAGE_BLOCK=30      -- s an enemy that took no damage is skipped
 AFQ_BOSS_POLL=5             -- s between two boss presence scans (boss interleave)
 AFQ_BOSS_MAX_WAIT=180       -- s an unfinished quest may delay the switch to a respawned boss
 S.autoFarmQuest=false
@@ -3742,6 +3750,20 @@ function buildBerryEspLabels(force)
 end
 
 TWEEN_STEP_TIME=FRAME_TIME -- one CFrame write per frame (was 0.01 before the stability pass); safe mode doubles it
+-- Server movement limit (measured live Oct 15 2026, Upper Skylands): a
+-- 2,600-3,400 stud flight at 320 studs/s was refused after ~1.5 s (the server
+-- kept the character far behind, snapped the root back to it every few frames
+-- and rejected every hit meanwhile); the same flight at 250 was accepted,
+-- and short hops (<= ~150 studs) at 320 always were. So a flight longer than
+-- TWEEN_BURST_DIST runs at most TWEEN_SERVER_CAP studs/s, and a server
+-- snap-back (root found more than TWEEN_SNAP_DIST off the last written point)
+-- re-bases the flight from where the server put the root and lowers the cap
+-- (x TWEEN_SNAP_SLOWDOWN, not below TWEEN_SERVER_FLOOR) for the session.
+TWEEN_BURST_DIST=300
+TWEEN_SERVER_CAP=250
+TWEEN_SERVER_FLOOR=150
+TWEEN_SNAP_DIST=60
+TWEEN_SNAP_SLOWDOWN=0.85
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
 -- target was reached, false when stopped (checkFn false, part gone, unload,
@@ -3810,6 +3832,7 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     end
     local moveSpeed=tonumber(speed) or 320
     if moveSpeed<=0 then moveSpeed=320 end
+    if isLocalRoot and distance>TWEEN_BURST_DIST then moveSpeed=math.min(moveSpeed,TWEEN_SERVER_CAP) end
     local token=isLocalRoot and claimRoot() or nil
     local function finish(result)
         if token then releaseRoot(token) end
@@ -3825,6 +3848,8 @@ function tweenTo(hrp, targetPos, speed, checkFn)
     local baseX,baseY,baseZ=startPos.X,startPos.Y,startPos.Z
     local duration=distance/moveSpeed
     local baseTime=clock()
+    -- Last point written (snap-back check); nil right after a (re)base.
+    local wroteX,wroteY,wroteZ=nil,nil,nil
     local function rebase()
         local part=currentPart()
         local okPos,pos=pcall(function() return part and part.Position end)
@@ -3832,6 +3857,16 @@ function tweenTo(hrp, targetPos, speed, checkFn)
         dx=targetPos.X-baseX; dy=targetPos.Y-baseY; dz=targetPos.Z-baseZ
         duration=math.max(math.sqrt(dx*dx+dy*dy+dz*dz)/moveSpeed,FRAME_TIME)
         baseTime=clock()
+        wroteX=nil
+    end
+    -- True when the root is far off the point this flight last wrote: the
+    -- server refused the movement and put the root back (see TWEEN_SERVER_CAP).
+    local function snappedBack(part)
+        if not isLocalRoot or wroteX==nil then return false end
+        local okPos,pos=pcall(function() return part.Position end)
+        if not okPos or not pos or not pos.X then return false end
+        local ex,ey,ez=pos.X-wroteX,pos.Y-wroteY,pos.Z-wroteZ
+        return ex*ex+ey*ey+ez*ez>TWEEN_SNAP_DIST*TWEEN_SNAP_DIST
     end
     local lastWrite=-1e9
     while keepGoing() do
@@ -3855,8 +3890,23 @@ function tweenTo(hrp, targetPos, speed, checkFn)
         else
             local part=currentPart()
             if not part then return finish(false) end
+            if snappedBack(part) then
+                -- Follow the server instead of writing on along the old line
+                -- (it refuses every write that far ahead): slow down and
+                -- re-base from where it put the root. A drift after a long
+                -- gap since the last write (frame hitch: gravity) only
+                -- re-bases; it says nothing about the server's limit.
+                if now-lastWrite<0.25 then
+                    moveSpeed=math.max(TWEEN_SERVER_FLOOR,moveSpeed*TWEEN_SNAP_SLOWDOWN)
+                    TWEEN_SERVER_CAP=math.max(TWEEN_SERVER_FLOOR,math.min(TWEEN_SERVER_CAP,moveSpeed))
+                end
+                rebase()
+                now=clock()
+            end
             local alpha=math.min((now-baseTime)/duration,1)
-            if placeRoot(part,baseX+dx*alpha,baseY+dy*alpha,baseZ+dz*alpha,rotationCF) then
+            local wx,wy,wz=baseX+dx*alpha,baseY+dy*alpha,baseZ+dz*alpha
+            if placeRoot(part,wx,wy,wz,rotationCF) then
+                wroteX,wroteY,wroteZ=wx,wy,wz
                 lastWrite=now
                 if alpha>=1 then
                     -- Arrival: final CFrame with zero velocity for three
@@ -6928,6 +6978,28 @@ function afq_spawnCentroid(q)
     return nil
 end
 
+function afq_questKey(q) return q.giverKey.."#"..tostring(q.questIndex) end
+
+-- Where quest q's enemies are: the live spawn centroid (remembered), else the
+-- remembered centroid or the last kill spot (afq_noteKill), else nil.
+function afq_questAnchor(q)
+    local key=afq_questKey(q)
+    local centroid=afq_spawnCentroid(q)
+    if centroid then AFQ.anchors[key]={pos=centroid,fromSpawns=true}; return centroid end
+    local known=AFQ.anchors[key]
+    return known and known.pos or nil
+end
+
+-- A kill of quest q's enemy at pos: the anchor when no spawn centroid has
+-- been read for the quest (a centroid is never overwritten by a kill).
+function afq_noteKill(q,pos)
+    if not pos or not pos.X then return end
+    local key=afq_questKey(q)
+    local known=AFQ.anchors[key]
+    if known and known.fromSpawns then return end
+    AFQ.anchors[key]={pos=pos,fromSpawns=false}
+end
+
 function afq_goToWait(q)
     local override=AFQ_ISLAND_OVERRIDES[q.giverKey]
     local overridePos=override and override.waitPos and override.waitPos[q.questIndex]
@@ -6947,7 +7019,11 @@ function afq_goToWait(q)
     -- Stale-map guard: a static spot more than AFQ_WAIT_STALE_DIST from the
     -- quest enemy's spawn markers (island moved in a game update) is replaced
     -- by AFQ_WAIT_HEIGHT studs above their centroid; so is a missing one.
-    local centroid=afq_spawnCentroid(q)
+    -- The markers stream out with distance, so the guard used to pass a stale
+    -- spot whenever it ran far from the enemies (seen live: Royal Squad,
+    -- sky5Wait1 ~2,600 studs from where they spawn): it now uses the last
+    -- known anchor of the quest instead (afq_questAnchor).
+    local centroid=afq_questAnchor(q)
     if centroid then
         local spot=Vector3.new(centroid.X,centroid.Y+AFQ_WAIT_HEIGHT,centroid.Z)
         local far=true
@@ -6961,8 +7037,12 @@ function afq_goToWait(q)
     return afq_teleportTo(position),position
 end
 
--- Nearest living Workspace.Enemies model whose Name contains the quest enemy
--- (case-insensitive plain find: models carry suffixes such as "[Lv. 300]").
+-- Nearest living Workspace.Enemies model of the quest enemy. A model named
+-- exactly the enemy (case-insensitive, optionally followed by " [Lv. n]")
+-- always wins over one that only contains it: the plain find alone let a
+-- "Bandit" quest fly to the nearest "Snow Bandit"/"Sky Bandit" across the map
+-- once the nearby ones were dead (kills that do not count). The contains
+-- match is kept only as the fallback when no exact name is alive.
 function afq_nearestEnemy(q)
     local _,root=afl_getCharacter(); if not root then return nil end
     local okPos,cur=pcall(function() return root.Position end)
@@ -6973,33 +7053,53 @@ function afq_nearestEnemy(q)
     local ok,enemies=pcall(function() return folder:GetChildren() end)
     if not ok or not enemies then return nil end
     local best,bestD=nil,math.huge
+    local loose,looseD=nil,math.huge
+    local exactSeen=false -- an exact-named model exists (alive, dead or blocked)
+    local suffix=wanted.." ["
     local now=clock()
     local blocked=AFQ.npcBlock or {}
     for key,untilAt in pairs(blocked) do if now>=untilAt then blocked[key]=nil end end
     local anyBlocked=next(blocked)~=nil
     for _,enemy in pairs(enemies) do
-        if enemy and enemy.Parent and isA(enemy,"Model") and not (anyBlocked and blocked[instKey(enemy)]) then
-            local hrp=enemy:FindFirstChild("HumanoidRootPart")
-            local hum=enemy:FindFirstChildOfClass("Humanoid")
+        if enemy and enemy.Parent and isA(enemy,"Model") then
             local name=""
             pcall(function() name=string.lower(enemy.Name) end)
-            if hrp and hum and hum.Health>0 and string.find(name,wanted,1,true) then
+            local exact=name==wanted or string.sub(name,1,#suffix)==suffix
+            if exact then exactSeen=true end
+            local hrp=(exact or string.find(name,wanted,1,true)) and enemy:FindFirstChild("HumanoidRootPart")
+            local hum=hrp and enemy:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health>0 and not (anyBlocked and blocked[instKey(enemy)]) then
                 local okE,p=pcall(function() return hrp.Position end)
                 if okE and p then
                     local dx,dy,dz=p.X-cur.X,p.Y-cur.Y,p.Z-cur.Z
                     local d=dx*dx+dy*dy+dz*dz
-                    if d<bestD then bestD=d; best=enemy end
+                    if exact then
+                        if d<bestD then bestD=d; best=enemy end
+                    elseif d<looseD then
+                        looseD=d; loose=enemy
+                    end
                 end
             end
         end
     end
-    return best
+    if best or exactSeen then return best end
+    return loose
 end
 
 -- Same fight as the Level Farm loop (head expander, offsets, tween then hard
 -- lock, click or RegisterHit), bounded by afq_farming(). Returns true when the
 -- enemy's Humanoid reached 0 HP.
-function afq_fight(npc)
+-- Desync guards (seen live Oct 15 2026): when the server refuses the
+-- character's movement it snaps the root back to its own, lagging position
+-- (hundreds to thousands of studs away) every few frames, and every hit is
+-- rejected while it does. The hard lock used to snap straight back onto the
+-- enemy in one frame, which the server refuses again, so the fight hovered
+-- with no damage until the 50 s cap. Now a root more than AFQ_RELOCK_DIST
+-- off the hover spot (server snap-back, a fall in a CommF_ quiet window, an
+-- enemy knocked away) re-tweens from where the root is; and AFQ_NO_DAMAGE_SECS
+-- of swings without HP loss re-approaches once, then skips the enemy for
+-- AFQ_NO_DAMAGE_BLOCK s.
+function afq_fight(npc,q)
     local hrp=npc:FindFirstChild("HumanoidRootPart")
     local hum=npc:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum or hum.Health<=0 then return false end
@@ -7009,9 +7109,33 @@ function afq_fight(npc)
     local reachedNpc=false
     local head=headExpander(npc)
     AFQ.activeHead=head
+    local bestHp=hum.Health
+    local lastDamageAt=fightStart
+    local swingsSinceDamage=0
+    local reapproached=false
+    local lastEnemyPos=nil
+    local lastArmedCheck=-1e9
     while hum and hum.Health>0 and partStillThere(npc) and afq_farming() do
         if not partStillThere(hrp) then break end
-        if clock()-fightStart>50 then
+        local now=clock()
+        local okHp,hp=pcall(function() return hum.Health end)
+        if okHp and type(hp)=="number" then
+            if hp<bestHp-0.01 then
+                bestHp=hp; lastDamageAt=now; swingsSinceDamage=0; reapproached=false
+            elseif hp>bestHp then
+                bestHp=hp -- regenerated: measure from the new top
+            end
+        end
+        if reachedNpc and now-lastDamageAt>=AFQ_NO_DAMAGE_SECS and swingsSinceDamage>=AFQ_NO_DAMAGE_SWINGS then
+            if not reapproached then
+                reapproached=true; reachedNpc=false
+                lastDamageAt=now; swingsSinceDamage=0
+            else
+                if type(AFQ.npcBlock)=="table" then AFQ.npcBlock[instKey(npc)]=now+AFQ_NO_DAMAGE_BLOCK end
+                break
+            end
+        end
+        if now-fightStart>50 then
             -- Not damageable (out of reach, immune, safe zone): skip it for 60 s
             -- instead of fighting it again in 50 s blocks forever.
             if type(AFQ.npcBlock)=="table" then AFQ.npcBlock[instKey(npc)]=clock()+60 end
@@ -7027,6 +7151,11 @@ function afq_fight(npc)
         if not useRemote and not AFQ_DEBUG.noHead then head.apply() end
         local ox,oy,oz=getNormalFarmOffsets()
         local targetPos=Vector3.new(enemyPos.X+ox,enemyPos.Y+oy,enemyPos.Z+oz)
+        lastEnemyPos=enemyPos
+        if reachedNpc and not writesPaused() then
+            local dx,dy,dz=playerPos.X-targetPos.X,playerPos.Y-targetPos.Y,playerPos.Z-targetPos.Z
+            if dx*dx+dy*dy+dz*dz>AFQ_RELOCK_DIST*AFQ_RELOCK_DIST then reachedNpc=false end
+        end
         if not reachedNpc then
             AFQ_DEBUG.phase="fight-tween"
             tweenTo(playerHrp,targetPos,S.FARM_SPEED,function()
@@ -7037,23 +7166,46 @@ function afq_fight(npc)
         elseif not AFQ_DEBUG.noLock then
             hardLockNpcCFrame(playerHrp,targetPos)
         end
-        local now=clock()
+        now=clock()
         if now-lastLevelCheck>=AFQ_LEVEL_CHECK_INTERVAL then
             lastLevelCheck=now
             pcall(afq_checkSwitchPending)
         end
+        -- No weapon held (e.g. after a respawn) and Roblox unfocused: the
+        -- equip loop cannot press the hotbar key and no M1 goes out (seen
+        -- live: hovering over a full-HP enemy). Say so instead of hovering
+        -- silently.
+        if now-lastArmedCheck>=1 then
+            lastArmedCheck=now
+            if getCurrentlyHeldTool()==nil and not robloxFocused() then
+                local note=" (no weapon held: focus Roblox so it can be equipped)"
+                if string.sub(AFQ.status or "",-#note)~=note then
+                    AFQ.status=(AFQ.status or "")..note
+                    afq_updateLabel()
+                end
+            end
+        end
+        -- Only swings that went out count towards the no-damage skip (an
+        -- unfocused window or a CommF_ quiet window sends nothing).
         if AFQ_DEBUG.noClick then
             -- isolation run: no attack input at all
         elseif useRemote then
-            if now-lastRemoteAttack>=0.05 then remoteAttack(npc); lastRemoteAttack=now end
+            if now-lastRemoteAttack>=0.05 then
+                if remoteAttack(npc) then swingsSinceDamage=swingsSinceDamage+1 end
+                lastRemoteAttack=now
+            end
         else
-            if now-lastClick>=writeInterval(0.06) then farmClick(); lastClick=now end
+            if now-lastClick>=writeInterval(0.06) then
+                if farmClick() then swingsSinceDamage=swingsSinceDamage+1 end
+                lastClick=now
+            end
         end
         frameWait()
         hrp=npc:FindFirstChild("HumanoidRootPart")
         hum=npc:FindFirstChildOfClass("Humanoid")
     end
     local okDead,dead=pcall(function() return hum~=nil and hum.Health<=0 end)
+    if okDead and dead and q then afq_noteKill(q,lastEnemyPos) end
     head.restore()
     AFQ.activeHead=nil
     frameWait()
@@ -7394,7 +7546,7 @@ function afq_step()
     setStatus()
     AFQ_DEBUG.phase="fight"
     AFQ.bossMisses=0
-    local killed=afq_fight(AFQ.selectedNpc)
+    local killed=afq_fight(AFQ.selectedNpc,q)
     AFQ_DEBUG.phase="after-fight"
     if not afq_farming() then return end
     -- Not killed (50 s cap, own death, target gone): pick afresh next step.
