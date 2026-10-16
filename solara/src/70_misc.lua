@@ -7,6 +7,7 @@ if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["7
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
 local S = S
+local PVP_COLLIDE_THREADS=setmetatable({}, {__mode="k"})
 function localRoot()
     local char=LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart") or nil
@@ -32,7 +33,7 @@ function doPullLoop(flag, getPoint)
                                 local hrp=model:FindFirstChild("HumanoidRootPart")
                                 if hrp then
                                     if hrp.CanCollide~=false then hrp.CanCollide=false end
-                                    hrp.Position=pullPoint
+                                    setPos(hrp,pullPoint)
                                 end
                             end
                         end)
@@ -139,7 +140,7 @@ task.spawn(function()
                     pcall(function()
                         local hrp=model:FindFirstChild("HumanoidRootPart")
                         if hrp then
-                            hrp.Position=frozen.position
+                            setPos(hrp,frozen.position)
                             zeroVelocity(hrp)
                         end
                     end)
@@ -467,7 +468,7 @@ task.spawn(function()
         if S.voidPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
-                pcall(function() hrp.Position=Vector3.new(hrp.Position.X,100000,hrp.Position.Z) end)
+                pcall(setPos,hrp,Vector3.new(hrp.Position.X,100000,hrp.Position.Z))
                 zeroVelocity(hrp)
             end
         end
@@ -480,7 +481,7 @@ task.spawn(function()
         if S.skyPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
-                pcall(function() hrp.Position=Vector3.new(hrp.Position.X,1000,hrp.Position.Z) end)
+                pcall(setPos,hrp,Vector3.new(hrp.Position.X,1000,hrp.Position.Z))
                 zeroVelocity(hrp)
             end
         end
@@ -546,6 +547,10 @@ task.spawn(function()
                     local enemyRootPart=target:FindFirstChild("HumanoidRootPart")
                     if enemyRootPart then
                         local function engaged() return alive() and S.pvpFarmLoop and not isPvpTargetDead(target) end
+                        -- One CanCollide thread per target (a new one used to be
+                        -- spawned every pass and they piled up on long fights).
+                        if not PVP_COLLIDE_THREADS[target] then
+                        PVP_COLLIDE_THREADS[target]=true
                         task.spawn(function()
                             while engaged() do
                                 pcall(function()
@@ -556,7 +561,9 @@ task.spawn(function()
                                 end)
                                 frameWait()
                             end
+                            PVP_COLLIDE_THREADS[target]=nil
                         end)
+                        end
                         local startX=myHrp.Position.X; local startY=myHrp.Position.Y; local startZ=myHrp.Position.Z
                         local tx=enemyRootPart.Position.X+20; local ty=enemyRootPart.Position.Y; local tz=enemyRootPart.Position.Z
                         local dx=tx-startX; local dy=ty-startY; local dz=tz-startZ
@@ -582,7 +589,7 @@ task.spawn(function()
                             local savedX=myHrp.Position.X; local savedZ=myHrp.Position.Z
                             local upStart=clock()
                             while clock()-upStart<5 and engaged() do
-                                setPartPosition(myHrp,Vector3.new(savedX,10000000,savedZ))
+                                setPartPosition(myHrp,Vector3.new(savedX,50000,savedZ)) -- was 1e7: far past float precision
                                 zeroVelocity(myHrp)
                                 task.wait(0.1)
                             end
@@ -840,6 +847,8 @@ do
     }
 
     local function fish_hold()
+        -- Alt-tabbed while held: release, or M1 stays down in the other window.
+        if FishState.IsHolding and not robloxFocused() then FishState.IsHolding=false; pcall(mouse1release); return end
         if not FishState.IsHolding and robloxFocused() and not menuUnderMouse() then FishState.IsHolding=true; pcall(mouse1press); FishState.Clicks=FishState.Clicks+1 end
     end
     local function fish_release()
@@ -961,7 +970,9 @@ do
                         ending=false; wasOpen=false
                     end
                 else
-                    if not FishState.IsHolding then fish_click(); task.wait(0.1) end
+                    -- Cast frame gone (unequipped, died): never leave M1 held.
+                    if FishState.IsHolding then fish_release() end
+                    fish_click(); task.wait(0.1)
                 end
                 continue
             end
@@ -1078,9 +1089,18 @@ do
         end
     end
 
+    local REPAIR_HOLD_MAX=3 -- s; never leave M1 held longer than this
     local function repairHold()
-        if not RepairState.holding and robloxFocused() and not menuUnderMouse() then
+        if RepairState.holding then
+            if not robloxFocused() or clock()-RepairState.heldAt>REPAIR_HOLD_MAX then
+                RepairState.holding=false
+                pcall(mouse1release)
+            end
+            return
+        end
+        if robloxFocused() and not menuUnderMouse() then
             RepairState.holding=true
+            RepairState.heldAt=clock()
             pcall(mouse1press)
         end
     end

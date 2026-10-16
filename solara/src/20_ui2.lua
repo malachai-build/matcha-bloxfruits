@@ -530,14 +530,10 @@ function findBoatVehicleSeat(boat)
     if not boat then return nil end
     local okDirect,directSeat=pcall(function() return boat:FindFirstChildOfClass("VehicleSeat") end)
     if okDirect and directSeat then return directSeat end
-    local okDescendants,descendants=pcall(function() return boat:GetDescendants() end)
-    if okDescendants and descendants then
-        for _,object in pairs(descendants) do
-            local okClass,className=pcall(function() return object.ClassName end)
-            if okClass and className=="VehicleSeat" then return object end
-        end
-    end
-    return nil
+    -- Recursive class search (real Roblox API in Solara) instead of a pcall per
+    -- descendant, which this ran every second for every boat.
+    local okDeep,deepSeat=pcall(function() return boat:FindFirstChildWhichIsA("VehicleSeat",true) end)
+    return okDeep and deepSeat or nil
 end
 
 function refreshBoatSeatList()
@@ -705,7 +701,7 @@ end
 task.spawn(function()
     pcall(refreshBoatSeatList)
     while alive() do
-        task.wait(1)
+        task.wait(2)
         local okRefresh,refreshError=pcall(refreshBoatSeatList)
         if not okRefresh then warnThrottled("boatSeats","[laced.club] Boat seat scan failed: "..tostring(refreshError),30) end
     end
@@ -788,7 +784,7 @@ task.spawn(function()
             if seat and char and hrp and humanoid and okSeat and seatParent and seatPos and not writesPaused()
                 and not isUsingSelectedBoatSeat(seat,char,humanoid,hrp) then
                 pcall(function()
-                    hrp.Position=Vector3.new(seatPos.X,seatPos.Y+2,seatPos.Z)
+                    setPos(hrp,Vector3.new(seatPos.X,seatPos.Y+2,seatPos.Z))
                     hrp.Velocity=Vector3.new(0,0,0)
                     hrp.AssemblyLinearVelocity=Vector3.new(0,0,0)
                 end)
@@ -1124,7 +1120,7 @@ function boatTweenTo(targetPos)
     if not okPrimary or not primary or not targetPos then finish(false); return end
     S.boatTweening=true
     local okRaise=pcall(function()
-        primary.Position=Vector3.new(primary.Position.X, primary.Position.Y+50, primary.Position.Z)
+        setPos(primary,Vector3.new(primary.Position.X, primary.Position.Y+50, primary.Position.Z))
     end)
     if not okRaise then finish(false); return end
     task.wait(0.1)
@@ -1148,7 +1144,7 @@ function boatTweenTo(targetPos)
         while writesPaused() and active() do local pausedAt=clock(); markTravel(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
         local alpha=math.min((clock()-t0)/duration,1)
         local okMove=pcall(function()
-            primary.Position=Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha)
+            setPos(primary,Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha))
         end)
         if not okMove then break end
         zeroVelocity(primary)
@@ -1175,7 +1171,7 @@ task.spawn(function()
         if keyDown(0x10) then my=my-S.boatFlySpeed end
         zeroVelocity(primary)
         pcall(function()
-            primary.Position=Vector3.new(primary.Position.X+mx, primary.Position.Y+my, primary.Position.Z+mz)
+            setPos(primary,Vector3.new(primary.Position.X+mx, primary.Position.Y+my, primary.Position.Z+mz))
         end)
     end
 end)

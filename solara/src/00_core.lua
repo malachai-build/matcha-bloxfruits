@@ -54,17 +54,18 @@ if type(solaraDiag)=="function" then solaraDiag("core entered") end
 -- ---------------------------------------------------------------------------
 clock = (type(os) == "table" and type(os.clock) == "function") and os.clock or tick
 
--- task.wait() with no argument resumes about 2,400 times a second in Matcha
--- (measured live), not once per frame, so every bare-wait loop spun (and wrote
--- CFrame/Position) at that rate. frameWait() yields one 60 Hz frame instead.
+-- Solara runs on Roblox's scheduler: task.wait() yields exactly one frame.
+-- task.wait(1/60) resumes on the first Heartbeat AFTER 16.7 ms, which with
+-- normal frame jitter is often the second frame (an accidental 30 Hz).
+-- FRAME_TIME stays as the nominal frame length for rate arithmetic.
 FRAME_TIME = 1 / 60
-function frameWait() task.wait(FRAME_TIME) end
+function frameWait() task.wait() end
 -- Idle cadence for loops whose feature is off: about 30 loops used to wake at
 -- 60 Hz with every toggle off (~1,800 resumes/s). idleWait(active) yields one
 -- frame while the feature is on and IDLE_POLL s while it is off.
 IDLE_POLL = 0.25
 function idleWait(active)
-    if active then task.wait(FRAME_TIME) else task.wait(IDLE_POLL) end
+    if active then task.wait() else task.wait(IDLE_POLL) end
 end
 -- True unless Matcha says Roblox is not the foreground window. Synthetic keys
 -- and clicks go to whatever window has focus, so every input path checks it.
@@ -91,7 +92,7 @@ end
 Players = game:GetService("Players")
 LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    repeat wait(0.1); LocalPlayer = Players.LocalPlayer until LocalPlayer
+    repeat task.wait(0.1); LocalPlayer = Players.LocalPlayer until LocalPlayer
 end
 if type(solaraDiag)=="function" then solaraDiag("core player ready") end
 
@@ -263,7 +264,7 @@ function safeRemote(tag, remote, method, ...)
     end
     RemoteFailures[tag] = (RemoteFailures[tag] or 0) + 1
     warnThrottled("remote:" .. tag, "[laced.club] " .. tag .. " remote failed: " .. tostring(result)
-        .. " (FireServer/InvokeServer need Matcha Pro / Hybrid mode)", 15)
+        .. "", 15)
     return false, result
 end
 function remoteFailing(tag)
@@ -320,6 +321,15 @@ function remoteInvokePending()
     return runGate ~= nil and runGate.remoteInvokeBusy == true
 end
 
+-- Moves a part and everything jointed to it, keeping its rotation. Never
+-- write BasePart.Position on a jointed part in Solara: real Roblox then
+-- rewrites the Weld/Motor6D offsets instead of moving the assembly, so the
+-- root separates from the rig (fling, death, server correction).
+function setPos(part, position)
+    local cf = part.CFrame
+    part.CFrame = cf + (position - cf.Position)
+end
+
 function moveRoot(part, x, y, z, rotation)
     if not part then return false end
     if writesPaused() then return false end
@@ -336,13 +346,13 @@ function moveRoot(part, x, y, z, rotation)
         part.CFrame = rotation and (positionCF * rotation) or positionCF
     end)
     if okCFrame then return true end
-    return (pcall(function() part.Position = Vector3.new(x, y, z) end))
+    return (pcall(function() setPos(part, Vector3.new(x, y, z)) end))
 end
 
 function setPartPosition(part, position)
     if not part or not position then return false end
     if writesPaused() then return false end
-    return (pcall(function() part.Position = position end))
+    return (pcall(setPos, part, position))
 end
 
 local function nearZeroVector(v)
@@ -382,9 +392,9 @@ function placeRoot(part, x, y, z, rotation)
         local positionCF = CFrame.new(x, y, z)
         part.CFrame = rotation and (positionCF * rotation) or positionCF
     end)
-    if not okCFrame and not pcall(function() part.Position = Vector3.new(x, y, z) end) then return false end
-    pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
-    pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    if not okCFrame and not pcall(function() setPos(part, Vector3.new(x, y, z)) end) then return false end
+    -- AssemblyLinearVelocity covers the deprecated Velocity in Solara.
+    pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
     return true
 end
 
@@ -429,13 +439,53 @@ function rootTweenOwned()
     return ROOT_OWNER.token ~= nil and clock() - ROOT_OWNER.at < ROOT_OWNER_TTL
 end
 
+-- Write-through Drawing cache (Solara). Every Drawing property write crosses
+-- into Solara's renderer, and the UE menu re-writes Position/Size/Color/
+-- Visible/Text of every object on every 16 ms frame, mostly with the value
+-- already set. The proxy forwards a write only when the value changed, and
+-- turns writes and reads on a removed object into no-ops (writing to a removed
+-- Drawing is a known Solara crash). Drawing.Fonts and every other field of the
+-- real library are passed through.
+do
+    local RealDrawing = Drawing
+    local function wrapDrawing(object)
+        local cache = {}
+        local removed = false
+        local function remove()
+            if removed then return end
+            removed = true
+            pcall(function() object.Visible = false end)
+            pcall(function() object:Remove() end)
+        end
+        return setmetatable({}, {
+            __index = function(_, key)
+                if key == "Remove" or key == "Destroy" then return remove end
+                if removed then return nil end
+                local value = cache[key]
+                if value ~= nil then return value end
+                return object[key]
+            end,
+            __newindex = function(_, key, value)
+                if removed or (value ~= nil and cache[key] == value) then return end
+                object[key] = value
+                cache[key] = value
+            end,
+        })
+    end
+    if type(RealDrawing) == "table" or type(RealDrawing) == "userdata" then
+        CachedDrawing = setmetatable({
+            new = function(kind) return wrapDrawing(RealDrawing.new(kind)) end,
+        }, { __index = RealDrawing })
+    end
+end
+
 -- Drawing helpers: every object is created, updated and removed defensively.
 function setProp(object, key, value)
     if object then pcall(function() object[key] = value end) end
 end
 
 function newDrawing(kind, props)
-    local okNew, object = pcall(function() return Drawing.new(kind) end)
+    local okNew, object = pcall(function() return (CachedDrawing or Drawing).new(kind) end)
     if not okNew or not object then return nil end
     for key, value in pairs(props or {}) do setProp(object, key, value) end
     return object

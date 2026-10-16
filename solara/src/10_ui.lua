@@ -74,16 +74,19 @@ function loadUEAdapter()
     local mousePositionReads
     ueSource, mousePositionReads = string.gsub(
         ueSource,
-        "Vector2%.new%(Mouse%.X, Mouse%.Y%)",
+        "Vector2%.new%(%s*Mouse%.X%s*,%s*Mouse%.Y%s*%)",
         'game:GetService("UserInputService"):GetMouseLocation()'
     )
-    assert(mousePositionReads == 3,
-        "UE mouse-coordinate patch expected 3 reads, got " .. tostring(mousePositionReads))
+    assert(mousePositionReads >= 1,
+        "UE mouse-coordinate patch found no Mouse.X/Mouse.Y reads (upstream library changed)")
+    -- Route UE's Drawing.new through the write cache (00_core CachedDrawing):
+    -- the menu re-writes every property of every object each frame.
+    ueSource = "local Drawing = CachedDrawing or Drawing; " .. ueSource
     if type(solaraDiag)=="function" then solaraDiag("UE mouse patch ready") end
 
     local previousUE = findExposedUE()
-    local ueChunk = loadstring(ueSource, "laced.club UE")
-    assert(type(ueChunk) == "function", "UE compile failed")
+    local ueChunk, compileError = loadstring(ueSource, "laced.club UE")
+    assert(type(ueChunk) == "function", "UE compile failed: " .. tostring(compileError))
     if type(solaraDiag)=="function" then solaraDiag("UE execution begin") end
     ueChunk()
     if type(solaraDiag)=="function" then solaraDiag("UE execution end") end
@@ -971,7 +974,7 @@ do
 
                 if playerRoot and MagnetSettings.farmMode=="enemy" and MagnetNearestFarm.attacking then
                     if MagnetNearestFarm.holdPosition then
-                        playerRoot.Position=MagnetNearestFarm.holdPosition
+                        setPos(playerRoot,MagnetNearestFarm.holdPosition)
                     end
                     playerRoot.Velocity=Vector3.new(0,0,0)
                     playerRoot.AssemblyLinearVelocity=Vector3.new(0,0,0)
@@ -1000,16 +1003,16 @@ do
                     if distance>0.01 then
                         local maxStep=MAGNET_FARM_TWEEN_SPEED*math.min(deltaTime,0.1)
                         local alpha=math.min(maxStep/distance,1)
-                        playerRoot.Position=Vector3.new(
+                        setPos(playerRoot,Vector3.new(
                             currentPosition.X+dx*alpha,
                             currentPosition.Y+dy*alpha,
                             currentPosition.Z+dz*alpha
-                        )
+                        ))
                     end
 
                     if MagnetSettings.farmMode=="enemy" and MagnetNearestFarm.target==targetModel
                         and not MagnetNearestFarm.attacking and distance<=1.5 then
-                        playerRoot.Position=targetPosition
+                        setPos(playerRoot,targetPosition)
                         MagnetNearestFarm.attacking=true
                         MagnetNearestFarm.attackEnds=now+MAGNET_NEAREST_ATTACK_TIME
                         MagnetNearestFarm.holdPosition=targetPosition

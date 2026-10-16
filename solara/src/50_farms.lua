@@ -354,6 +354,7 @@ task.spawn(function()
                         end
                     end
                 end
+                autoFruitFound=bestPart~=nil
                 if bestPart then
 
                     S.fruitPriorityActive=true
@@ -362,10 +363,9 @@ task.spawn(function()
                     local okTarget, fruitPos=pcall(function() return bestPart.Position end)
                     local arrived=false
                     if okTarget and fruitPos and fruitPos.X and fruitPos.Y and fruitPos.Z then
-                        tweenTo(hrp, Vector3.new(fruitPos.X,fruitPos.Y+3,fruitPos.Z), S.FRUIT_SPEED, function()
+                        arrived=tweenTo(hrp, Vector3.new(fruitPos.X,fruitPos.Y+3,fruitPos.Z), S.FRUIT_SPEED, function()
                             return S.autoFruits and partStillThere(bestPart)
-                        end)
-                        arrived=true
+                        end)==true
                     end
 
                     if arrived and S.autoFruits then
@@ -386,7 +386,8 @@ task.spawn(function()
             -- Always release the priority lock, even when the step failed.
             S.fruitPriorityActive=false
             if not okStep then warnThrottled("fruitFarm","[laced.club] Fruit farm step failed: "..tostring(stepError),15) end
-            task.wait(0.1)
+            -- Nothing spawned: rescan the Workspace once a second, not at 10 Hz.
+            task.wait(autoFruitFound and 0.1 or 1)
         else
             task.wait(0.1)
         end
@@ -588,23 +589,23 @@ function afl_jitterClick(x, y)
     x=math.floor((tonumber(x) or 0)+0.5); y=math.floor((tonumber(y) or 0)+0.5)
 
     mousemoveabs(x,y)
-    wait(0.05)
+    task.wait(0.05)
     for _=1,12 do
         local okPos,mx,my=pcall(function() return mouse.X,mouse.Y end)
         if not okPos or not mx or not my then return false end
         local dx=math.floor(x-mx+0.5); local dy=math.floor(y-my+0.5)
         if math.abs(dx)<=2 and math.abs(dy)<=2 then break end
         mousemoverel(dx,dy)
-        wait(0.03)
+        task.wait(0.03)
     end
 
-    mousemoverel(3,0); wait(0.03)
-    mousemoverel(-3,3); wait(0.03)
-    mousemoverel(0,-3); wait(0.03)
+    mousemoverel(3,0); task.wait(0.03)
+    mousemoverel(-3,3); task.wait(0.03)
+    mousemoverel(0,-3); task.wait(0.03)
 
     local okFinal,mx,my=pcall(function() return mouse.X,mouse.Y end)
     if okFinal and mx and my then mousemoverel(math.floor(x-mx+0.5),math.floor(y-my+0.5)) end
-    wait(0.1)
+    task.wait(0.1)
     return true
 end
 
@@ -785,7 +786,7 @@ function afl_waitDialogueOption(optionNumber,timeout,notAddress)
             local address=instKey(object)
             if not notAddress or not address or address~=notAddress then return object,center end
         end
-        wait(0.05)
+        task.wait(0.15) -- each poll walks DialogueGui:GetDescendants()
     end
     return lastObject,lastCenter
 end

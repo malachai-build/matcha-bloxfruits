@@ -73,17 +73,18 @@ if type(solaraDiag)=="function" then solaraDiag("core entered") end
 -- ---------------------------------------------------------------------------
 clock = (type(os) == "table" and type(os.clock) == "function") and os.clock or tick
 
--- task.wait() with no argument resumes about 2,400 times a second in Matcha
--- (measured live), not once per frame, so every bare-wait loop spun (and wrote
--- CFrame/Position) at that rate. frameWait() yields one 60 Hz frame instead.
+-- Solara runs on Roblox's scheduler: task.wait() yields exactly one frame.
+-- task.wait(1/60) resumes on the first Heartbeat AFTER 16.7 ms, which with
+-- normal frame jitter is often the second frame (an accidental 30 Hz).
+-- FRAME_TIME stays as the nominal frame length for rate arithmetic.
 FRAME_TIME = 1 / 60
-function frameWait() task.wait(FRAME_TIME) end
+function frameWait() task.wait() end
 -- Idle cadence for loops whose feature is off: about 30 loops used to wake at
 -- 60 Hz with every toggle off (~1,800 resumes/s). idleWait(active) yields one
 -- frame while the feature is on and IDLE_POLL s while it is off.
 IDLE_POLL = 0.25
 function idleWait(active)
-    if active then task.wait(FRAME_TIME) else task.wait(IDLE_POLL) end
+    if active then task.wait() else task.wait(IDLE_POLL) end
 end
 -- True unless Matcha says Roblox is not the foreground window. Synthetic keys
 -- and clicks go to whatever window has focus, so every input path checks it.
@@ -110,7 +111,7 @@ end
 Players = game:GetService("Players")
 LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    repeat wait(0.1); LocalPlayer = Players.LocalPlayer until LocalPlayer
+    repeat task.wait(0.1); LocalPlayer = Players.LocalPlayer until LocalPlayer
 end
 if type(solaraDiag)=="function" then solaraDiag("core player ready") end
 
@@ -282,7 +283,7 @@ function safeRemote(tag, remote, method, ...)
     end
     RemoteFailures[tag] = (RemoteFailures[tag] or 0) + 1
     warnThrottled("remote:" .. tag, "[laced.club] " .. tag .. " remote failed: " .. tostring(result)
-        .. " (FireServer/InvokeServer need Matcha Pro / Hybrid mode)", 15)
+        .. "", 15)
     return false, result
 end
 function remoteFailing(tag)
@@ -339,6 +340,15 @@ function remoteInvokePending()
     return runGate ~= nil and runGate.remoteInvokeBusy == true
 end
 
+-- Moves a part and everything jointed to it, keeping its rotation. Never
+-- write BasePart.Position on a jointed part in Solara: real Roblox then
+-- rewrites the Weld/Motor6D offsets instead of moving the assembly, so the
+-- root separates from the rig (fling, death, server correction).
+function setPos(part, position)
+    local cf = part.CFrame
+    part.CFrame = cf + (position - cf.Position)
+end
+
 function moveRoot(part, x, y, z, rotation)
     if not part then return false end
     if writesPaused() then return false end
@@ -355,13 +365,13 @@ function moveRoot(part, x, y, z, rotation)
         part.CFrame = rotation and (positionCF * rotation) or positionCF
     end)
     if okCFrame then return true end
-    return (pcall(function() part.Position = Vector3.new(x, y, z) end))
+    return (pcall(function() setPos(part, Vector3.new(x, y, z)) end))
 end
 
 function setPartPosition(part, position)
     if not part or not position then return false end
     if writesPaused() then return false end
-    return (pcall(function() part.Position = position end))
+    return (pcall(setPos, part, position))
 end
 
 local function nearZeroVector(v)
@@ -401,9 +411,9 @@ function placeRoot(part, x, y, z, rotation)
         local positionCF = CFrame.new(x, y, z)
         part.CFrame = rotation and (positionCF * rotation) or positionCF
     end)
-    if not okCFrame and not pcall(function() part.Position = Vector3.new(x, y, z) end) then return false end
-    pcall(function() part.Velocity = Vector3.new(0, 0, 0) end)
-    pcall(function() part.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    if not okCFrame and not pcall(function() setPos(part, Vector3.new(x, y, z)) end) then return false end
+    -- AssemblyLinearVelocity covers the deprecated Velocity in Solara.
+    pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
     return true
 end
 
@@ -448,13 +458,53 @@ function rootTweenOwned()
     return ROOT_OWNER.token ~= nil and clock() - ROOT_OWNER.at < ROOT_OWNER_TTL
 end
 
+-- Write-through Drawing cache (Solara). Every Drawing property write crosses
+-- into Solara's renderer, and the UE menu re-writes Position/Size/Color/
+-- Visible/Text of every object on every 16 ms frame, mostly with the value
+-- already set. The proxy forwards a write only when the value changed, and
+-- turns writes and reads on a removed object into no-ops (writing to a removed
+-- Drawing is a known Solara crash). Drawing.Fonts and every other field of the
+-- real library are passed through.
+do
+    local RealDrawing = Drawing
+    local function wrapDrawing(object)
+        local cache = {}
+        local removed = false
+        local function remove()
+            if removed then return end
+            removed = true
+            pcall(function() object.Visible = false end)
+            pcall(function() object:Remove() end)
+        end
+        return setmetatable({}, {
+            __index = function(_, key)
+                if key == "Remove" or key == "Destroy" then return remove end
+                if removed then return nil end
+                local value = cache[key]
+                if value ~= nil then return value end
+                return object[key]
+            end,
+            __newindex = function(_, key, value)
+                if removed or (value ~= nil and cache[key] == value) then return end
+                object[key] = value
+                cache[key] = value
+            end,
+        })
+    end
+    if type(RealDrawing) == "table" or type(RealDrawing) == "userdata" then
+        CachedDrawing = setmetatable({
+            new = function(kind) return wrapDrawing(RealDrawing.new(kind)) end,
+        }, { __index = RealDrawing })
+    end
+end
+
 -- Drawing helpers: every object is created, updated and removed defensively.
 function setProp(object, key, value)
     if object then pcall(function() object[key] = value end) end
 end
 
 function newDrawing(kind, props)
-    local okNew, object = pcall(function() return Drawing.new(kind) end)
+    local okNew, object = pcall(function() return (CachedDrawing or Drawing).new(kind) end)
     if not okNew or not object then return nil end
     for key, value in pairs(props or {}) do setProp(object, key, value) end
     return object
@@ -1224,16 +1274,19 @@ function loadUEAdapter()
     local mousePositionReads
     ueSource, mousePositionReads = string.gsub(
         ueSource,
-        "Vector2%.new%(Mouse%.X, Mouse%.Y%)",
+        "Vector2%.new%(%s*Mouse%.X%s*,%s*Mouse%.Y%s*%)",
         'game:GetService("UserInputService"):GetMouseLocation()'
     )
-    assert(mousePositionReads == 3,
-        "UE mouse-coordinate patch expected 3 reads, got " .. tostring(mousePositionReads))
+    assert(mousePositionReads >= 1,
+        "UE mouse-coordinate patch found no Mouse.X/Mouse.Y reads (upstream library changed)")
+    -- Route UE's Drawing.new through the write cache (00_core CachedDrawing):
+    -- the menu re-writes every property of every object each frame.
+    ueSource = "local Drawing = CachedDrawing or Drawing; " .. ueSource
     if type(solaraDiag)=="function" then solaraDiag("UE mouse patch ready") end
 
     local previousUE = findExposedUE()
-    local ueChunk = loadstring(ueSource, "laced.club UE")
-    assert(type(ueChunk) == "function", "UE compile failed")
+    local ueChunk, compileError = loadstring(ueSource, "laced.club UE")
+    assert(type(ueChunk) == "function", "UE compile failed: " .. tostring(compileError))
     if type(solaraDiag)=="function" then solaraDiag("UE execution begin") end
     ueChunk()
     if type(solaraDiag)=="function" then solaraDiag("UE execution end") end
@@ -2121,7 +2174,7 @@ do
 
                 if playerRoot and MagnetSettings.farmMode=="enemy" and MagnetNearestFarm.attacking then
                     if MagnetNearestFarm.holdPosition then
-                        playerRoot.Position=MagnetNearestFarm.holdPosition
+                        setPos(playerRoot,MagnetNearestFarm.holdPosition)
                     end
                     playerRoot.Velocity=Vector3.new(0,0,0)
                     playerRoot.AssemblyLinearVelocity=Vector3.new(0,0,0)
@@ -2150,16 +2203,16 @@ do
                     if distance>0.01 then
                         local maxStep=MAGNET_FARM_TWEEN_SPEED*math.min(deltaTime,0.1)
                         local alpha=math.min(maxStep/distance,1)
-                        playerRoot.Position=Vector3.new(
+                        setPos(playerRoot,Vector3.new(
                             currentPosition.X+dx*alpha,
                             currentPosition.Y+dy*alpha,
                             currentPosition.Z+dz*alpha
-                        )
+                        ))
                     end
 
                     if MagnetSettings.farmMode=="enemy" and MagnetNearestFarm.target==targetModel
                         and not MagnetNearestFarm.attacking and distance<=1.5 then
-                        playerRoot.Position=targetPosition
+                        setPos(playerRoot,targetPosition)
                         MagnetNearestFarm.attacking=true
                         MagnetNearestFarm.attackEnds=now+MAGNET_NEAREST_ATTACK_TIME
                         MagnetNearestFarm.holdPosition=targetPosition
@@ -2797,14 +2850,10 @@ function findBoatVehicleSeat(boat)
     if not boat then return nil end
     local okDirect,directSeat=pcall(function() return boat:FindFirstChildOfClass("VehicleSeat") end)
     if okDirect and directSeat then return directSeat end
-    local okDescendants,descendants=pcall(function() return boat:GetDescendants() end)
-    if okDescendants and descendants then
-        for _,object in pairs(descendants) do
-            local okClass,className=pcall(function() return object.ClassName end)
-            if okClass and className=="VehicleSeat" then return object end
-        end
-    end
-    return nil
+    -- Recursive class search (real Roblox API in Solara) instead of a pcall per
+    -- descendant, which this ran every second for every boat.
+    local okDeep,deepSeat=pcall(function() return boat:FindFirstChildWhichIsA("VehicleSeat",true) end)
+    return okDeep and deepSeat or nil
 end
 
 function refreshBoatSeatList()
@@ -2972,7 +3021,7 @@ end
 task.spawn(function()
     pcall(refreshBoatSeatList)
     while alive() do
-        task.wait(1)
+        task.wait(2)
         local okRefresh,refreshError=pcall(refreshBoatSeatList)
         if not okRefresh then warnThrottled("boatSeats","[laced.club] Boat seat scan failed: "..tostring(refreshError),30) end
     end
@@ -3055,7 +3104,7 @@ task.spawn(function()
             if seat and char and hrp and humanoid and okSeat and seatParent and seatPos and not writesPaused()
                 and not isUsingSelectedBoatSeat(seat,char,humanoid,hrp) then
                 pcall(function()
-                    hrp.Position=Vector3.new(seatPos.X,seatPos.Y+2,seatPos.Z)
+                    setPos(hrp,Vector3.new(seatPos.X,seatPos.Y+2,seatPos.Z))
                     hrp.Velocity=Vector3.new(0,0,0)
                     hrp.AssemblyLinearVelocity=Vector3.new(0,0,0)
                 end)
@@ -3391,7 +3440,7 @@ function boatTweenTo(targetPos)
     if not okPrimary or not primary or not targetPos then finish(false); return end
     S.boatTweening=true
     local okRaise=pcall(function()
-        primary.Position=Vector3.new(primary.Position.X, primary.Position.Y+50, primary.Position.Z)
+        setPos(primary,Vector3.new(primary.Position.X, primary.Position.Y+50, primary.Position.Z))
     end)
     if not okRaise then finish(false); return end
     task.wait(0.1)
@@ -3415,7 +3464,7 @@ function boatTweenTo(targetPos)
         while writesPaused() and active() do local pausedAt=clock(); markTravel(); task.wait(0.05); t0=t0+(clock()-pausedAt) end
         local alpha=math.min((clock()-t0)/duration,1)
         local okMove=pcall(function()
-            primary.Position=Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha)
+            setPos(primary,Vector3.new(startX+dx*alpha, fixedY, startZ+dz*alpha))
         end)
         if not okMove then break end
         zeroVelocity(primary)
@@ -3442,7 +3491,7 @@ task.spawn(function()
         if keyDown(0x10) then my=my-S.boatFlySpeed end
         zeroVelocity(primary)
         pcall(function()
-            primary.Position=Vector3.new(primary.Position.X+mx, primary.Position.Y+my, primary.Position.Z+mz)
+            setPos(primary,Vector3.new(primary.Position.X+mx, primary.Position.Y+my, primary.Position.Z+mz))
         end)
     end
 end)
@@ -3676,7 +3725,7 @@ function buildEspLabels(fruits)
 end
 
 berryScanRunning=false
-BERRY_SCAN_BATCH=80
+BERRY_SCAN_BATCH=400 -- per frame; Solara runs native Luau (was 80, which made one scan take ~12 s)
 BERRY_DRAW_DISTANCE=10000
 BERRY_DRAW_DISTANCE_SQ=BERRY_DRAW_DISTANCE*BERRY_DRAW_DISTANCE
 -- Stability pass (Oct 15 2026): the scan walks the whole Workspace tree and
@@ -3685,7 +3734,7 @@ BERRY_DRAW_DISTANCE_SQ=BERRY_DRAW_DISTANCE*BERRY_DRAW_DISTANCE
 -- BERRY_RESCAN_INTERVAL s (the toggle forces one at once), skips the
 -- top-level folders that never hold map berries, and stops expanding after
 -- BERRY_SCAN_MAX_OBJECTS objects.
-BERRY_RESCAN_INTERVAL=15
+BERRY_RESCAN_INTERVAL=45
 BERRY_SCAN_MAX_OBJECTS=60000
 BERRY_SCAN_SKIP_ROOTS={Enemies=true,Characters=true,Camera=true,Boats=true,ChestModels=true}
 berryNextScanAt=0
@@ -3832,6 +3881,9 @@ function buildBerryEspLabels(force)
 end
 
 TWEEN_STEP_TIME=FRAME_TIME -- one CFrame write per frame (was 0.01 before the stability pass); safe mode doubles it
+MOVEMENT_FAULT_LIMIT=5
+MOVEMENT_FAULT_WINDOW=20
+MOVEMENT_FAULTS={count=0,at=-1e9}
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
 -- target was reached, false when stopped (checkFn false, part gone, unload,
@@ -3900,10 +3952,22 @@ function tweenTo(hrp, targetPos, speed, checkFn, rotationOverride)
     if type(solaraDiag)=="function" then
         solaraDiag("tween begin distance=" .. math.floor(distance) .. " speed=" .. math.floor(moveSpeed),"tween-begin",1)
     end
+    -- A fault stops this tween only; the caller backs off and retries. Solara's
+    -- isnetworkowner is briefly false while seated or just after a respawn,
+    -- and one rubber-band used to unload every feature. Only a run of
+    -- MOVEMENT_FAULT_LIMIT faults within MOVEMENT_FAULT_WINDOW s unloads.
     local function movementFault(reason)
-        if type(solaraDiag)=="function" then solaraDiag("movement fault: " .. reason) end
-        warn("[laced.club / Solara] Travel stopped: " .. reason .. ". Unloading automation to avoid repeated snapback and death.")
-        if type(shutdownScript)=="function" then pcall(shutdownScript,"movement") end
+        if type(solaraDiag)=="function" then solaraDiag("movement fault: " .. reason,"movement-fault",1) end
+        local now=clock()
+        if now-MOVEMENT_FAULTS.at>MOVEMENT_FAULT_WINDOW then MOVEMENT_FAULTS.count=0 end
+        MOVEMENT_FAULTS.at=now
+        MOVEMENT_FAULTS.count=MOVEMENT_FAULTS.count+1
+        if MOVEMENT_FAULTS.count>=MOVEMENT_FAULT_LIMIT then
+            warn("[laced.club / Solara] Travel stopped repeatedly (" .. reason .. "). Unloading automation to avoid repeated snapback and death.")
+            if type(shutdownScript)=="function" then pcall(shutdownScript,"movement") end
+        else
+            warnThrottled("movementFault","[laced.club / Solara] Travel stopped: " .. reason,5)
+        end
     end
     local function ownsPhysics(part)
         if not isLocalRoot or type(isnetworkowner)~="function" then return true end
@@ -4028,7 +4092,7 @@ function tweenTo(hrp, targetPos, speed, checkFn, rotationOverride)
                     end
                     return finish(true)
                 end
-                task.wait(step)
+                if step<=FRAME_TIME then frameWait() else task.wait(step) end
             elseif not writesPaused() then
                 return finish(false) -- the root left the DataModel
             end
@@ -4480,15 +4544,25 @@ end
 -- Head hitbox expansion shared by every click-farm loop. Remembers the
 -- original size so it can be restored when the fight ends.
 HEAD_APPLY_INTERVAL = 0.25
+-- Original head size/collision per head Instance, recorded once. Back-to-back
+-- farmAttack calls on the same NPC used to record the already-enlarged head
+-- as the "original" (the previous expander restores one frame later), so the
+-- head stayed enlarged and two threads fought over its Size.
+HEAD_ORIGINALS=setmetatable({}, {__mode="k"})
 function headExpander(model)
     local state={head=nil,size=nil,canCollide=nil,nextApply=0}
     local okHead,head=pcall(function() return model:FindFirstChild("Head") end)
     if okHead and head then
         state.head=head
-        pcall(function()
-            state.size=head.Size
-            state.canCollide=head.CanCollide
-        end)
+        local original=HEAD_ORIGINALS[head]
+        if not original then
+            pcall(function() original={size=head.Size,canCollide=head.CanCollide} end)
+            HEAD_ORIGINALS[head]=original
+        end
+        if original then
+            state.size=original.size
+            state.canCollide=original.canCollide
+        end
     end
     -- A dying enemy is destroyed shortly after its Humanoid reaches 0 HP: no
     -- write may race that destroy.
@@ -4593,10 +4667,11 @@ function farmAttack(hrp, checkFn, enemyName, useTween, maxDistance, attackFn, at
         if now-lastClick>=hitDelay then
             lastClick=now
             if attackFn then
-                -- Matcha's task.spawn forwards no arguments: attackFn used to
-                -- get nil and hit the first enemy in range, not this target.
-                local target=nearest
-                task.spawn(function() attackFn(target) end)
+                -- Called inline: basicAttack/remoteAttack do not yield for
+                -- long, and a task.spawn per swing (20/s per fight) piled up
+                -- threads whenever an attack did yield.
+                local okAttack,attackError=pcall(attackFn,nearest)
+                if not okAttack then warnThrottled("farmAttack","[laced.club] attack failed: "..tostring(attackError),15) end
             else
                 farmClick()
             end
@@ -5049,8 +5124,8 @@ do
                             if now-lastAttack>=attackDelay then
                                 lastAttack=now
                                 if useRemote then
-                                    local swingTarget=target -- task.spawn forwards no arguments
-                                    task.spawn(function() remoteAttack(swingTarget) end)
+                                    -- Inline (was a task.spawn per swing, 20/s).
+                                    pcall(remoteAttack,target)
                                 else farmClick() end
                             end
                             frameWait()
@@ -5467,6 +5542,7 @@ task.spawn(function()
                         end
                     end
                 end
+                autoFruitFound=bestPart~=nil
                 if bestPart then
 
                     S.fruitPriorityActive=true
@@ -5475,10 +5551,9 @@ task.spawn(function()
                     local okTarget, fruitPos=pcall(function() return bestPart.Position end)
                     local arrived=false
                     if okTarget and fruitPos and fruitPos.X and fruitPos.Y and fruitPos.Z then
-                        tweenTo(hrp, Vector3.new(fruitPos.X,fruitPos.Y+3,fruitPos.Z), S.FRUIT_SPEED, function()
+                        arrived=tweenTo(hrp, Vector3.new(fruitPos.X,fruitPos.Y+3,fruitPos.Z), S.FRUIT_SPEED, function()
                             return S.autoFruits and partStillThere(bestPart)
-                        end)
-                        arrived=true
+                        end)==true
                     end
 
                     if arrived and S.autoFruits then
@@ -5499,7 +5574,8 @@ task.spawn(function()
             -- Always release the priority lock, even when the step failed.
             S.fruitPriorityActive=false
             if not okStep then warnThrottled("fruitFarm","[laced.club] Fruit farm step failed: "..tostring(stepError),15) end
-            task.wait(0.1)
+            -- Nothing spawned: rescan the Workspace once a second, not at 10 Hz.
+            task.wait(autoFruitFound and 0.1 or 1)
         else
             task.wait(0.1)
         end
@@ -5701,23 +5777,23 @@ function afl_jitterClick(x, y)
     x=math.floor((tonumber(x) or 0)+0.5); y=math.floor((tonumber(y) or 0)+0.5)
 
     mousemoveabs(x,y)
-    wait(0.05)
+    task.wait(0.05)
     for _=1,12 do
         local okPos,mx,my=pcall(function() return mouse.X,mouse.Y end)
         if not okPos or not mx or not my then return false end
         local dx=math.floor(x-mx+0.5); local dy=math.floor(y-my+0.5)
         if math.abs(dx)<=2 and math.abs(dy)<=2 then break end
         mousemoverel(dx,dy)
-        wait(0.03)
+        task.wait(0.03)
     end
 
-    mousemoverel(3,0); wait(0.03)
-    mousemoverel(-3,3); wait(0.03)
-    mousemoverel(0,-3); wait(0.03)
+    mousemoverel(3,0); task.wait(0.03)
+    mousemoverel(-3,3); task.wait(0.03)
+    mousemoverel(0,-3); task.wait(0.03)
 
     local okFinal,mx,my=pcall(function() return mouse.X,mouse.Y end)
     if okFinal and mx and my then mousemoverel(math.floor(x-mx+0.5),math.floor(y-my+0.5)) end
-    wait(0.1)
+    task.wait(0.1)
     return true
 end
 
@@ -5898,7 +5974,7 @@ function afl_waitDialogueOption(optionNumber,timeout,notAddress)
             local address=instKey(object)
             if not notAddress or not address or address~=notAddress then return object,center end
         end
-        wait(0.05)
+        task.wait(0.15) -- each poll walks DialogueGui:GetDescendants()
     end
     return lastObject,lastCenter
 end
@@ -5928,7 +6004,8 @@ function afl_clickDialogueOption(optionNumber,timeout,notAddress)
     local object,center=afl_waitDialogueOption(optionNumber,timeout,notAddress)
     if not object or not center then return false,nil end
     if not afl_jitterClick(center.X+AFL_QUEST_OFFSET_X,center.Y+AFL_QUEST_OFFSET_Y) then return false,nil end
-    mouse1press(); wait(0.1); mouse1release()
+    if menuUnderMouse() then return false end -- never click the open menu
+    mouse1press(); task.wait(0.1); mouse1release()
     local address=instKey(object)
     return true,address
 end
@@ -6111,7 +6188,7 @@ function afl_setQuest()
         local okRemote,reason=afl_acceptQuestRemote()
         if okRemote then
             AFL.lastQuestVia="remote"
-            wait(0.3)
+            task.wait(0.3)
             return true
         end
         warnThrottled("questRemote","[laced.club] Remote quest accept failed ("..tostring(reason).."); clicking the dialogue instead",30)
@@ -6125,10 +6202,11 @@ function afl_setQuest()
         return false
     end
 
-    wait(0.5)
+    task.wait(0.5)
     if not stillOn() then return false end
-    mouse1press(); wait(0.08); mouse1release()
-    wait(1)
+    if menuUnderMouse() then return false end -- never click the open menu
+    mouse1press(); task.wait(0.08); mouse1release()
+    task.wait(1)
     if not stillOn() then return false end
 
     local originalOption1=nil
@@ -6137,12 +6215,12 @@ function afl_setQuest()
 
     local selected=afl_clickDialogueOption(quest.questButton,3)
     if not selected then return false end
-    wait(0.35)
+    task.wait(0.35)
     if not stillOn() then return false end
 
     local accepted=afl_clickDialogueOption(1,3,originalOption1)
     if not accepted then
-        wait(0.4)
+        task.wait(0.4)
         accepted=afl_clickDialogueOption(1,1)
     end
     return accepted==true
@@ -6189,7 +6267,7 @@ end
 function afl_farmNpcs()
     local kills=0
     afl_getLevels()
-    if not AFL.npcToFarm then wait(1); return end
+    if not AFL.npcToFarm then task.wait(1); return end
     local function pressNevermind()
         afl_clickDialogueOption(3,1)
     end
@@ -6200,10 +6278,10 @@ function afl_farmNpcs()
     local function goGetQuest()
         afl_teleportTo(AFL.islandPositions[AFL.npcToFarm])
         if not farming() then return end
-        wait(0.5); afl_setQuest()
+        task.wait(0.5); afl_setQuest()
         if not farming() then return end
-        wait(0.5)
-        afl_teleportToWait(AFL.npcToFarm); wait(0.5)
+        task.wait(0.5)
+        afl_teleportToWait(AFL.npcToFarm); task.wait(0.5)
     end
     if farmPriorityBlocked() then return end
     if AFL.islandPositions[AFL.npcToFarm] and AFL.waitPositions[AFL.npcToFarm] then
@@ -6211,7 +6289,7 @@ function afl_farmNpcs()
         goGetQuest()
     end
     while alive() and S.autoFarmLevel do
-        if farmPriorityBlocked() then wait(0.1); continue end
+        if farmPriorityBlocked() then task.wait(0.1); continue end
         local curLevel=afl_readLevel()
         if curLevel and curLevel~=AFL.lastLevel then
             AFL.lastLevel=curLevel; local old=AFL.npcToFarm; afl_getLevels()
@@ -6240,17 +6318,17 @@ function afl_farmNpcs()
             repeat
                 AFL.selectedNpc=afl_getNextNpc(); attempts=attempts+1
                 if AFL.selectedNpc then break end
-                wait(0.05)
+                task.wait(0.05)
             until attempts>15
             if not AFL.selectedNpc then
                 if AFL.waitPositions[AFL.npcToFarm] then afl_teleportToWait(AFL.npcToFarm) end
-                wait(0.5); continue
+                task.wait(0.5); continue
             end
         end
         local npc=AFL.selectedNpc
         local hrp=npc:FindFirstChild("HumanoidRootPart")
         local hum=npc:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health<=0 then AFL.selectedNpc=nil; wait(0.05); continue end
+        if not hrp or not hum or hum.Health<=0 then AFL.selectedNpc=nil; task.wait(0.05); continue end
         local fightStart=clock()
         local lastClick=0
         local lastRemoteAttack=0
@@ -6313,10 +6391,10 @@ task.spawn(function()
             AFL.nextNpcCache=nil
             if not ok then
                 warnThrottled("levelFarm","[laced.club] Level farm error: "..tostring(farmError),15)
-                wait(0.5)
+                task.wait(0.5)
             end
         end
-        wait(0.5)
+        task.wait(0.5)
     end
 end)
 
@@ -6843,7 +6921,7 @@ function afq_farming()
 end
 
 -- Sleep up to seconds, in steps of at most 0.25 s, ending early when the
--- farm stops (a plain wait(60) would keep the step alive after toggle off).
+-- farm stops (a plain task.wait(60) would keep the step alive after toggle off).
 function afq_sleep(seconds)
     local untilAt=clock()+(tonumber(seconds) or 0)
     repeat
@@ -6998,19 +7076,20 @@ end
 -- verifies it through the tracker showing the new quest.
 function afq_acceptByDialogue(q)
     if not robloxFocused() then return false,"the dialogue accept needs the Roblox window in front" end
-    wait(0.5)
+    task.wait(0.5)
     if not afq_farming() then return false,"stopped" end
-    mouse1press(); wait(0.08); mouse1release()
-    wait(1)
+    if menuUnderMouse() then return false end -- never click the open menu
+    mouse1press(); task.wait(0.08); mouse1release()
+    task.wait(1)
     if not afq_farming() then return false,"stopped" end
     local original=nil
     local first=afl_waitDialogueOption(1,3)
     if first then original=instKey(first) end
     if not afl_clickDialogueOption(q.questIndex,3) then return false,"quest option "..q.questIndex.." not found in the dialogue" end
-    wait(0.35)
+    task.wait(0.35)
     if not afq_farming() then return false,"stopped" end
     local accepted=afl_clickDialogueOption(1,3,original)
-    if not accepted then wait(0.4); accepted=afl_clickDialogueOption(1,1) end
+    if not accepted then task.wait(0.4); accepted=afl_clickDialogueOption(1,1) end
     if not accepted then return false,"accept option not found in the dialogue" end
     return true
 end
@@ -7234,11 +7313,11 @@ end
 function afq_step()
     AFQ_DEBUG.phase="select"
     local level=afq_level()
-    if not level then AFQ.status="level unknown"; afq_updateLabel(); wait(1); return end
+    if not level then AFQ.status="level unknown"; afq_updateLabel(); task.wait(1); return end
     local q,skipped=afq_select(level)
     if not q then
         AFQ.status="Lv "..level..": no quest with a known giver position in sea "..tostring(AFL.currentSea)
-        afq_updateLabel(); wait(2); return
+        afq_updateLabel(); task.wait(2); return
     end
     local warnText=skipped and (" [no giver position for "..skipped.giverKey.."]") or ""
     -- Quest switch: the selection (level-up, forceLevel, boss toggle) differs
@@ -7263,7 +7342,7 @@ function afq_step()
                 q=AFQ.entry
             else
                 AFQ.status="Lv "..level..": quest switch cooldown ("..math.ceil(left).."s)"
-                afq_updateLabel(); wait(0.5); return
+                afq_updateLabel(); task.wait(0.5); return
             end
         elseif afq_remoteQuestOff() then
             -- Remote quest accept off (the default): no AbandonQuest. The
@@ -7517,7 +7596,7 @@ function afq_step()
         AFQ_DEBUG.phase="after-wait"
         return
     end
-    if AFQ_DEBUG.noFight then AFQ_DEBUG.phase="nofight-idle"; setStatus(" (fight disabled)"); wait(0.5); return end
+    if AFQ_DEBUG.noFight then AFQ_DEBUG.phase="nofight-idle"; setStatus(" (fight disabled)"); task.wait(0.5); return end
     AFQ_DEBUG.phase="scan"
     if AFQ.selectedNpc then
         local okName,npcName=pcall(function() return string.lower(AFQ.selectedNpc.Name) end)
@@ -7535,7 +7614,7 @@ function afq_step()
         repeat
             AFQ.selectedNpc=afq_nearestEnemy(q); attempts=attempts+1
             if AFQ.selectedNpc then break end
-            if scanPos then afq_holdAt(scanPos,0.05) else wait(0.05) end
+            if scanPos then afq_holdAt(scanPos,0.05) else task.wait(0.05) end
         until attempts>15 or not afq_farming()
         if not AFQ.selectedNpc then
             setStatus(" waiting for spawn")
@@ -7555,7 +7634,7 @@ function afq_step()
             end
             -- 0.25 s (was 0.5): the next step scans again, so a spawn is seen
             -- at 4 Hz or better while waiting.
-            if arrived and spot then afq_holdAt(spot,0.25) else wait(0.25) end
+            if arrived and spot then afq_holdAt(spot,0.25) else task.wait(0.25) end
             return
         end
     end
@@ -7586,7 +7665,7 @@ task.spawn(function()
             if AFQ.activeHead then pcall(AFQ.activeHead.restore); AFQ.activeHead=nil end
             if not ok then
                 warnThrottled("questFarm","[laced.club] Auto Farm Quest error: "..tostring(stepError),15)
-                wait(0.5)
+                task.wait(0.5)
             end
         elseif AFQ.activeHead then
             pcall(AFQ.activeHead.restore); AFQ.activeHead=nil
@@ -7680,6 +7759,7 @@ if LACED_LOAD and type(LACED_LOAD.started) == "table" then LACED_LOAD.started["7
 local alive = alive
 local SCRIPT_STATE = SCRIPT_STATE
 local S = S
+local PVP_COLLIDE_THREADS=setmetatable({}, {__mode="k"})
 function localRoot()
     local char=LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart") or nil
@@ -7705,7 +7785,7 @@ function doPullLoop(flag, getPoint)
                                 local hrp=model:FindFirstChild("HumanoidRootPart")
                                 if hrp then
                                     if hrp.CanCollide~=false then hrp.CanCollide=false end
-                                    hrp.Position=pullPoint
+                                    setPos(hrp,pullPoint)
                                 end
                             end
                         end)
@@ -7812,7 +7892,7 @@ task.spawn(function()
                     pcall(function()
                         local hrp=model:FindFirstChild("HumanoidRootPart")
                         if hrp then
-                            hrp.Position=frozen.position
+                            setPos(hrp,frozen.position)
                             zeroVelocity(hrp)
                         end
                     end)
@@ -8140,7 +8220,7 @@ task.spawn(function()
         if S.voidPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
-                pcall(function() hrp.Position=Vector3.new(hrp.Position.X,100000,hrp.Position.Z) end)
+                pcall(setPos,hrp,Vector3.new(hrp.Position.X,100000,hrp.Position.Z))
                 zeroVelocity(hrp)
             end
         end
@@ -8153,7 +8233,7 @@ task.spawn(function()
         if S.skyPull and not writesPaused() and not rootTweenOwned() then
             local hrp=localRoot()
             if hrp then
-                pcall(function() hrp.Position=Vector3.new(hrp.Position.X,1000,hrp.Position.Z) end)
+                pcall(setPos,hrp,Vector3.new(hrp.Position.X,1000,hrp.Position.Z))
                 zeroVelocity(hrp)
             end
         end
@@ -8219,6 +8299,10 @@ task.spawn(function()
                     local enemyRootPart=target:FindFirstChild("HumanoidRootPart")
                     if enemyRootPart then
                         local function engaged() return alive() and S.pvpFarmLoop and not isPvpTargetDead(target) end
+                        -- One CanCollide thread per target (a new one used to be
+                        -- spawned every pass and they piled up on long fights).
+                        if not PVP_COLLIDE_THREADS[target] then
+                        PVP_COLLIDE_THREADS[target]=true
                         task.spawn(function()
                             while engaged() do
                                 pcall(function()
@@ -8229,7 +8313,9 @@ task.spawn(function()
                                 end)
                                 frameWait()
                             end
+                            PVP_COLLIDE_THREADS[target]=nil
                         end)
+                        end
                         local startX=myHrp.Position.X; local startY=myHrp.Position.Y; local startZ=myHrp.Position.Z
                         local tx=enemyRootPart.Position.X+20; local ty=enemyRootPart.Position.Y; local tz=enemyRootPart.Position.Z
                         local dx=tx-startX; local dy=ty-startY; local dz=tz-startZ
@@ -8255,7 +8341,7 @@ task.spawn(function()
                             local savedX=myHrp.Position.X; local savedZ=myHrp.Position.Z
                             local upStart=clock()
                             while clock()-upStart<5 and engaged() do
-                                setPartPosition(myHrp,Vector3.new(savedX,10000000,savedZ))
+                                setPartPosition(myHrp,Vector3.new(savedX,50000,savedZ)) -- was 1e7: far past float precision
                                 zeroVelocity(myHrp)
                                 task.wait(0.1)
                             end
@@ -8513,6 +8599,8 @@ do
     }
 
     local function fish_hold()
+        -- Alt-tabbed while held: release, or M1 stays down in the other window.
+        if FishState.IsHolding and not robloxFocused() then FishState.IsHolding=false; pcall(mouse1release); return end
         if not FishState.IsHolding and robloxFocused() and not menuUnderMouse() then FishState.IsHolding=true; pcall(mouse1press); FishState.Clicks=FishState.Clicks+1 end
     end
     local function fish_release()
@@ -8634,7 +8722,9 @@ do
                         ending=false; wasOpen=false
                     end
                 else
-                    if not FishState.IsHolding then fish_click(); task.wait(0.1) end
+                    -- Cast frame gone (unequipped, died): never leave M1 held.
+                    if FishState.IsHolding then fish_release() end
+                    fish_click(); task.wait(0.1)
                 end
                 continue
             end
@@ -8751,9 +8841,18 @@ do
         end
     end
 
+    local REPAIR_HOLD_MAX=3 -- s; never leave M1 held longer than this
     local function repairHold()
-        if not RepairState.holding and robloxFocused() and not menuUnderMouse() then
+        if RepairState.holding then
+            if not robloxFocused() or clock()-RepairState.heldAt>REPAIR_HOLD_MAX then
+                RepairState.holding=false
+                pcall(mouse1release)
+            end
+            return
+        end
+        if robloxFocused() and not menuUnderMouse() then
             RepairState.holding=true
+            RepairState.heldAt=clock()
             pcall(mouse1press)
         end
     end
@@ -9134,7 +9233,7 @@ task.spawn(function()
     local boosting=false
     while alive() do
         local qPressed=keyDown(0x51)
-        local m1Pressed=ismouse1pressed()
+        local okM1,m1Pressed=pcall(ismouse1pressed); m1Pressed=okM1 and m1Pressed==true
         local now=clock()
 
         if S.soulGuitarM1Boost then
@@ -9172,7 +9271,7 @@ task.spawn(function()
     local wasM1Pressed=false
     local boosting=false
     while alive() do
-        local m1Pressed=ismouse1pressed()
+        local okM1,m1Pressed=pcall(ismouse1pressed); m1Pressed=okM1 and m1Pressed==true
         if S.diamondM1Boost and not m1Pressed and wasM1Pressed and not boosting then
             boosting=true
             task.spawn(function()
@@ -9484,6 +9583,10 @@ function safeObjectPosition(object)
         local okPrimaryPosition,primaryPosition=pcall(function() return primary.Position end)
         if okPrimaryPosition and primaryPosition then return primaryPosition end
     end
+    -- A Model's pivot (real Roblox API in Solara) instead of walking every
+    -- descendant: the Mirage island has no PrimaryPart and this ran per frame.
+    local okPivot,pivot=pcall(function() return object:GetPivot() end)
+    if okPivot and pivot then return pivot.Position end
     local okChildren,children=pcall(function() return object:GetDescendants() end)
     if okChildren and children then
         for _,child in pairs(children) do
@@ -9640,9 +9743,9 @@ task.spawn(function()
                 tweenTo(hrp,Vector3.new(position.X,position.Y+300,position.Z),S.FARM_SPEED,function()
                     return S.autoMirageTween and not S.fruitPriorityActive and findMirageObject()~=nil
                 end)
-                -- Once hovering above Mirage tweenTo returns at once; this loop used
-                -- to re-enter it without ever yielding.
-                frameWait()
+                -- Once hovering above Mirage tweenTo returns at once; re-check
+                -- at 5 Hz, not every frame.
+                task.wait(0.2)
             else
                 task.wait(0.35)
             end

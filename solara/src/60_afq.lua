@@ -17,7 +17,8 @@ function afl_clickDialogueOption(optionNumber,timeout,notAddress)
     local object,center=afl_waitDialogueOption(optionNumber,timeout,notAddress)
     if not object or not center then return false,nil end
     if not afl_jitterClick(center.X+AFL_QUEST_OFFSET_X,center.Y+AFL_QUEST_OFFSET_Y) then return false,nil end
-    mouse1press(); wait(0.1); mouse1release()
+    if menuUnderMouse() then return false end -- never click the open menu
+    mouse1press(); task.wait(0.1); mouse1release()
     local address=instKey(object)
     return true,address
 end
@@ -200,7 +201,7 @@ function afl_setQuest()
         local okRemote,reason=afl_acceptQuestRemote()
         if okRemote then
             AFL.lastQuestVia="remote"
-            wait(0.3)
+            task.wait(0.3)
             return true
         end
         warnThrottled("questRemote","[laced.club] Remote quest accept failed ("..tostring(reason).."); clicking the dialogue instead",30)
@@ -214,10 +215,11 @@ function afl_setQuest()
         return false
     end
 
-    wait(0.5)
+    task.wait(0.5)
     if not stillOn() then return false end
-    mouse1press(); wait(0.08); mouse1release()
-    wait(1)
+    if menuUnderMouse() then return false end -- never click the open menu
+    mouse1press(); task.wait(0.08); mouse1release()
+    task.wait(1)
     if not stillOn() then return false end
 
     local originalOption1=nil
@@ -226,12 +228,12 @@ function afl_setQuest()
 
     local selected=afl_clickDialogueOption(quest.questButton,3)
     if not selected then return false end
-    wait(0.35)
+    task.wait(0.35)
     if not stillOn() then return false end
 
     local accepted=afl_clickDialogueOption(1,3,originalOption1)
     if not accepted then
-        wait(0.4)
+        task.wait(0.4)
         accepted=afl_clickDialogueOption(1,1)
     end
     return accepted==true
@@ -278,7 +280,7 @@ end
 function afl_farmNpcs()
     local kills=0
     afl_getLevels()
-    if not AFL.npcToFarm then wait(1); return end
+    if not AFL.npcToFarm then task.wait(1); return end
     local function pressNevermind()
         afl_clickDialogueOption(3,1)
     end
@@ -289,10 +291,10 @@ function afl_farmNpcs()
     local function goGetQuest()
         afl_teleportTo(AFL.islandPositions[AFL.npcToFarm])
         if not farming() then return end
-        wait(0.5); afl_setQuest()
+        task.wait(0.5); afl_setQuest()
         if not farming() then return end
-        wait(0.5)
-        afl_teleportToWait(AFL.npcToFarm); wait(0.5)
+        task.wait(0.5)
+        afl_teleportToWait(AFL.npcToFarm); task.wait(0.5)
     end
     if farmPriorityBlocked() then return end
     if AFL.islandPositions[AFL.npcToFarm] and AFL.waitPositions[AFL.npcToFarm] then
@@ -300,7 +302,7 @@ function afl_farmNpcs()
         goGetQuest()
     end
     while alive() and S.autoFarmLevel do
-        if farmPriorityBlocked() then wait(0.1); continue end
+        if farmPriorityBlocked() then task.wait(0.1); continue end
         local curLevel=afl_readLevel()
         if curLevel and curLevel~=AFL.lastLevel then
             AFL.lastLevel=curLevel; local old=AFL.npcToFarm; afl_getLevels()
@@ -329,17 +331,17 @@ function afl_farmNpcs()
             repeat
                 AFL.selectedNpc=afl_getNextNpc(); attempts=attempts+1
                 if AFL.selectedNpc then break end
-                wait(0.05)
+                task.wait(0.05)
             until attempts>15
             if not AFL.selectedNpc then
                 if AFL.waitPositions[AFL.npcToFarm] then afl_teleportToWait(AFL.npcToFarm) end
-                wait(0.5); continue
+                task.wait(0.5); continue
             end
         end
         local npc=AFL.selectedNpc
         local hrp=npc:FindFirstChild("HumanoidRootPart")
         local hum=npc:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health<=0 then AFL.selectedNpc=nil; wait(0.05); continue end
+        if not hrp or not hum or hum.Health<=0 then AFL.selectedNpc=nil; task.wait(0.05); continue end
         local fightStart=clock()
         local lastClick=0
         local lastRemoteAttack=0
@@ -402,10 +404,10 @@ task.spawn(function()
             AFL.nextNpcCache=nil
             if not ok then
                 warnThrottled("levelFarm","[laced.club] Level farm error: "..tostring(farmError),15)
-                wait(0.5)
+                task.wait(0.5)
             end
         end
-        wait(0.5)
+        task.wait(0.5)
     end
 end)
 
@@ -932,7 +934,7 @@ function afq_farming()
 end
 
 -- Sleep up to seconds, in steps of at most 0.25 s, ending early when the
--- farm stops (a plain wait(60) would keep the step alive after toggle off).
+-- farm stops (a plain task.wait(60) would keep the step alive after toggle off).
 function afq_sleep(seconds)
     local untilAt=clock()+(tonumber(seconds) or 0)
     repeat
@@ -1087,19 +1089,20 @@ end
 -- verifies it through the tracker showing the new quest.
 function afq_acceptByDialogue(q)
     if not robloxFocused() then return false,"the dialogue accept needs the Roblox window in front" end
-    wait(0.5)
+    task.wait(0.5)
     if not afq_farming() then return false,"stopped" end
-    mouse1press(); wait(0.08); mouse1release()
-    wait(1)
+    if menuUnderMouse() then return false end -- never click the open menu
+    mouse1press(); task.wait(0.08); mouse1release()
+    task.wait(1)
     if not afq_farming() then return false,"stopped" end
     local original=nil
     local first=afl_waitDialogueOption(1,3)
     if first then original=instKey(first) end
     if not afl_clickDialogueOption(q.questIndex,3) then return false,"quest option "..q.questIndex.." not found in the dialogue" end
-    wait(0.35)
+    task.wait(0.35)
     if not afq_farming() then return false,"stopped" end
     local accepted=afl_clickDialogueOption(1,3,original)
-    if not accepted then wait(0.4); accepted=afl_clickDialogueOption(1,1) end
+    if not accepted then task.wait(0.4); accepted=afl_clickDialogueOption(1,1) end
     if not accepted then return false,"accept option not found in the dialogue" end
     return true
 end
@@ -1323,11 +1326,11 @@ end
 function afq_step()
     AFQ_DEBUG.phase="select"
     local level=afq_level()
-    if not level then AFQ.status="level unknown"; afq_updateLabel(); wait(1); return end
+    if not level then AFQ.status="level unknown"; afq_updateLabel(); task.wait(1); return end
     local q,skipped=afq_select(level)
     if not q then
         AFQ.status="Lv "..level..": no quest with a known giver position in sea "..tostring(AFL.currentSea)
-        afq_updateLabel(); wait(2); return
+        afq_updateLabel(); task.wait(2); return
     end
     local warnText=skipped and (" [no giver position for "..skipped.giverKey.."]") or ""
     -- Quest switch: the selection (level-up, forceLevel, boss toggle) differs
@@ -1352,7 +1355,7 @@ function afq_step()
                 q=AFQ.entry
             else
                 AFQ.status="Lv "..level..": quest switch cooldown ("..math.ceil(left).."s)"
-                afq_updateLabel(); wait(0.5); return
+                afq_updateLabel(); task.wait(0.5); return
             end
         elseif afq_remoteQuestOff() then
             -- Remote quest accept off (the default): no AbandonQuest. The
@@ -1606,7 +1609,7 @@ function afq_step()
         AFQ_DEBUG.phase="after-wait"
         return
     end
-    if AFQ_DEBUG.noFight then AFQ_DEBUG.phase="nofight-idle"; setStatus(" (fight disabled)"); wait(0.5); return end
+    if AFQ_DEBUG.noFight then AFQ_DEBUG.phase="nofight-idle"; setStatus(" (fight disabled)"); task.wait(0.5); return end
     AFQ_DEBUG.phase="scan"
     if AFQ.selectedNpc then
         local okName,npcName=pcall(function() return string.lower(AFQ.selectedNpc.Name) end)
@@ -1624,7 +1627,7 @@ function afq_step()
         repeat
             AFQ.selectedNpc=afq_nearestEnemy(q); attempts=attempts+1
             if AFQ.selectedNpc then break end
-            if scanPos then afq_holdAt(scanPos,0.05) else wait(0.05) end
+            if scanPos then afq_holdAt(scanPos,0.05) else task.wait(0.05) end
         until attempts>15 or not afq_farming()
         if not AFQ.selectedNpc then
             setStatus(" waiting for spawn")
@@ -1644,7 +1647,7 @@ function afq_step()
             end
             -- 0.25 s (was 0.5): the next step scans again, so a spawn is seen
             -- at 4 Hz or better while waiting.
-            if arrived and spot then afq_holdAt(spot,0.25) else wait(0.25) end
+            if arrived and spot then afq_holdAt(spot,0.25) else task.wait(0.25) end
             return
         end
     end
@@ -1675,7 +1678,7 @@ task.spawn(function()
             if AFQ.activeHead then pcall(AFQ.activeHead.restore); AFQ.activeHead=nil end
             if not ok then
                 warnThrottled("questFarm","[laced.club] Auto Farm Quest error: "..tostring(stepError),15)
-                wait(0.5)
+                task.wait(0.5)
             end
         elseif AFQ.activeHead then
             pcall(AFQ.activeHead.restore); AFQ.activeHead=nil

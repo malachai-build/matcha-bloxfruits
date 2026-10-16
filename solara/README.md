@@ -25,6 +25,9 @@ For local diagnosis, place the ten `src/` files in Solara's `laced_solara/src/` 
 - Removes Matcha-only `setrobloxinput` calls and uses `Instance:IsA` for class checks.
 - Runs the final keep-alive loop in a spawned task.
 - Patches the downloaded Drawing UI's mouse reads to use screen coordinates for clicks and dragging.
-- Lowers the default character tween speed to 100 studs/s and stops movement when local ownership is lost or Roblox corrects the character backward. Mastery and raid travel use the same checked tween.
+- Lowers the default character tween speed to 100 studs/s and stops a tween when local ownership is lost or Roblox corrects the character backward. Only 5 such faults within 20 s unload the automation. Mastery and raid travel use the same checked tween.
+- Moves parts with CFrame writes (`setPos`), never `BasePart.Position`: in real Roblox a Position write on a jointed part (character root, boat PrimaryPart) rewrites its joints instead of moving the assembly.
+- Routes every Drawing (the UE menu and the ESP) through a write cache that skips unchanged property writes and ignores writes to removed objects.
+- Uses `task.wait()` for per-frame loops (one frame in Solara) and `task.wait` instead of the deprecated `wait`.
 
 Rebuild `full.lua` after editing a chunk with `python build.py`. This build has passed static syntax checks; live Solara/Blox Fruits behavior still needs testing.

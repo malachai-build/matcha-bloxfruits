@@ -72,15 +72,25 @@ end
 -- Head hitbox expansion shared by every click-farm loop. Remembers the
 -- original size so it can be restored when the fight ends.
 HEAD_APPLY_INTERVAL = 0.25
+-- Original head size/collision per head Instance, recorded once. Back-to-back
+-- farmAttack calls on the same NPC used to record the already-enlarged head
+-- as the "original" (the previous expander restores one frame later), so the
+-- head stayed enlarged and two threads fought over its Size.
+HEAD_ORIGINALS=setmetatable({}, {__mode="k"})
 function headExpander(model)
     local state={head=nil,size=nil,canCollide=nil,nextApply=0}
     local okHead,head=pcall(function() return model:FindFirstChild("Head") end)
     if okHead and head then
         state.head=head
-        pcall(function()
-            state.size=head.Size
-            state.canCollide=head.CanCollide
-        end)
+        local original=HEAD_ORIGINALS[head]
+        if not original then
+            pcall(function() original={size=head.Size,canCollide=head.CanCollide} end)
+            HEAD_ORIGINALS[head]=original
+        end
+        if original then
+            state.size=original.size
+            state.canCollide=original.canCollide
+        end
     end
     -- A dying enemy is destroyed shortly after its Humanoid reaches 0 HP: no
     -- write may race that destroy.
@@ -185,10 +195,11 @@ function farmAttack(hrp, checkFn, enemyName, useTween, maxDistance, attackFn, at
         if now-lastClick>=hitDelay then
             lastClick=now
             if attackFn then
-                -- Matcha's task.spawn forwards no arguments: attackFn used to
-                -- get nil and hit the first enemy in range, not this target.
-                local target=nearest
-                task.spawn(function() attackFn(target) end)
+                -- Called inline: basicAttack/remoteAttack do not yield for
+                -- long, and a task.spawn per swing (20/s per fight) piled up
+                -- threads whenever an attack did yield.
+                local okAttack,attackError=pcall(attackFn,nearest)
+                if not okAttack then warnThrottled("farmAttack","[laced.club] attack failed: "..tostring(attackError),15) end
             else
                 farmClick()
             end
@@ -641,8 +652,8 @@ do
                             if now-lastAttack>=attackDelay then
                                 lastAttack=now
                                 if useRemote then
-                                    local swingTarget=target -- task.spawn forwards no arguments
-                                    task.spawn(function() remoteAttack(swingTarget) end)
+                                    -- Inline (was a task.spawn per swing, 20/s).
+                                    pcall(remoteAttack,target)
                                 else farmClick() end
                             end
                             frameWait()

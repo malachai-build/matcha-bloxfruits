@@ -322,7 +322,7 @@ task.spawn(function()
     local boosting=false
     while alive() do
         local qPressed=keyDown(0x51)
-        local m1Pressed=ismouse1pressed()
+        local okM1,m1Pressed=pcall(ismouse1pressed); m1Pressed=okM1 and m1Pressed==true
         local now=clock()
 
         if S.soulGuitarM1Boost then
@@ -360,7 +360,7 @@ task.spawn(function()
     local wasM1Pressed=false
     local boosting=false
     while alive() do
-        local m1Pressed=ismouse1pressed()
+        local okM1,m1Pressed=pcall(ismouse1pressed); m1Pressed=okM1 and m1Pressed==true
         if S.diamondM1Boost and not m1Pressed and wasM1Pressed and not boosting then
             boosting=true
             task.spawn(function()
@@ -672,6 +672,10 @@ function safeObjectPosition(object)
         local okPrimaryPosition,primaryPosition=pcall(function() return primary.Position end)
         if okPrimaryPosition and primaryPosition then return primaryPosition end
     end
+    -- A Model's pivot (real Roblox API in Solara) instead of walking every
+    -- descendant: the Mirage island has no PrimaryPart and this ran per frame.
+    local okPivot,pivot=pcall(function() return object:GetPivot() end)
+    if okPivot and pivot then return pivot.Position end
     local okChildren,children=pcall(function() return object:GetDescendants() end)
     if okChildren and children then
         for _,child in pairs(children) do
@@ -828,9 +832,9 @@ task.spawn(function()
                 tweenTo(hrp,Vector3.new(position.X,position.Y+300,position.Z),S.FARM_SPEED,function()
                     return S.autoMirageTween and not S.fruitPriorityActive and findMirageObject()~=nil
                 end)
-                -- Once hovering above Mirage tweenTo returns at once; this loop used
-                -- to re-enter it without ever yielding.
-                frameWait()
+                -- Once hovering above Mirage tweenTo returns at once; re-check
+                -- at 5 Hz, not every frame.
+                task.wait(0.2)
             else
                 task.wait(0.35)
             end

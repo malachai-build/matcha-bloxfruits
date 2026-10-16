@@ -178,7 +178,7 @@ function buildEspLabels(fruits)
 end
 
 berryScanRunning=false
-BERRY_SCAN_BATCH=80
+BERRY_SCAN_BATCH=400 -- per frame; Solara runs native Luau (was 80, which made one scan take ~12 s)
 BERRY_DRAW_DISTANCE=10000
 BERRY_DRAW_DISTANCE_SQ=BERRY_DRAW_DISTANCE*BERRY_DRAW_DISTANCE
 -- Stability pass (Oct 15 2026): the scan walks the whole Workspace tree and
@@ -187,7 +187,7 @@ BERRY_DRAW_DISTANCE_SQ=BERRY_DRAW_DISTANCE*BERRY_DRAW_DISTANCE
 -- BERRY_RESCAN_INTERVAL s (the toggle forces one at once), skips the
 -- top-level folders that never hold map berries, and stops expanding after
 -- BERRY_SCAN_MAX_OBJECTS objects.
-BERRY_RESCAN_INTERVAL=15
+BERRY_RESCAN_INTERVAL=45
 BERRY_SCAN_MAX_OBJECTS=60000
 BERRY_SCAN_SKIP_ROOTS={Enemies=true,Characters=true,Camera=true,Boats=true,ChestModels=true}
 berryNextScanAt=0
@@ -334,6 +334,9 @@ function buildBerryEspLabels(force)
 end
 
 TWEEN_STEP_TIME=FRAME_TIME -- one CFrame write per frame (was 0.01 before the stability pass); safe mode doubles it
+MOVEMENT_FAULT_LIMIT=5
+MOVEMENT_FAULT_WINDOW=20
+MOVEMENT_FAULTS={count=0,at=-1e9}
 
 -- Lerps the root part to targetPos at `speed` studs/s. Returns true when the
 -- target was reached, false when stopped (checkFn false, part gone, unload,
@@ -402,10 +405,22 @@ function tweenTo(hrp, targetPos, speed, checkFn, rotationOverride)
     if type(solaraDiag)=="function" then
         solaraDiag("tween begin distance=" .. math.floor(distance) .. " speed=" .. math.floor(moveSpeed),"tween-begin",1)
     end
+    -- A fault stops this tween only; the caller backs off and retries. Solara's
+    -- isnetworkowner is briefly false while seated or just after a respawn,
+    -- and one rubber-band used to unload every feature. Only a run of
+    -- MOVEMENT_FAULT_LIMIT faults within MOVEMENT_FAULT_WINDOW s unloads.
     local function movementFault(reason)
-        if type(solaraDiag)=="function" then solaraDiag("movement fault: " .. reason) end
-        warn("[laced.club / Solara] Travel stopped: " .. reason .. ". Unloading automation to avoid repeated snapback and death.")
-        if type(shutdownScript)=="function" then pcall(shutdownScript,"movement") end
+        if type(solaraDiag)=="function" then solaraDiag("movement fault: " .. reason,"movement-fault",1) end
+        local now=clock()
+        if now-MOVEMENT_FAULTS.at>MOVEMENT_FAULT_WINDOW then MOVEMENT_FAULTS.count=0 end
+        MOVEMENT_FAULTS.at=now
+        MOVEMENT_FAULTS.count=MOVEMENT_FAULTS.count+1
+        if MOVEMENT_FAULTS.count>=MOVEMENT_FAULT_LIMIT then
+            warn("[laced.club / Solara] Travel stopped repeatedly (" .. reason .. "). Unloading automation to avoid repeated snapback and death.")
+            if type(shutdownScript)=="function" then pcall(shutdownScript,"movement") end
+        else
+            warnThrottled("movementFault","[laced.club / Solara] Travel stopped: " .. reason,5)
+        end
     end
     local function ownsPhysics(part)
         if not isLocalRoot or type(isnetworkowner)~="function" then return true end
@@ -530,7 +545,7 @@ function tweenTo(hrp, targetPos, speed, checkFn, rotationOverride)
                     end
                     return finish(true)
                 end
-                task.wait(step)
+                if step<=FRAME_TIME then frameWait() else task.wait(step) end
             elseif not writesPaused() then
                 return finish(false) -- the root left the DataModel
             end
