@@ -678,3 +678,30 @@ New Misc toggle **Store Rolled Fruit** (`gacha_store_fruit`, on by default). Aft
 5. The pause is always released, stored or not, and AFQ's loop picks up again by itself on its next pass.
 
 **Not live tested:** no fruit was available to equip and store in this session. The `StoreFruit` argument shape is the one community scripts use, not one read from the game's own code (the fruit tool's scripts aren't loaded without a fruit).
+
+## Gacha: roll at the NPC instead of by remote (Oct 16 2026)
+
+The remote roll (CommF_ `"Cousin","Buy"` from anywhere) did not roll (user report). The roll now goes through the NPC the way a player does it. The flow was recorded live in Sea 2:
+
+1. **Talk.** All farms pause (`S.gachaPaused`) and the character flies to the stand spot about 10 studs from **Blox Fruit Gacha** (title "Zioles"). The script clicks on the NPC, using its WorldToScreen point when it's on screen; mouse coordinates are screen pixels. From 28 studs the dialogue did not open. `Camera.lookAt` and right-drag camera turns have no effect, and facing the NPC isn't needed. The talk click opened the dialogue only some of the time, so it retries up to 3 times.
+2. **Random Fruit.** Option 1 must read "Random Fruit"; letters are read from the per-letter `fill` labels. The script waits 0.7 s for the slide-in, clicks, and confirms the dialogue moved on. If it didn't, it retries 20 px and then 35 px higher; the first click had landed ~20 px low while the dialogue slid in.
+3. **Purchase.** `ZiolesGacha_Window.Frame.Main.Footer.PurchaseButton` is clicked at its AbsolutePosition +(70, 40); these buttons read AbsoluteSize 0,0. The roll is proven by `Data.Beli` dropping. On cooldown the game answers "[You must wait 01:49 to buy another roll.]" and the script retries in 10 min.
+4. **Spin and close.** Wait up to 25 s for the new `... Fruit` tool. Then close the spinner and the window until the player attribute `NPC_INTERACTION_LOCKClient` reads 0. An open window keeps it above 0 and blocks every NPC dialogue, AFQ's quest accept included.
+   - Gacha window X: +(19, 24), measured with the user's cursor on it.
+   - Spinner CloseButton: not measured yet, so candidate points are tried with the lock as proof.
+   - A leftover dialogue is answered "Nevermind".
+5. **Store.** The fruit is equipped by hotbar key, then a click opens the game's fruit menu: option 1 Eat, 2 Drop, 3 Store, 4 Nevermind. Option 3 must read "Store" before it is clicked; the game answers "[Blox Fruit stored.]". This replaces the community `StoreFruit` remote.
+
+Also changed:
+
+- `ZiolesGacha_Window` (18 characters) is read intermittently by Matcha, so PlayerGui lookups retry.
+- The Sea 2 stand spot is built in. Other seas learn it when the player stands within 12 studs of the NPC, or with the new **Save Gacha Spot** button. Spots are saved to `laced_club_configs/gacha_spot_<sea>.txt`.
+
+### Live
+
+Four dry runs on cooldown, so nothing was spent:
+
+- The final run went NPC click → "Random Fruit" → Purchase → cooldown reply → window closed (lock 0).
+- An earlier run failed because a window left open by a test held the lock; that led to the lock-based close.
+
+**Not live tested:** the spinner close after a real roll, and the Store click. Store uses the same option click as Random Fruit; the menu layout comes from the user's own store.

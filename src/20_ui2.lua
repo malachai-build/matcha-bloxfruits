@@ -87,14 +87,15 @@ miscTab:AddToggle("auto_mirage_gear",{
 
 miscTab:AddSection("Fruit Gacha",{Column=2})
 miscTab:AddToggle("auto_gacha_roll",{
-    Text="Auto Gacha Roll",Description="Rolls the Blox Fruit Gacha (random fruit, costs Beli) once per 2 h cooldown, from anywhere",Default=false,Column=2,
+    Text="Auto Gacha Roll",Description="Every 2 h: pauses the farms, flies to the Blox Fruit Gacha and rolls a random fruit (costs Beli; needs Roblox focused)",Default=false,Column=2,
     Callback=function(v) S.autoGachaRoll=v end
 })
 miscTab:AddToggle("gacha_store_fruit",{
-    Text="Store Rolled Fruit",Description="After a roll, presses the new fruit's hotbar key and stores it (needs Roblox focused for the key)",Default=true,Column=2,
+    Text="Store Rolled Fruit",Description="After a roll, presses the new fruit's hotbar key and picks Store in the fruit menu",Default=true,Column=2,
     Callback=function(v) S.gachaStoreFruit=v end
 })
 miscTab:AddButton("gacha_roll_now",{Text="Roll Gacha Now",Column=2,Callback=function() S.gachaRollNow=true end})
+miscTab:AddButton("gacha_save_spot",{Text="Save Gacha Spot (stand at the NPC)",Column=2,Callback=function() if type(S.gachaSaveSpot)=="function" then S.gachaSaveSpot() end end})
 S.gachaStatusLabel=miscTab:AddLabel("gacha_status",{Text="Gacha: idle",Column=2})
 
 miscTab:AddSection("World Status",{Column=2})

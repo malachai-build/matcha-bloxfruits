@@ -540,7 +540,8 @@ S = {
     autoGachaRoll   = false,
     gachaRollNow    = false, -- set by the "Roll Now" button, cleared by the loop
     gachaStoreFruit = true,  -- equip the rolled fruit by its hotbar key and store it
-    gachaPaused     = false, -- every farm yields while the rolled fruit is stored (at most GACHA_PAUSE_SECS)
+    gachaPaused     = false, -- every farm yields while a Gacha roll runs (flight, dialogue, spin, store)
+    gachaSaveSpot   = nil,   -- set by 80_misc2: saves the Gacha stand spot for this sea
     gachaStatusLabel = nil,
     selectedSeaEvent = "Shark",
     autoSeaEvent    = false,
@@ -2266,14 +2267,15 @@ miscTab:AddToggle("auto_mirage_gear",{
 
 miscTab:AddSection("Fruit Gacha",{Column=2})
 miscTab:AddToggle("auto_gacha_roll",{
-    Text="Auto Gacha Roll",Description="Rolls the Blox Fruit Gacha (random fruit, costs Beli) once per 2 h cooldown, from anywhere",Default=false,Column=2,
+    Text="Auto Gacha Roll",Description="Every 2 h: pauses the farms, flies to the Blox Fruit Gacha and rolls a random fruit (costs Beli; needs Roblox focused)",Default=false,Column=2,
     Callback=function(v) S.autoGachaRoll=v end
 })
 miscTab:AddToggle("gacha_store_fruit",{
-    Text="Store Rolled Fruit",Description="After a roll, presses the new fruit's hotbar key and stores it (needs Roblox focused for the key)",Default=true,Column=2,
+    Text="Store Rolled Fruit",Description="After a roll, presses the new fruit's hotbar key and picks Store in the fruit menu",Default=true,Column=2,
     Callback=function(v) S.gachaStoreFruit=v end
 })
 miscTab:AddButton("gacha_roll_now",{Text="Roll Gacha Now",Column=2,Callback=function() S.gachaRollNow=true end})
+miscTab:AddButton("gacha_save_spot",{Text="Save Gacha Spot (stand at the NPC)",Column=2,Callback=function() if type(S.gachaSaveSpot)=="function" then S.gachaSaveSpot() end end})
 S.gachaStatusLabel=miscTab:AddLabel("gacha_status",{Text="Gacha: idle",Column=2})
 
 miscTab:AddSection("World Status",{Column=2})
@@ -10005,36 +10007,67 @@ task.spawn(function()
     end
 end)
 
--- Auto Fruit Gacha (Oct 15 2026). The Blox Fruit Gacha NPC (Sea 1 Middle
--- Town, Sea 2 Cafe, Sea 3 Mansion) still answers the classic CommF_
--- "Cousin" call from anywhere on the map (live: "Cousin","Check" answered in
--- Sea 2 about 4,000 studs from the Cafe), so no travel is needed: the roll is
--- CommF_ "Cousin","Buy" through invokeEnhancedComm (quiet window,
--- serialised with every other CommF_ invoke).
--- Matcha's InvokeServer returns only a boolean, so the server's answer
--- (fruit name, cooldown text) is not visible. A roll is proven by Data.Beli
--- dropping or a new "... Fruit" tool appearing within GACHA_CONFIRM_SECS.
---   * proven: the next roll is GACHA_COOLDOWN_SECS later;
---   * not proven (cooldown still running from a roll made elsewhere, not
---     enough Beli, level too low): retried after GACHA_RETRY_SECS, never
---     spammed.
--- The next-roll time is os.time() based and saved per account to
--- laced_club_configs/gacha_<UserId>.txt, so a re-run or a rejoin keeps it.
--- "Roll Gacha Now" ignores the saved time for one attempt.
--- Store Rolled Fruit (on by default): after a proven roll with a new fruit
--- tool, the fruit is equipped by its hotbar number key and stored with
--- CommF_ "StoreFruit" (storeFruit below).
+-- Auto Fruit Gacha (Oct 16 2026, NPC route). Rolling from anywhere with
+-- CommF_ "Cousin","Buy" did not roll (user report, Oct 16), so the roll now
+-- goes through the NPC exactly as a player does it (recorded live in Sea 2):
+--   1. talk to "Blox Fruit Gacha" (dialogue title "Zioles"): a click ON the
+--      NPC within ~10 studs opens the dialogue; facing it is not needed
+--      (user, live), but from the 28-stud spot the dialogue did not open.
+--      The cursor is put on the NPC when it is on screen (WorldToScreen; mouse
+--      coordinates are screen pixels, live: mousemoveabs(1280,720) reads
+--      1279,719). Camera.lookAt and right-drag camera turns have no effect;
+--   2. dialogue option 1 "Random Fruit" opens PlayerGui.ZiolesGacha_Window;
+--   3. Frame.Main.Footer.PurchaseButton buys the roll: Data.Beli drops at
+--      once, PlayerGui.SpinnerWindow spins ~10 s, then the fruit arrives as a
+--      "<Name> Fruit" tool in the Backpack and
+--      SpinnerWindow.AboveSpinner.Navigation.CloseButton appears;
+--   4. Store: hold the fruit and click: the game's own fruit menu ("What do
+--      you wish to do with this Blox Fruit?") lists option1 Eat, option2 Drop,
+--      option3 Store, option4 Nevermind; Store answers "[Blox Fruit stored.]".
+-- Every option's text is read back before it is clicked (option 1 of the
+-- fruit menu is Eat), and nothing is clicked when the text does not match.
+-- The Gacha/spinner buttons read AbsoluteSize 0,0 through Matcha, so each is
+-- clicked at a measured point from its AbsolutePosition (live, Sea 2):
+-- PurchaseButton +(70,40) (answered "You must wait 01:49 to buy another
+-- roll."), the Gacha window's Title.Close +(19,24) (the user's cursor on the
+-- X). An open Gacha window or spinner keeps the player attribute
+-- NPC_INTERACTION_LOCKClient above 0 and blocks every NPC dialogue (AFQ's
+-- quest accept too), so windows are closed until that lock reads 0. The
+-- spinner's CloseButton point is not measured yet: candidate points are
+-- tried with the lock as the proof. "ZiolesGacha_Window" (18 characters) is
+-- one of the long names Matcha reads intermittently (see ensureRemotes), so
+-- GUI lookups retry.
+-- Clicks need Roblox in front. Every farm is paused (S.gachaPaused, read by
+-- farmPriorityFeatureActive and the boss/material/sea/mirage/raid loops) from
+-- the flight to the end of the store, and released on every path; AFQ's loop
+-- picks up again by itself.
+-- Stand spots: Sea 2 is built in (where the dialogue was opened live). For
+-- the other seas the spot is learned: standing within GACHA_LEARN_DIST studs
+-- of the NPC saves the position (also the "Save Gacha Spot" button), per
+-- sea, in laced_club_configs/gacha_spot_<sea>.txt.
+-- A roll is proven by Data.Beli dropping. Proven: next roll in
+-- GACHA_COOLDOWN_SECS. No Beli drop after the purchase click (cooldown from a
+-- roll made elsewhere, not enough Beli): retried in GACHA_RETRY_SECS. The
+-- next-roll time is os.time() based and saved per account
+-- (laced_club_configs/gacha_<UserId>.txt). "Roll Gacha Now" ignores it once.
 GACHA_COOLDOWN_SECS=2*60*60
 GACHA_RETRY_SECS=10*60
-GACHA_CONFIRM_SECS=4
-GACHA_CALM_SECS=1.5
-GACHA_PAUSE_SECS=5
+GACHA_FOCUS_RETRY_SECS=30
+GACHA_SPIN_SECS=25
+GACHA_STORE_SECS=8
+GACHA_LEARN_DIST=12
+GACHA_NPC_NAME="Blox Fruit Gacha"
+GACHA_STAND={ [2]=Vector3.new(-425.93,73.00,395.86) } -- ~10 studs from the NPC; 28 studs was too far (live)
+GACHA_PURCHASE_AIM=Vector2.new(70,40)
+GACHA_CLOSE_AIM=Vector2.new(19,24)
+GACHA_SPINNER_CLOSE_AIMS={ Vector2.new(19,24), Vector2.new(35,25), Vector2.new(60,25), Vector2.new(19,45), Vector2.new(60,45), Vector2.new(90,30) }
 task.spawn(function()
     local folder="laced_club_configs"
     local userId=0
     pcall(function() userId=tonumber(LocalPlayer.UserId) or 0 end)
     local path=folder.."/gacha_"..tostring(userId)..".txt"
     local function now() return os.time() end
+    local function ensureFolder() pcall(function() if not isfolder(folder) then makefolder(folder) end end) end
     local function loadNext()
         local value=0
         pcall(function()
@@ -10043,10 +10076,27 @@ task.spawn(function()
         return value
     end
     local function saveNext(t)
+        ensureFolder()
+        pcall(function() writefile(path,tostring(math.floor(t))) end)
+    end
+    local sea=tonumber(AFL.currentSea) or 0
+    local spotPath=folder.."/gacha_spot_"..tostring(sea)..".txt"
+    local function loadSpot()
+        local spot=nil
         pcall(function()
-            if not isfolder(folder) then makefolder(folder) end
-            writefile(path,tostring(math.floor(t)))
+            if isfile(spotPath) then
+                local x,y,z=string.match(readfile(spotPath),"^%s*(-?[%d.]+),(-?[%d.]+),(-?[%d.]+)")
+                if x then spot=Vector3.new(tonumber(x),tonumber(y),tonumber(z)) end
+            end
         end)
+        return spot
+    end
+    local learnedSpot=loadSpot()
+    local function standSpot() return learnedSpot or GACHA_STAND[sea] end
+    local function saveSpot(pos)
+        learnedSpot=pos
+        ensureFolder()
+        pcall(function() writefile(spotPath,string.format("%.2f,%.2f,%.2f",pos.X,pos.Y,pos.Z)) end)
     end
     local nextAt=loadNext()
     local lastResult="idle"
@@ -10058,6 +10108,41 @@ task.spawn(function()
         if left<=0 then timer="ready"
         else timer=string.format("next in %dh %02dm",math.floor(left/3600),math.floor((left%3600)/60)) end
         pcall(function() label.Text="Gacha: "..lastResult.." | "..timer end)
+    end
+    local function myRoot()
+        local char=LocalPlayer and LocalPlayer.Character
+        return char and char:FindFirstChild("HumanoidRootPart")
+    end
+    local function npcPosition()
+        local pos=nil
+        pcall(function()
+            local npcs=Workspace:FindFirstChild("NPCs")
+            local npc=npcs and npcs:FindFirstChild(GACHA_NPC_NAME)
+            local root=npc and (npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart)
+            pos=root and root.Position
+        end)
+        return pos
+    end
+    -- Learn this sea's stand spot when the player stands near the NPC (seas
+    -- without a built-in spot only).
+    local function learnSpot()
+        if learnedSpot or GACHA_STAND[sea] then return end
+        local npc=npcPosition()
+        local root=myRoot()
+        if not npc or not root then return end
+        local okPos,me=pcall(function() return root.Position end)
+        if not okPos or not me then return end
+        if (me-npc).Magnitude>GACHA_LEARN_DIST then return end
+        saveSpot(me)
+        notify("Gacha spot learned for sea "..tostring(sea),"Fruit Gacha",4)
+    end
+    S.gachaSaveSpot=function()
+        local root=myRoot()
+        local okPos,me=pcall(function() return root.Position end)
+        if not okPos or not me then notify("No character","Fruit Gacha",3); return end
+        saveSpot(me)
+        local npc=npcPosition()
+        notify("Gacha spot saved for sea "..tostring(sea)..(npc and string.format(" (%.0f studs from the NPC)",(me-npc).Magnitude) or " (NPC not visible from here)"),"Fruit Gacha",5)
     end
     local function beli()
         local data=LocalPlayer and LocalPlayer:FindFirstChild("Data")
@@ -10100,15 +10185,181 @@ task.spawn(function()
         local okName,name=pcall(function() return tool and tool.Name end)
         return okName and name or nil
     end
+    local function pg() return LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui") end
+    -- PlayerGui child lookup that retries (long names read intermittently).
+    local function findGui(name)
+        local gui=pg()
+        if not gui then return nil end
+        for _=1,15 do
+            local ok,child=pcall(function() return gui:FindFirstChild(name) end)
+            if ok and child then return child end
+        end
+        local ok,child=pcall(function() return gui:WaitForChild(name,0.5) end)
+        return ok and child or nil
+    end
+    -- Click a GUI object at a measured point from its AbsolutePosition.
+    local function clickGui(object,aim)
+        local okPos,p=pcall(function() return object.AbsolutePosition end)
+        if not okPos or not p or not p.X then return false end
+        if not afl_jitterClick(p.X+aim.X,p.Y+aim.Y) then return false end
+        mouse1press(); task.wait(0.1); mouse1release()
+        return true
+    end
+    local function npcLock()
+        local ok,v=pcall(function() return LocalPlayer:GetAttribute("NPC_INTERACTION_LOCKClient") end)
+        return ok and tonumber(v) or 0
+    end
+    local function clickWorld()
+        mouse1press(); task.wait(0.08); mouse1release()
+    end
+    local function lowerName(object)
+        local ok,name=pcall(function() return object.Name end)
+        return ok and type(name)=="string" and string.lower(name) or ""
+    end
+    -- Text of dialogue option n: the game draws one "fill" label per letter
+    -- under optionN.button.textLabel.wordK.fill; letters sorted by X, spaces
+    -- dropped ("Random Fruit" reads "RandomFruit"). nil when not shown.
+    local function optionText(n)
+        local gui=pg() and pg():FindFirstChild("DialogueGui")
+        if not gui then return nil end
+        local okD,descendants=pcall(function() return gui:GetDescendants() end)
+        if not okD or not descendants then return nil end
+        local wanted="option"..tostring(n)
+        local letters={}
+        for _,object in ipairs(descendants) do
+            if lowerName(object)=="fill" then
+                local inOption,current=false,object
+                for _=1,8 do
+                    local okParent,parent=pcall(function() return current.Parent end)
+                    if not okParent or not parent then break end
+                    current=parent
+                    local name=lowerName(current)
+                    if string.sub(name,-#wanted)==wanted then inOption=true; break end
+                    if name=="dialoguegui" then break end
+                end
+                if inOption then
+                    local okT,text,pos=pcall(function() return object.Text,object.AbsolutePosition end)
+                    if okT and type(text)=="string" and pos and pos.X then letters[#letters+1]={pos.X,text} end
+                end
+            end
+        end
+        if #letters==0 then return nil end
+        table.sort(letters,function(a,b) return a[1]<b[1] end)
+        local out={}
+        for _,l in ipairs(letters) do out[#out+1]=l[2] end
+        return (string.gsub(table.concat(out),"%s",""))
+    end
+    local function waitFor(fn,timeout)
+        local untilAt=clock()+timeout
+        repeat
+            local v=fn()
+            if v then return v end
+            task.wait(0.1)
+        until clock()>=untilAt or not alive()
+        return nil
+    end
+    -- Click option n only if its text is the expected one (waits up to
+    -- timeout s for the dialogue to show it). The dialogue slides up while it
+    -- opens: a click right after the text appeared landed ~20 px low (user,
+    -- live), so it waits for the slide, clicks, and checks that the dialogue
+    -- moved on (the option no longer reads the text); if not, it clicks again
+    -- 20 and then 35 px higher (options are ~120 px apart, so this never
+    -- reaches the option above).
+    local function clickOptionIf(n,expected,timeout)
+        if not waitFor(function() return optionText(n)==expected end,timeout or 3) then return false end
+        task.wait(0.7)
+        for _,dy in ipairs({0,-20,-35}) do
+            if optionText(n)~=expected then return true end
+            local _,center=afl_findDialogueOption(n)
+            if not center then return true end
+            if not afl_jitterClick(center.X+AFL_QUEST_OFFSET_X,center.Y+AFL_QUEST_OFFSET_Y+dy) then return false end
+            mouse1press(); task.wait(0.1); mouse1release()
+            if waitFor(function() return optionText(n)~=expected end,1) then return true end
+        end
+        return false
+    end
+    -- An open dialogue also holds the NPC lock: answer "Nevermind".
+    local function closeDialogue()
+        for n=1,4 do
+            if optionText(n)=="Nevermind" then return clickOptionIf(n,"Nevermind",0.5) end
+        end
+        return false
+    end
+    local function gachaWindow()
+        local gui=findGui("ZiolesGacha_Window")
+        local ok,button=pcall(function() return gui.Frame.Main.Footer.PurchaseButton end)
+        return ok and button or nil
+    end
+    local function spinnerClose()
+        local gui=findGui("SpinnerWindow")
+        local ok,close=pcall(function() return gui.AboveSpinner.Navigation.CloseButton end)
+        if not ok or not close then return nil end
+        local okP,p=pcall(function() return close.AbsolutePosition end)
+        if not okP or not p or (p.X==0 and p.Y==0) then return nil end
+        return close
+    end
+    -- Close the spinner and the Gacha window until NPC_INTERACTION_LOCKClient
+    -- reads 0 (the lock is the only proof: Visible is not readable). The lock
+    -- is re-read after every click.
+    local function closeWindows()
+        local tries=0
+        while npcLock()>0 and tries<6 and alive() and robloxFocused() do
+            tries=tries+1
+            if closeDialogue() then waitFor(function() return npcLock()==0 end,1.5) end
+            local before=npcLock()
+            if before==0 then break end
+            local close=spinnerClose()
+            if close then
+                for _,aim in ipairs(GACHA_SPINNER_CLOSE_AIMS) do
+                    clickGui(close,aim)
+                    if waitFor(function() return npcLock()<before end,1.5) then break end
+                end
+            end
+            if npcLock()>=before then
+                local gui=findGui("ZiolesGacha_Window")
+                local ok,x=pcall(function() return gui.Frame.Title.Close end)
+                if ok and x then clickGui(x,GACHA_CLOSE_AIM); waitFor(function() return npcLock()<before end,1.5) end
+            end
+            if npcLock()>=before then break end -- nothing left that this can close
+        end
+        return npcLock()==0
+    end
+    -- Screen point of the NPC (WorldToScreen works only in a render callback).
+    local function npcScreenPoint()
+        local part=nil
+        pcall(function()
+            local npc=Workspace.NPCs:FindFirstChild(GACHA_NPC_NAME)
+            part=npc and (npc:FindFirstChild("UpperTorso") or npc:FindFirstChild("HumanoidRootPart"))
+        end)
+        if not part then return nil end
+        local point,visible,done=nil,false,false
+        local conn
+        conn=game:GetService("RunService").RenderStepped:Connect(function()
+            pcall(function() point,visible=WorldToScreen(part.Position) end)
+            done=true
+            if conn then conn:Disconnect() end
+        end)
+        local untilAt=clock()+1
+        while not done and clock()<untilAt do task.wait(0.03) end
+        if not done and conn then pcall(function() conn:Disconnect() end) end
+        if point and visible and point.X>0 and point.Y>0 then return point end
+        return nil
+    end
+    -- Click to talk. Near the NPC a click opens its dialogue without facing
+    -- it (user, live); the cursor is put on the NPC when it is on screen,
+    -- otherwise the click goes where the cursor is.
+    local function clickNpc()
+        local point=npcScreenPoint()
+        if point and not afl_jitterClick(point.X,point.Y) then return false end
+        mouse1press(); task.wait(0.08); mouse1release()
+        return true
+    end
     -- Hotbar key route (the user's ask): press number keys until the new
     -- fruit is the held tool. The hotbar frames' names are not readable
     -- through Matcha (WeaponEquip.hotbarName), so the slot is found by trying:
     -- the slot after the last filled one first (a new tool lands there), then
     -- 1-9. A wrong tool is put away again by pressing its key a second time.
-    -- Keys only while Roblox is focused and before the pause deadline (the
-    -- farms are paused, so no farm click can eat the fruit in hand).
     local function equipFruitByKey(name,deadline)
-        if not robloxFocused() then return false,nil end
         local kids=0
         pcall(function()
             for _,child in ipairs(LocalPlayer.Backpack:GetChildren()) do
@@ -10121,8 +10372,7 @@ task.spawn(function()
         order[1]=guess
         for slot=1,9 do if slot~=guess then order[#order+1]=slot end end
         for _,slot in ipairs(order) do
-            if not alive() or not robloxFocused() then return false,nil end
-            if clock()>=deadline-1.5 then break end -- keep time for the store call
+            if not alive() or not robloxFocused() or clock()>=deadline then break end
             if heldName()==name then return true,nil end
             local key=WeaponEquip.key(slot)
             pcall(function()
@@ -10133,113 +10383,158 @@ task.spawn(function()
             local held=heldName()
             if held==name then return true,key end
             if held~=nil then
-                -- Wrong tool: press the same key again to put it away.
                 pcall(function() keypress(key); task.wait(0.1); keyrelease(key) end)
                 task.wait(0.25)
             end
         end
         return heldName()==name,nil
     end
-    -- "Spin Fruit" -> "Spin-Spin" when the tool has no OriginalName attribute.
-    local function storeName(tool,name)
-        local okAttr,attr=pcall(function() return tool:GetAttribute("OriginalName") end)
-        if okAttr and type(attr)=="string" and attr~="" then return attr end
-        local base=string.match(name,"^(.-)%s+Fruit$") or name
-        return base.."-"..base
-    end
-    -- Equip the rolled fruit with its hotbar key, then store it (CommF_
-    -- "StoreFruit", the call the game's Store button makes). Auto Farm Quest
-    -- never leaves a calm moment, so instead of waiting for one every farm is
-    -- paused (S.gachaPaused, read by farmPriorityFeatureActive and the
-    -- boss/material/sea/mirage/raid loops) for at most GACHA_PAUSE_SECS. The
-    -- pause is always released, stored or not; the farms (AFQ's loop
-    -- included) pick up again on their own at their next pass.
-    -- Proven by the tool leaving Backpack and Character.
-    local function storeFruitPaused(name,deadline)
-        -- Let the farms see the pause and stop clicking/swinging.
-        local settleUntil=math.min(deadline-3,clock()+0.6)
-        while alive() and clock()<settleUntil do task.wait(0.05) end
-        local equipped,equipKey=equipFruitByKey(name,deadline)
-        local tool=findFruitTool(name)
-        if not tool then return true,"gone",nil end
-        local ok,_,err=invokeEnhancedComm("StoreFruit",storeName(tool,name),tool)
-        if not ok then return false,"StoreFruit failed: "..tostring(err),equipKey end
-        repeat
-            task.wait(0.2)
-        until not alive() or findFruitTool(name)==nil or clock()>=deadline
-        if findFruitTool(name)==nil then return true,equipped and "key" or "remote",nil end
+    -- Store with the game's fruit menu: hold the fruit, click, option 3
+    -- "Store" (read back first; option 1 is Eat). Proven by the tool leaving
+    -- Backpack and Character.
+    local function storeFruit(name)
+        local deadline=clock()+GACHA_STORE_SECS
+        local equipped,equipKey=equipFruitByKey(name,deadline-3)
+        if not equipped then return false,"could not hold "..name.." with a hotbar key",equipKey end
+        clickWorld()
+        if not clickOptionIf(3,"Store",3) then
+            return false,"the fruit menu's Store option was not found",equipKey
+        end
+        local gone=waitFor(function() return findFruitTool(name)==nil end,math.max(1,deadline-clock()))
+        if gone then return true,"stored",nil end
         return false,"still in backpack (storage full?)",equipKey
     end
-    local function storeFruit(name)
-        local deadline=clock()+GACHA_PAUSE_SECS
-        S.gachaPaused=true
-        local okRun,stored,how,equipKey=pcall(storeFruitPaused,name,deadline)
-        -- Not stored: put the fruit away so the farm re-equips its weapon and
-        -- no click can eat it.
-        if not (okRun and stored) and equipKey and heldName()==name and robloxFocused() then
-            pcall(function() keypress(equipKey); task.wait(0.1); keyrelease(equipKey) end)
-        end
-        S.gachaPaused=false
-        if not okRun then return false,tostring(stored) end
-        return stored,how
+    -- Fly to the stand spot (farms are paused, so nothing else writes the root).
+    local function flyTo(spot)
+        local root=myRoot()
+        if not root then return false end
+        afl_setCanCollide(false)
+        local ok=tweenTo(root,spot,AFL.tweenSpeed,function() return alive() and S.gachaPaused==true end)
+        afl_setCanCollide(true)
+        if ok then zeroVelocity(root) end
+        return ok
     end
-    local function roll(manual)
+    -- One roll at the NPC. Returns "rolled", "none" (no Beli drop) or
+    -- "retry",seconds (could not reach or click; nothing spent).
+    local function rollAtNpc(manual)
+        if npcLock()>0 and not closeWindows() then
+            lastResult="a game window is open (NPC lock): close it"
+            return "retry",GACHA_FOCUS_RETRY_SECS
+        end
+        local spot=standSpot()
+        if not spot then
+            lastResult="no spot for sea "..tostring(sea).." (stand at the NPC once)"
+            return "retry",GACHA_RETRY_SECS
+        end
+        if not robloxFocused() then
+            lastResult="waiting for Roblox focus (clicks)"
+            return "retry",GACHA_FOCUS_RETRY_SECS
+        end
+        local held=heldName()
+        if held and string.find(held,"Fruit",1,true) then
+            lastResult="holding "..held..": put it away first"
+            return "retry",GACHA_FOCUS_RETRY_SECS
+        end
+        lastResult="flying to the Gacha"
+        setLabel()
+        task.wait(0.6) -- let the farms see the pause
+        if not flyTo(spot) then lastResult="flight to the Gacha failed"; return "retry",GACHA_FOCUS_RETRY_SECS end
+        task.wait(0.5)
         local beliBefore=beli()
         local toolsBefore=fruitTools()
-        S.quietDefer="travel" -- read (and cleared) by quietInvoke: a flight starting in the lead-in postpones it
-        local ok,_,err=invokeEnhancedComm("Cousin","Buy")
-        S.quietDefer=nil
-        if not ok and err==QUIET_POSTPONED then return "postponed" end
-        if not ok then
-            lastResult="remote failed"
-            warnThrottled("gacha:remote","[laced.club] Gacha: Cousin Buy failed: "..tostring(err),30)
-            nextAt=now()+GACHA_RETRY_SECS
-            return "failed"
+        lastResult="talking to the Gacha"
+        setLabel()
+        local seen=waitFor(function()
+            local ok,npc=pcall(function() return Workspace.NPCs:FindFirstChild(GACHA_NPC_NAME) end)
+            return ok and npc
+        end,5)
+        if not seen then lastResult="Gacha NPC not loaded at the spot"; return "retry",GACHA_FOCUS_RETRY_SECS end
+        -- The talk click did not always open the dialogue (2 of 4 live dry
+        -- runs): up to 3 clicks, a new one only while nothing is open.
+        task.wait(0.5)
+        local talked=false
+        for _=1,3 do
+            if npcLock()==0 then clickNpc() end
+            if waitFor(function() return optionText(1)=="RandomFruit" end,3) then talked=true; break end
+            if npcLock()>0 then closeWindows() end
         end
-        local waited=0
-        local fruit,spent=nil,false
-        repeat
-            task.wait(0.2)
-            waited=waited+0.2
-            local beliAfter=beli()
-            spent=beliBefore~=nil and beliAfter~=nil and beliAfter<beliBefore
-            fruit=newFruit(toolsBefore,fruitTools())
-        until not alive() or spent or fruit or waited>=GACHA_CONFIRM_SECS
-        if spent or fruit then
-            -- Give the fruit tool a moment to replicate after the Beli drop.
-            if not fruit then task.wait(0.6); fruit=newFruit(toolsBefore,fruitTools()) end
-            lastResult=fruit and ("got "..fruit) or "rolled"
-            nextAt=now()+GACHA_COOLDOWN_SECS
-            saveNext(nextAt)
-            notify(fruit and ("Gacha rolled: "..fruit) or "Gacha rolled (fruit sent to inventory)","Fruit Gacha",5)
-            if fruit and S.gachaStoreFruit then
-                local stored,how=storeFruit(fruit)
-                if stored then
-                    lastResult="stored "..fruit
-                    notify("Stored "..fruit,"Fruit Gacha",4)
-                else
-                    lastResult="got "..fruit.." (not stored)"
-                    warnThrottled("gacha:store","[laced.club] Gacha: could not store "..fruit..": "..tostring(how),30)
-                    notify("Could not store "..fruit..": "..tostring(how),"Fruit Gacha",5)
-                end
-            end
+        if not talked or not clickOptionIf(1,"RandomFruit",1) then
+            lastResult="Gacha dialogue did not open"
+            return "retry",GACHA_FOCUS_RETRY_SECS
+        end
+        local purchase=waitFor(gachaWindow,4)
+        if not purchase then lastResult="Gacha window did not open"; return "retry",GACHA_FOCUS_RETRY_SECS end
+        task.wait(0.4)
+        clickGui(purchase,GACHA_PURCHASE_AIM)
+        local spent=waitFor(function()
+            local b=beli()
+            return beliBefore~=nil and b~=nil and b<beliBefore
+        end,6)
+        if not spent then
+            task.wait(0.5)
+            closeWindows()
+            lastResult="no roll (cooldown/Beli?)"
+            if manual then notify("Gacha did not roll: cooldown running or not enough Beli","Fruit Gacha",5) end
+            return "none"
+        end
+        nextAt=now()+GACHA_COOLDOWN_SECS
+        saveNext(nextAt)
+        lastResult="spinning"
+        setLabel()
+        local fruit=waitFor(function() return newFruit(toolsBefore,fruitTools()) end,GACHA_SPIN_SECS)
+        waitFor(spinnerClose,3)
+        task.wait(0.5)
+        if not closeWindows() then
+            warnThrottled("gacha:close","[laced.club] Gacha: a Gacha/spinner window is still open (NPC lock "..tostring(npcLock())
+                .."); NPC dialogues stay blocked until it is closed",30)
+        end
+        if not fruit then
+            lastResult="rolled (fruit not seen in the backpack)"
+            notify("Gacha rolled (fruit not found in the backpack)","Fruit Gacha",5)
             return "rolled"
         end
-        lastResult="no roll (cooldown/Beli?)"
-        nextAt=now()+GACHA_RETRY_SECS
-        if manual then notify("Gacha did not roll: cooldown running, not enough Beli, or level too low","Fruit Gacha",5) end
-        return "none"
+        lastResult="got "..fruit
+        notify("Gacha rolled: "..fruit,"Fruit Gacha",5)
+        if S.gachaStoreFruit then
+            local stored,how,equipKey=storeFruit(fruit)
+            if stored then
+                lastResult="stored "..fruit
+                notify("Stored "..fruit,"Fruit Gacha",4)
+            else
+                -- Put the fruit away so the farm re-equips its weapon and no
+                -- click can eat it.
+                if equipKey and heldName()==fruit and robloxFocused() then
+                    pcall(function() keypress(equipKey); task.wait(0.1); keyrelease(equipKey) end)
+                end
+                lastResult="got "..fruit.." (not stored)"
+                warnThrottled("gacha:store","[laced.club] Gacha: could not store "..fruit..": "..tostring(how),30)
+                notify("Could not store "..fruit..": "..tostring(how),"Fruit Gacha",5)
+            end
+        end
+        return "rolled"
     end
+    local function roll(manual)
+        S.gachaPaused=true
+        local okRun,result,retryIn=pcall(rollAtNpc,manual)
+        S.gachaPaused=false
+        if not okRun then
+            lastResult="error"
+            warnThrottled("gacha:error","[laced.club] Gacha error: "..tostring(result),30)
+            nextAt=now()+GACHA_FOCUS_RETRY_SECS
+            return
+        end
+        if result=="none" then nextAt=now()+GACHA_RETRY_SECS
+        elseif result=="retry" then nextAt=now()+(retryIn or GACHA_FOCUS_RETRY_SECS) end
+    end
+    local learnAt=0
     while alive() do
         local okPass,passError=pcall(function()
+            if clock()>=learnAt then learnAt=clock()+2; learnSpot() end
             local manual=S.gachaRollNow==true
-            if (S.autoGachaRoll or manual) and not remoteFailing("CommF_") then
+            if S.autoGachaRoll or manual then
                 if manual or now()>=nextAt then
-                    if clock()-ACTIVITY.travelAt<GACHA_CALM_SECS then
-                        lastResult="waiting (travelling)"
-                    elseif roll(manual)~="postponed" then
-                        S.gachaRollNow=false
-                    end
+                    S.gachaRollNow=false
+                    roll(manual)
                 end
             else
                 S.gachaRollNow=false
@@ -10247,6 +10542,7 @@ task.spawn(function()
             setLabel()
         end)
         if not okPass then
+            S.gachaPaused=false
             S.gachaRollNow=false
             warnThrottled("gacha:error","[laced.club] Gacha error: "..tostring(passError),30)
             task.wait(2)
