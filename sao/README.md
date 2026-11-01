@@ -6,21 +6,21 @@ A standalone Auto Farm Quest script for Sword Art Online: Eternity (place 108438
 loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/sao/sao_afq.lua"))()
 ```
 
-Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, **Insert** shows or hides the settings menu, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
+Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
 
 ## Settings menu
 
-A Drawing-based box. Matcha can't create real Roblox GUI.
+The same UE library (laced.club UI) as the Blox Fruits script, downloaded at load, with the orange accent.
 
-- **Moving and hiding:** drag the blue title bar to move it. **Insert** shows or hides it.
-- **Sections:** click a section header (Farm, Travel, Combat, Skills, Parry, Survival) to open or close it.
-- **Values:** click a value to change it.
-  - on/off switches flip.
-  - dropdowns (`v`) open a list; pick one.
-  - numbers step down on the left half (`-`) and up on the right half (`+`).
-- **Skills:** pick a skill id for slots 1-4, and the script casts every filled slot remotely during fights (`slotSkills`; default slot 2 = Avalanche). The list has the Greatsword skills.
-- **Saving:** every change is saved to `sao_afq_settings.json` in the Matcha workspace and loaded on the next start.
-- **Mouse note:** clicks on the menu also reach the game underneath. In `attackMode = "click"` the script skips its own clicks while the mouse is over the menu.
+- **Main tab:**
+  - **Farm:** Auto Farm Quest (F6), Auto Quest Pickup (F7), Target Mob dropdown, dump button.
+  - **Travel:** Travel Mode dropdown, Infinite Dash (F9), and the HP % slider for retreating to town.
+- **Combat tab:**
+  - **Attacks:** Attack Mode and Skill Mode dropdowns, Skill Slot 1-4 dropdowns (every filled slot is cast remotely in fights), Skill Recast slider.
+  - **Parry:** Auto Parry (F10), Parry Mode, Face Attacker.
+- **Settings tab:** UE's own, with the menu key and configs.
+- **Hotkeys and saving:** hotkeys update the menu toggles. Settings are also saved to `sao_afq_settings.json` on every change and loaded on the next start.
+- **No menu?** If the UE download fails, the script still runs on the hotkeys and warns in the console.
 
 ## What it does
 
