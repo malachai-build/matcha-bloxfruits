@@ -73,6 +73,22 @@ Live test with cooldown 0.3: 33 dashes in 12 s with stamina at 0-5, up to 89 stu
 
 The dash's i-frames (`invulnerable = 0.22`) can't be changed from the client. The client only sends `Combat:FireServer("Dash")` and never reads `invulnerable`, so the server grants i-frames from its own copy of the config. Constant invulnerability would mean spamming that remote. The script doesn't do this, because remote calls are what crashed the Blox Fruits script.
 
+## Remote quests (default, `questMode = "remote"`)
+
+- **Remotes:** the dialogue's own calls, found in `UI.Dialogue`.
+  - **Talk:** `QuestTalk:InvokeServer(questId)`. This also turns in a finished quest.
+  - **Accept:** `QuestAccept:InvokeServer(id)`.
+  - **Cancel:** `QuestCancel:FireServer()`, the menu's "cancel quest".
+  - The quest id comes from the giver's `QuestPrompt` `QuestId` attribute. Matcha returns wrong values for the NPC *model* attributes, which is why the old quest table pointed at the wrong NPCs.
+- **Live tests (unfocused):**
+  - `QuestTalk("boarQuest")` at the town giver (`World.Folder.BeginningQuestNPC`) turned in "Show your Strength".
+  - `QuestTalk` + `QuestAccept` started "The Art of Healing".
+  - `QuestCancel` dropped it again.
+  - Matcha's `InvokeServer` only returns `true`, so the script reads the tracker to see what happened.
+  - No crash in about 8 invokes. The Blox Fruits crashes came from `CommF_`.
+- **Accepting:** the script tries eligible kill quests highest level first (`acceptTries` 4). It cancels any quest that starts without a "Defeat X" step (tutorials, fetch quests). A quest that won't start (already done, on cooldown, level-locked) is skipped for `questSkipTime` (10 min).
+- **Fully unfocused:** quest accept and turn-in, travel, attacks, skills and parry all run with Roblox unfocused.
+
 ## Remote attack (default, `attackMode = "remote"`)
 
 - **How it works:** the game's light attack is `Combat:FireServer("Swing", "Light", combo)`, then at the hit frame `FireServer("Hit", "Light", combo, { mobModel })`. The script sends both itself, `hitDelay` (0.25 s) apart, every `swingInterval` (0.65 s), always combo 1, facing the mob from 4 studs.

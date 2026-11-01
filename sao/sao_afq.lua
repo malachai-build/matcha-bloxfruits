@@ -40,22 +40,22 @@ if type(_G.SAO_AFQ) == "table" and type(_G.SAO_AFQ.unload) == "function" then
     pcall(_G.SAO_AFQ.unload)
 end
 
--- Floor 1 quests, lowest level first. minLevel and mob come from the MobZones names
--- (StarterPlains_FrenzyBoar_Lv1 ... HauntedPeak_RuinKoboldTrooper_Lv22-25); the quest's
--- real target is read from the tracker once it is accepted, so a wrong guess here only
--- picks the giver.
+-- Floor 1 kill quests, lowest level first. Ids and givers come from each NPC's
+-- QuestPrompt "QuestId" attribute (what the game's prompt handler reads; Matcha returns
+-- wrong values for the NPC *model* attributes, which an earlier table was built from).
+-- minLevel and mob come from the MobZones names (StarterPlains_FrenzyBoar_Lv1 ...
+-- HauntedPeak_RuinKoboldTrooper_Lv22-25) and are guesses; the real target is read from
+-- the tracker once a quest is accepted. Tutorial quests (beginningQuest,
+-- healingTutorialQuest, GUIDE, BLACKSMITH_GUIDE) are left out.
 local QUESTS = {
-    { id = "boarQuest", minLevel = 1, mob = "Frenzy Boar",
-      npcs = { "Medai.HorunkaQuestNPC1", "Medai.HorunkaQuestNPC2" } },
-    { id = "beginningWolfQuest", minLevel = 5, mob = "Dire Wolf",
-      npcs = { "Horunka.BeginningQuestNPC6" } },
-    { id = "waspHuntQuest", minLevel = 10, mob = "Wasp",
-      npcs = { "Medai.WaspQuestNPC" } },
-    { id = "nepenthesHuntQuest", minLevel = 15, mob = "Little Nepenthes",
-      npcs = { "World.Folder.BeginningQuestNPC" } },
-    { id = "horunkaKoboldBarsQuest", minLevel = 22, mob = "Ruin Kobold",
-      npcs = { "World.Folder.BeginningQuestNPC2", "World.Folder.BeginningQuestNPC3",
-               "World.Folder.BeginningQuestNPC4", "World.Folder.BeginningQuestNPC5" } },
+    { id = "boarQuest", minLevel = 1, mob = "Frenzy Boar", npcs = { "World.Folder.BeginningQuestNPC" } },
+    { id = "beginningWolfQuest", minLevel = 5, mob = "Dire Wolf", npcs = { "Horunka.BeginningQuestNPC6" } },
+    { id = "waspHuntQuest", minLevel = 10, mob = "Wasp", npcs = { "Medai.WaspQuestNPC" } },
+    { id = "medaiHuntQuest", minLevel = 10, mob = nil, npcs = { "Horunka.MedaiQuestNPC" } },
+    { id = "nepenthesHuntQuest", minLevel = 15, mob = "Little Nepenthes", npcs = { "Tolbana.TolbanaQuestNPC2" } },
+    { id = "secretMedicineQuest", minLevel = 15, mob = "Little Nepenthes", npcs = { "Medai.HorunkaQuestNPC2" } },
+    { id = "tolbanaWolfQuest", minLevel = 20, mob = "Dire Wolf", npcs = { "Tolbana.TolbanaQuestNPC" } },
+    { id = "horunkaKoboldBarsQuest", minLevel = 22, mob = "Ruin Kobold", npcs = { "Medai.HorunkaQuestNPC1" } },
 }
 
 local CFG = {
@@ -89,8 +89,11 @@ local CFG = {
     stepLift = 0.4,         -- studs above the current height per step; gravity takes it back
     climbLift = 4,          -- max lift per step when terrain pushes us back (slopes, steps)
     nearRange = 12,         -- inside this a fight/giver adjust is one short placement
-    talkPresses = 5,        -- E presses at a giver (opens the prompt, steps dialogue, confirms)
+    questMode = "remote",   -- "remote": QuestTalk / QuestAccept remotes (no focus); "keys": press E
+    talkPresses = 5,        -- E presses at a giver in "keys" mode (prompt, dialogue, confirm)
     turnInTries = 6,        -- quest NPCs to try when the giver of a finished quest is unknown
+    acceptTries = 4,        -- quests to try per pickup (highest eligible level first)
+    questSkipTime = 600,    -- s to skip a quest that would not start (done / cooldown / locked)
     questGivers = {},       -- learned: tracker quest title -> giver path (saved with settings)
     infiniteDash = true,    -- Ctrl dash with no stamina cost and no cooldown (F9 toggles)
     dashCooldown = 0,       -- game value 0.55; 0.3 = the dash duration, 0 = every press dashes
@@ -629,7 +632,7 @@ local function pickQuest()
     end
     local lvl, pick = playerLevel(), QUESTS[1]
     for _, q in ipairs(QUESTS) do
-        if lvl >= q.minLevel then pick = q end
+        if lvl >= q.minLevel and q.mob then pick = q end
     end
     return pick
 end
@@ -663,7 +666,25 @@ end
 -- Walk up to a giver (it wanders, so re-read its root) and press E a few times:
 -- the first press fires the QuestPrompt, the rest step the dialogue and confirm
 -- the AcceptModal (accept is the default choice).
-local function talkTo(path)
+-- The giver's quest id from its QuestPrompt (the attribute the game's prompt handler reads).
+local function questIdOf(path)
+    local npc = child(Workspace, path)
+    if not npc then return nil end
+    for _, d in ipairs(npc:GetDescendants()) do
+        if d.ClassName == "ProximityPrompt" then
+            local id = attr(d, "QuestId")
+            if type(id) == "string" and id ~= "" then return id end
+        end
+    end
+    return nil
+end
+
+local function questRemote(name)
+    local rs = game:GetService("ReplicatedStorage")
+    return rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild(name)
+end
+
+local function talkTo(path, accept)
     local r = giverRoot(path)
     local np = partPos(r)
     if not np then setStatus("quest: giver " .. path .. " not loaded"); return false end
@@ -680,6 +701,26 @@ local function talkTo(path)
         if here and flatDist(here, spot) < 1.5 then break end
         if here and flatDist(here, spot) > CFG.nearRange then travelTo(spot, farming) else nudgeToward(spot, np, 4) end
         task.wait(0.25)
+    end
+    if CFG.questMode == "remote" then
+        -- The game's dialogue does QuestTalk:InvokeServer(questId) (this also turns a finished
+        -- quest in) and, for an offer, QuestAccept:InvokeServer(id) (UI.Dialogue). Live Nov 1
+        -- 2026: QuestTalk("boarQuest") at the town giver turned in "Show your Strength", and
+        -- QuestTalk + QuestAccept started a quest, all unfocused. Matcha's InvokeServer only
+        -- returns true, so the caller reads the tracker to see what happened.
+        local id = questIdOf(path)
+        local talk = questRemote("QuestTalk")
+        if not id or not talk then setStatus("quest: no quest id/remote for " .. path); return false end
+        setStatus("quest: talking to " .. path .. " (" .. id .. ")")
+        pcall(function() return talk:InvokeServer(id) end)
+        task.wait(0.5)
+        if accept then
+            local acc = questRemote("QuestAccept")
+            if acc then pcall(function() return acc:InvokeServer(id) end) end
+        end
+        task.wait(0.8)
+        STATE.giver = path
+        return true
     end
     if not focused() then setStatus("quest: waiting for Roblox focus"); return false end
     setStatus("quest: talking to " .. path)
@@ -728,9 +769,12 @@ end
 -- we accepted from, then every known quest NPC nearest first, until the tracker moves on.
 local function turnIn(tr)
     local title = tr and tr.title
-    -- Talking needs the E key, which only reaches a focused Roblox window; without focus
-    -- the search would teleport between NPCs for nothing.
-    if not focused() then setStatus("quest: '" .. tostring(title) .. "' done - focus Roblox to turn it in"); return false end
+    -- In "keys" mode talking needs the E key, which only reaches a focused Roblox window;
+    -- without focus the search would teleport between NPCs for nothing.
+    if CFG.questMode ~= "remote" and not focused() then
+        setStatus("quest: '" .. tostring(title) .. "' done - focus Roblox to turn it in")
+        return false
+    end
     local tried, order = {}, {}
     local function push(path) if path and not tried[path] then tried[path] = true; order[#order + 1] = path end end
     push(title and CFG.questGivers[title])
@@ -749,6 +793,47 @@ local function turnIn(tr)
         end
     end
     setStatus("quest: could not find where to turn in '" .. tostring(title) .. "'")
+    return false
+end
+
+-- Accept a kill quest: eligible quests (minLevel <= level) highest first, skipping ones
+-- that recently would not start (completed and not repeatable, on cooldown, level-locked).
+-- A quest that starts without a "Defeat X" step (tutorials, fetch quests) is cancelled
+-- again with QuestCancel:FireServer() (the menu's cancelQuest does exactly that).
+local QUEST_SKIP = {}
+local function acceptQuest(tr)
+    local lvl = playerLevel()
+    local cands = {}
+    for _, q in ipairs(QUESTS) do
+        if (not CFG.questId or q.id == CFG.questId) and lvl >= q.minLevel and clock() >= (QUEST_SKIP[q.id] or 0) then
+            cands[#cands + 1] = q
+        end
+    end
+    table.sort(cands, function(a, b) return a.minLevel > b.minLevel end)
+    local before = tr and tr.title
+    for i = 1, math.min(#cands, CFG.acceptTries) do
+        if not farming() then return false end
+        local q = cands[i]
+        local giver = nearestGiver(q)
+        if giver then
+            setStatus(string.format("quest: accepting %s at %s", q.id, giver))
+            talkTo(giver, true)
+            local after = readTracker()
+            if after and after.title and after.title ~= before then
+                if trackerTarget(after) then
+                    learnGiver(after.title, giver)
+                    return true
+                end
+                -- Started something we cannot farm: drop it and do not offer it again soon.
+                local cancel = questRemote("QuestCancel")
+                if cancel then pcall(function() cancel:FireServer() end) end
+                task.wait(0.8)
+                before = (readTracker() or {}).title
+            end
+        end
+        QUEST_SKIP[q.id] = clock() + CFG.questSkipTime
+    end
+    setStatus("quest: no kill quest would start (level " .. lvl .. ")")
     return false
 end
 
@@ -913,14 +998,18 @@ task.spawn(function()
                 lastTalk = clock()
                 turnIn(tr)
                 target = trackerTarget(readTracker())
-            elseif STATE.quest and not target and clock() - lastTalk > 6 and focused() then
+            elseif STATE.quest and not target and clock() - lastTalk > 6 and (CFG.questMode == "remote" or focused()) then
                 lastTalk = clock()
-                local giver = nearestGiver(q)
-                local before = tr and tr.title
-                if giver then talkTo(giver) else setStatus("quest: no giver loaded for " .. q.id); task.wait(1) end
-                local after = readTracker()
-                if giver and after and after.title and after.title ~= before then learnGiver(after.title, giver) end
-                target = trackerTarget(after)
+                if CFG.questMode == "remote" then
+                    acceptQuest(tr)
+                else
+                    local giver = nearestGiver(q)
+                    local before = tr and tr.title
+                    if giver then talkTo(giver) else setStatus("quest: no giver loaded for " .. q.id); task.wait(1) end
+                    local after = readTracker()
+                    if giver and after and after.title and after.title ~= before then learnGiver(after.title, giver) end
+                end
+                target = trackerTarget(readTracker())
             end
             target = target or q.mob
             if STATE.farm and myRoot() then
