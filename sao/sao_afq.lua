@@ -195,7 +195,9 @@ end
 
 local function grounded(pos, fromY)
     local g = groundY(pos.X, pos.Z, fromY or pos.Y)
-    if not g then return pos end
+    -- No raycast hit (Matcha's Raycast returned nil in every live test): keep our own height
+    -- instead of dropping to a mob collider's centre, which can sit below the ground.
+    if not g then return Vector3.new(pos.X, fromY or pos.Y, pos.Z) end
     return Vector3.new(pos.X, g + hipOffset, pos.Z)
 end
 
