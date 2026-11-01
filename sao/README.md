@@ -6,7 +6,7 @@ A standalone Auto Farm Quest script for Sword Art Online: Eternity (place 108438
 loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/sao/sao_afq.lua"))()
 ```
 
-Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
+Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
 
 ## What it does
 
@@ -28,13 +28,31 @@ Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8*
 
 ## Infinite dash (Ctrl)
 
-On by default (`infiniteDash = true`), toggled with F9, and undone on unload. The CombatPlus dodge config is a client table, `{ staminaCost = 10, speed = 50, duration = 0.3, cooldown = 0.55, invulnerable = 0.22 }`. The script finds it in the Luau heap (`findgc`) and sets `staminaCost` to 0 and `cooldown` to 0.3, so dashes chain back to back. The heap scan takes 15-30 s after load; the status line shows `dash:patching` until it's done.
+On by default (`infiniteDash = true`), toggled with F9, and undone on unload. The CombatPlus dodge config is a client table, `{ staminaCost = 10, speed = 50, duration = 0.3, cooldown = 0.55, invulnerable = 0.22 }`. The script finds it in the Luau heap (`findgc`) and sets `staminaCost` to 0 and `cooldown` to 0 (`dashCooldown`), so every Ctrl press dashes. The heap scan takes 15-30 s after load; the status line shows `dash:patching` until it's done.
 
-Live test: 33 dashes in 12 s with stamina at 0-5, up to 89 studs/s while sprinting, and no kick. The server didn't refuse any of them.
+Live test with cooldown 0.3: 33 dashes in 12 s with stamina at 0-5, up to 89 studs/s while sprinting, and no kick. The server didn't refuse any of them. Cooldown 0 is applied but untested.
+
+The dash's i-frames (`invulnerable = 0.22`) can't be changed from the client. The client only sends `Combat:FireServer("Dash")` and never reads `invulnerable`, so the server grants i-frames from its own copy of the config. Constant invulnerability would mean spamming that remote. The script doesn't do this, because remote calls are what crashed the Blox Fruits script.
+
+## Auto-parry (F)
+
+On by default (`autoParry = true`), toggled with F10.
+
+- **What the game does:**
+  - A mob attack fires the `MobTelegraph` effect: a red `Highlight` (named "Highlight") goes on the mob model and is destroyed after `windup + 0.1` s. The windup is 0.15-0.8 s, default 0.4.
+  - F with your weapon drawn sends `Combat:FireServer("Parry", serverTime)` if the client parry cooldown (`block.parryCooldown = 0.9`) is over; otherwise it blocks.
+  - The server judges the parry against `block.parryWindow = 0.4`.
+- **What the script does:**
+  - Every 0.5 s it lists mobs within `parryRange` (25 studs).
+  - 30 times a second it checks those mobs for a new "Highlight" child.
+  - It taps F so the press lands `parryLead` (0.2 s) before the expected hit.
+  - It learns each mob type's windup from how long the highlight lasted.
+  - Your weapon has to be drawn: a sheathed F press does nothing.
+- **Optional:** set `parryCooldown = 0.3` to shorten the client cooldown. The server may still have its own.
+- **Not verified yet:** whether the presses actually parry. During the first live watcher (60 s), no telegraph was seen.
 
 ## To do
 
-- **Auto-parry (F).** The parry config sits next to the dash config in the heap: `window = 1.2`, `cooldown = 0.4`, `lungeRange = 16`, `slowAttacker = 0.45`, `poise = 2`, `damage = 1.5`. Next step: find what tells the client a mob attack is coming (the `telegraph` config / `CombatFeedback` remote), and press F inside the window.
 - **Dash travel.** Use the infinite dash for travel instead of CFrame steps: face the target and press Ctrl, about 15 studs per dash at the game's own 50 studs/s dash speed.
 
 ## Not verified yet
@@ -52,7 +70,8 @@ _G.SAO_AFQ_CONFIG = {
     questId = "boarQuest",   -- force one quest giver
     autoQuest = false,       -- just farm, never talk to givers
     stepSpeed = 48, stepHz = 12, stepLift = 0.4, climbLift = 4,
-    infiniteDash = true, dashCooldown = 0.3,
+    infiniteDash = true, dashCooldown = 0,
+    autoParry = true, parryRange = 25, parryLead = 0.2, parryCooldown = nil,
     holdHz = 10, clickHz = 6,
 }
 ```

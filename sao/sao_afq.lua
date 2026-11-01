@@ -31,7 +31,7 @@
     ClassName), instances are not comparable with == (compare .Address).
 
     Keys: F6 farm on/off, F7 quest pickup on/off, F8 dump to console, F9 infinite dash,
-          End unload.
+          F10 auto-parry, End unload.
     Override any CFG field before loading:
         _G.SAO_AFQ_CONFIG = { mobName = "Dire Wolf", autoQuest = false }
 ]]
@@ -74,15 +74,20 @@ local CFG = {
     climbLift = 4,          -- max lift per step when terrain pushes us back (slopes, steps)
     nearRange = 12,         -- inside this a fight/giver adjust is one short placement
     talkPresses = 5,        -- E presses at a giver (opens the prompt, steps dialogue, confirms)
-    infiniteDash = true,    -- Ctrl dash with no stamina cost and a short cooldown (F9 toggles)
-    dashCooldown = 0.3,     -- = the dash duration, so dashes chain back to back
-    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, unload = 0x23 },
+    infiniteDash = true,    -- Ctrl dash with no stamina cost and no cooldown (F9 toggles)
+    dashCooldown = 0,       -- game value 0.55; 0.3 = the dash duration, 0 = every press dashes
+    autoParry = true,       -- tap F when a nearby mob telegraphs an attack (F10 toggles)
+    parryRange = 25,        -- studs: mobs watched for telegraphs
+    parryLead = 0.2,        -- s before the hit to press F (server parry window is 0.4 s)
+    parryCooldown = nil,    -- e.g. 0.3 to patch the client 0.9 s parry cooldown; nil = leave it
+    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, unload = 0x23 },
 }
 if type(_G.SAO_AFQ_CONFIG) == "table" then
     for k, v in pairs(_G.SAO_AFQ_CONFIG) do CFG[k] = v end
 end
 
 local VK_E = 0x45
+local VK_F = 0x46
 -- Server movement cap is RemakeConfig.MAX_MOVE_SPEED = 50. A brief 57.6 studs/s spike
 -- (own dash on top of 36 studs/s steps) did not kick, but travel stays just under 50.
 local MAX_STEP_SPEED = 49
@@ -92,7 +97,7 @@ local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do task.wait(0.1); LocalPlayer = Players.LocalPlayer end
 local Workspace = game:GetService("Workspace")
 
-local STATE = { running = true, farm = false, quest = CFG.autoQuest, status = "idle", giver = nil }
+local STATE = { running = true, farm = false, quest = CFG.autoQuest, parry = CFG.autoParry, status = "idle", giver = nil }
 local API = { unload = function() end }
 _G.SAO_AFQ = API
 
@@ -572,6 +577,101 @@ local function setDash(on)
     end)
 end
 
+-- ---------------------------------------------------------------------------
+-- Auto-parry (F)
+-- ---------------------------------------------------------------------------
+-- How the game does it (Systems.Combat / Systems.Effects, read Nov 1 2026):
+--   * a mob attack fires the MobTelegraph effect: a Highlight (default Name "Highlight")
+--     is parented to the mob model and destroyed after windup + 0.1 s, windup clamped to
+--     0.15-0.8 s (default 0.4). The hit lands when the windup ends.
+--   * F with the weapon drawn sends FireServer("Parry", serverTime) when the client
+--     parry cooldown (CombatConfig.block.parryCooldown = 0.9) is over, else it blocks.
+--     The server judges the parry with block.parryWindow = 0.4.
+-- So: watch nearby mobs for a new "Highlight" child, tap F so the press lands about
+-- parryLead s before the hit, and learn each MobKind's windup from how long its
+-- highlight lived. Highlights named CombatPlusFlash / CombatPlusBlade are hit effects.
+local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0 }
+
+local function tapParry()
+    if not focused() then return false end
+    PARRY.pressedAt = clock()
+    PARRY.count = PARRY.count + 1
+    pcall(function() keypress(VK_F); task.wait(0.05); keyrelease(VK_F) end)
+    return true
+end
+
+-- Collector (2 Hz): mobs within parryRange.
+task.spawn(function()
+    while alive() do
+        local out = {}
+        if STATE.parry then
+            local here = partPos(myRoot())
+            local folder = Workspace:FindFirstChild("Mobs")
+            if here and folder then
+                for _, m in ipairs(folder:GetChildren()) do
+                    if mobAlive(m) then
+                        local p = partPos(m:FindFirstChild("Collider") or m.PrimaryPart)
+                        if p and (p - here).Magnitude <= CFG.parryRange then out[#out + 1] = m end
+                    end
+                end
+            end
+        end
+        PARRY.near = out
+        task.wait(0.5)
+    end
+end)
+
+-- Watcher (30 Hz): new telegraph highlight -> schedule one F tap.
+task.spawn(function()
+    while alive() do
+        if STATE.parry then
+            local now = clock()
+            for _, m in ipairs(PARRY.near) do
+                local h = m.Parent and m:FindFirstChild("Highlight")
+                local okA, mobKey = pcall(function() return m.Address end)
+                mobKey = okA and mobKey or m.Name
+                local entry = PARRY.seen[mobKey]
+                if h and h.ClassName == "Highlight" then
+                    local okH, hKey = pcall(function() return h.Address end)
+                    hKey = okH and hKey or now
+                    if not entry or entry.h ~= hKey then
+                        local kind = tostring(attr(m, "MobKind") or m.Name)
+                        PARRY.seen[mobKey] = { h = hKey, at = now, kind = kind }
+                        local windup = PARRY.windup[kind] or 0.4
+                        local delay = math.max(0, windup - CFG.parryLead)
+                        task.delay(delay, function()
+                            if alive() and STATE.parry and clock() - PARRY.pressedAt > 0.25 then tapParry() end
+                        end)
+                    end
+                elseif entry and entry.h and not entry.done then
+                    -- Highlight gone: it lived windup + 0.1 s. Learn the windup for this kind.
+                    local lived = now - entry.at - 0.1
+                    if lived >= 0.1 and lived <= 0.9 then
+                        local old = PARRY.windup[entry.kind]
+                        PARRY.windup[entry.kind] = old and (old * 0.6 + lived * 0.4) or lived
+                    end
+                    entry.done = true
+                end
+            end
+        end
+        task.wait(1 / 30)
+    end
+end)
+
+-- Optional: shorten the client parry cooldown (0.9 s) so back-to-back attacks can both be
+-- parried. The server may keep its own cooldown; nil leaves the game value alone.
+local PARRY_ORIGINAL_COOLDOWN = 0.9
+local function patchParryCooldown(on)
+    if not CFG.parryCooldown then return end
+    task.spawn(function()
+        if on then
+            pcall(setgc, "parryCooldown", CFG.parryCooldown, PARRY_ORIGINAL_COOLDOWN)
+        else
+            pcall(setgc, "parryCooldown", PARRY_ORIGINAL_COOLDOWN, CFG.parryCooldown)
+        end
+    end)
+end
+
 local label = nil
 pcall(function()
     label = Drawing.new("Text")
@@ -592,14 +692,16 @@ task.spawn(function()
                 elseif name == "quest" then STATE.quest = not STATE.quest
                 elseif name == "dump" then task.spawn(dump)
                 elseif name == "dash" then setDash(DASH.state ~= "on")
+                elseif name == "parry" then STATE.parry = not STATE.parry
                 elseif name == "unload" then API.unload() end
             end
             was[name] = down
         end
         if label then
             pcall(function()
-                label.Text = string.format("SAO AFQ  farm:%s  quest:%s  dash:%s  |  %s",
-                    STATE.farm and "ON" or "off", STATE.quest and "ON" or "off", DASH.state, STATE.status)
+                label.Text = string.format("SAO AFQ  farm:%s  quest:%s  dash:%s  parry:%s(%d)  |  %s",
+                    STATE.farm and "ON" or "off", STATE.quest and "ON" or "off", DASH.state,
+                    STATE.parry and "ON" or "off", PARRY.count, STATE.status)
             end)
         end
         task.wait(0.1)
@@ -609,10 +711,12 @@ end)
 API.unload = function()
     STATE.running, STATE.farm = false, false
     if DASH.state == "on" then setDash(false) end
+    patchParryCooldown(false)
     if label then pcall(function() label:Remove() end); label = nil end
     if _G.SAO_AFQ == API then _G.SAO_AFQ = nil end
 end
 API.state, API.config, API.dump, API.quests, API.setDash = STATE, CFG, dump, QUESTS, setDash
 
 if CFG.infiniteDash then setDash(true) end
-print("[SAO AFQ] loaded - F6 farm, F7 quest pickup, F8 dump, F9 infinite dash, End unload")
+patchParryCooldown(true)
+print("[SAO AFQ] loaded - F6 farm, F7 quest pickup, F8 dump, F9 infinite dash, F10 auto-parry, End unload")
