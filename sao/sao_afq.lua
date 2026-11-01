@@ -81,6 +81,8 @@ local CFG = {
     parryLead = 0.2,        -- s before the hit to press F (server parry window is 0.4 s)
     parryCooldown = 0.25,   -- patches the client 0.9 s parry cooldown (several attackers); nil = leave it
     parryMinGap = 0.12,     -- s between auto-parry taps
+    parryMode = "key",      -- "key": tap F (needs Roblox focus); "remote": Combat:FireServer("Parry", t)
+    parryFace = true,       -- remote mode: turn toward the attacker first (enemy behind you)
     skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting ({} = none)
     skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)
     zeroSkillCooldown = true, -- patch the client skill cooldowns to 0 (server still enforces its own)
@@ -657,10 +659,57 @@ end
 -- parryLead s before the hit, and learn each MobKind's windup from how long its
 -- highlight lived. Highlights named CombatPlusFlash / CombatPlusBlade are hit effects.
 
-local function tapParry()
-    if not focused() then return false end
+-- Server time for the remote parry. The game sends workspace:GetServerTimeNow() (Unix
+-- seconds with a fraction), which Matcha does not bind, and Matcha's tick()/os.clock()
+-- count from boot. os.time() is Unix time in whole seconds, so catch the moment it ticks
+-- over and carry the fraction with os.clock() from there (about one frame of error plus
+-- the PC clock offset, small next to the 0.4 s parry window).
+local SERVER_CLOCK = { base = nil, at = nil }
+task.spawn(function()
+    local s0 = os.time()
+    local untilT = clock() + 2
+    while clock() < untilT do
+        local s = os.time()
+        if s ~= s0 then
+            SERVER_CLOCK.base, SERVER_CLOCK.at = s, clock()
+            break
+        end
+        task.wait()
+    end
+end)
+local function serverTimeNow()
+    if SERVER_CLOCK.base then return SERVER_CLOCK.base + (clock() - SERVER_CLOCK.at) end
+    return os.time()
+end
+
+-- Turn the root toward the attacker (one write) so a parry from behind still faces it.
+local function faceToward(p)
+    local root = myRoot()
+    local here = partPos(root)
+    if not here or not p then return end
+    local dir = Vector3.new(p.X - here.X, 0, p.Z - here.Z)
+    if dir.Magnitude < 0.1 then return end
+    pcall(function() root.CFrame = CFrame.lookAt(here, here + dir) end)
+end
+
+local combatRemote = nil
+local function tapParry(attacker)
     PARRY.pressedAt = clock()
     PARRY.count = PARRY.count + 1
+    if CFG.parryMode == "remote" then
+        -- Same call the game's F handler makes (Systems.Combat): Combat:FireServer("Parry",
+        -- serverTime). FireServer is one-way; works without Roblox focus or an F press.
+        if CFG.parryFace and attacker then
+            faceToward(partPos(attacker:FindFirstChild("Collider") or attacker.PrimaryPart))
+        end
+        if not combatRemote then
+            local rs = game:GetService("ReplicatedStorage")
+            combatRemote = rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild("Combat")
+        end
+        if not combatRemote then return false end
+        return (pcall(function() combatRemote:FireServer("Parry", serverTimeNow()) end))
+    end
+    if not focused() then return false end
     pcall(function() keypress(VK_F); task.wait(0.05); keyrelease(VK_F) end)
     return true
 end
@@ -710,7 +759,7 @@ task.spawn(function()
                             task.wait(delay)
                             -- 0.12 s spacing: one tap can cover attacks that land together
                             -- (parry window 0.4 s), but a later attacker still gets its own.
-                            if alive() and STATE.parry and clock() - PARRY.pressedAt > CFG.parryMinGap then tapParry() end
+                            if alive() and STATE.parry and clock() - PARRY.pressedAt > CFG.parryMinGap then tapParry(m) end
                         end)
                     end
                 elseif entry and entry.h and not entry.done then
