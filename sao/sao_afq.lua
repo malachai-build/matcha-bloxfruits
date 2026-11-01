@@ -104,8 +104,9 @@ local CFG = {
     parryServerCooldown = 0.9, -- remote mode: inside this since the last parry, block instead
     blockHold = 0.45,       -- s to hold that block before releasing it
     skillMode = "remote",   -- "remote": SwordSkillCast remote (no focus); "keys": tap skillSlots
-    remoteSkills = { "Avalanche" }, -- equipped skill ids (Greatsword: Avalanche, Cyclone,
-                                    -- TitansVerdict, ExecutionersCross)
+    slotSkills = { "none", "Avalanche", "none", "none" }, -- skill id per slot 1-4 (menu: Skills);
+                                    -- Greatsword: Avalanche, Cyclone, TitansVerdict, ExecutionersCross
+    remoteSkills = { "Avalanche" }, -- rebuilt from slotSkills at load and on every menu change
     skillRecast = 9,        -- s between casts of one skill (server cooldown measured ~8.5 s)
     skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting in "keys" mode ({} = none)
     skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)
@@ -118,7 +119,7 @@ local CFG = {
     retreatMaxWait = 60,    -- s to wait for health before farming again anyway
     townPos = Vector3.new(45, 87, -3026), -- Town of Beginnings spawn area: HP regen (2%/s) works here
                                           -- only; nil = just back off retreatDistance studs
-    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, unload = 0x23 },
+    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, unload = 0x23, gui = 0x2D },
 }
 if type(_G.SAO_AFQ_CONFIG) == "table" then
     for k, v in pairs(_G.SAO_AFQ_CONFIG) do CFG[k] = v end
@@ -146,6 +147,8 @@ local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0, 
     lastRemoteParry = -1e9, blockSeq = 0 }
 -- Remote sword skill casts: next allowed time per skill id, and our own cast counter.
 local SKILLCAST = { nextAt = {}, castId = 5000 }
+-- Set by the settings menu loop: the mouse is over the menu, so click-mode attacks wait.
+local MENU_MOUSE = { over = false }
 local API = { unload = function() end }
 _G.SAO_AFQ = API
 
@@ -737,7 +740,7 @@ local function fight(mob)
             end
         elseif clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 then
             nextClick = clock() + clickEvery
-            if focused() and clock() >= PARRY.holdClicksUntil then pcall(mouse1click) end
+            if focused() and clock() >= PARRY.holdClicksUntil and not MENU_MOUSE.over then pcall(mouse1click) end
         end
         -- Sword skills: tap the slot keys often. The client refuses early taps by itself
         -- (Duration lock while the animation plays, server-synced cooldown after a reject),
@@ -1106,12 +1109,285 @@ task.spawn(function()
     end
 end)
 
+-- ---------------------------------------------------------------------------
+-- Settings menu (Drawing only: Matcha cannot create Roblox GUI instances)
+-- ---------------------------------------------------------------------------
+-- Drag the title bar to move it, click a section header to open/close it, click a value
+-- to toggle / open its dropdown / step a number (left half lower, right half higher).
+-- Insert shows/hides it. Settings are saved to sao_afq_settings.json in the Matcha
+-- workspace on every change and loaded at start.
+local SKILL_OPTIONS = { "none", "Avalanche", "Cyclone", "TitansVerdict", "ExecutionersCross" }
+local MOB_OPTIONS = { "auto (quest)", "Frenzy Boar", "Dire Wolf", "Wind Wasp", "Little Nepenthes",
+    "Ruin Kobold Trooper", "Ruin Kobold Sentinel" }
+local SETTINGS_FILE = "sao_afq_settings.json"
+
+local function rebuildRemoteSkills()
+    local out = {}
+    for i = 1, 4 do
+        local id = CFG.slotSkills[i]
+        if id and id ~= "none" then out[#out + 1] = id end
+    end
+    CFG.remoteSkills = out
+end
+
+local function saveSettings()
+    pcall(function()
+        local data = {
+            travelMode = CFG.travelMode, attackMode = CFG.attackMode, skillMode = CFG.skillMode,
+            slotSkills = CFG.slotSkills, skillRecast = CFG.skillRecast, parryMode = CFG.parryMode,
+            retreatHp = CFG.retreatHp, mobName = CFG.mobName or false, infiniteDash = CFG.infiniteDash,
+            autoQuest = STATE.quest, autoParry = STATE.parry,
+        }
+        writefile(SETTINGS_FILE, game:GetService("HttpService"):JSONEncode(data))
+    end)
+end
+
+local function loadSettings()
+    pcall(function()
+        if type(isfile) == "function" and not isfile(SETTINGS_FILE) then return end
+        local d = game:GetService("HttpService"):JSONDecode(readfile(SETTINGS_FILE))
+        if type(d) ~= "table" then return end
+        for _, k in ipairs({ "travelMode", "attackMode", "skillMode", "skillRecast", "parryMode", "retreatHp", "infiniteDash" }) do
+            if d[k] ~= nil then CFG[k] = d[k] end
+        end
+        if type(d.slotSkills) == "table" then
+            for i = 1, 4 do CFG.slotSkills[i] = d.slotSkills[i] or d.slotSkills[tostring(i)] or CFG.slotSkills[i] end
+        end
+        if d.mobName ~= nil then CFG.mobName = d.mobName or nil end
+        if d.autoQuest ~= nil then STATE.quest = d.autoQuest end
+        if d.autoParry ~= nil then STATE.parry = d.autoParry end
+    end)
+    rebuildRemoteSkills()
+end
+loadSettings()
+
+local GUI = {
+    x = 40, y = 120, w = 270, visible = true, open = { Farm = true, Skills = true },
+    rows = {}, pool = {}, popup = nil, popPool = {}, drag = nil, mouseWas = false,
+}
+local ROW_H, HEAD_H, TITLE_H = 18, 20, 22
+local C_BG, C_TITLE, C_HEAD = Color3.fromRGB(22, 26, 34), Color3.fromRGB(60, 120, 200), Color3.fromRGB(38, 46, 60)
+local C_TEXT, C_VALUE, C_POP = Color3.fromRGB(230, 235, 245), Color3.fromRGB(120, 220, 255), Color3.fromRGB(30, 36, 48)
+
+local function onOff(v) return v and "ON" or "off" end
+local function fmtNum(v) return (math.abs(v - math.floor(v)) < 1e-6) and tostring(math.floor(v)) or string.format("%.2f", v) end
+
+-- Each item: { section, label, kind = "toggle"|"choice"|"num"|"button", get, set, options, step, min, max }
+local ITEMS = {
+    { "Farm", "Farm (F6)", "toggle", function() return STATE.farm end, function(v) STATE.farm = v end },
+    { "Farm", "Auto quest (F7)", "toggle", function() return STATE.quest end, function(v) STATE.quest = v end },
+    { "Farm", "Target mob", "choice", function() return CFG.mobName or "auto (quest)" end,
+        function(v) CFG.mobName = (v ~= "auto (quest)") and v or nil end, MOB_OPTIONS },
+    { "Travel", "Travel mode", "choice", function() return CFG.travelMode end, function(v) CFG.travelMode = v end,
+        { "teleport", "dash", "step" } },
+    { "Travel", "Infinite dash (F9)", "toggle", function() return DASH.state == "on" end,
+        function(v) CFG.infiniteDash = v; setDash(v) end },
+    { "Combat", "Attack mode", "choice", function() return CFG.attackMode end, function(v) CFG.attackMode = v end,
+        { "remote", "click" } },
+    { "Combat", "Skill mode", "choice", function() return CFG.skillMode end, function(v) CFG.skillMode = v end,
+        { "remote", "keys" } },
+    { "Skills", "Slot 1", "choice", function() return CFG.slotSkills[1] end, function(v) CFG.slotSkills[1] = v; rebuildRemoteSkills() end, SKILL_OPTIONS },
+    { "Skills", "Slot 2", "choice", function() return CFG.slotSkills[2] end, function(v) CFG.slotSkills[2] = v; rebuildRemoteSkills() end, SKILL_OPTIONS },
+    { "Skills", "Slot 3", "choice", function() return CFG.slotSkills[3] end, function(v) CFG.slotSkills[3] = v; rebuildRemoteSkills() end, SKILL_OPTIONS },
+    { "Skills", "Slot 4", "choice", function() return CFG.slotSkills[4] end, function(v) CFG.slotSkills[4] = v; rebuildRemoteSkills() end, SKILL_OPTIONS },
+    { "Skills", "Recast (s)", "num", function() return CFG.skillRecast end, function(v) CFG.skillRecast = v end, nil, 0.5, 1, 30 },
+    { "Parry", "Auto parry (F10)", "toggle", function() return STATE.parry end, function(v) STATE.parry = v end },
+    { "Parry", "Parry mode", "choice", function() return CFG.parryMode end, function(v) CFG.parryMode = v end,
+        { "remote", "key" } },
+    { "Survival", "Retreat below HP", "num", function() return CFG.retreatHp end, function(v) CFG.retreatHp = v end, nil, 0.05, 0.1, 0.9 },
+    { "Survival", "Unload script (End)", "button", function() return "" end, function() API.unload() end },
+}
+local SECTIONS = { "Farm", "Travel", "Combat", "Skills", "Parry", "Survival" }
+
+local function newDraw(kind, props)
+    local ok, d = pcall(Drawing.new, kind)
+    if not ok or not d then return nil end
+    for k, v in pairs(props) do pcall(function() d[k] = v end) end
+    return d
+end
+
+-- Fixed pool: one bg square + label + value text per visible row (sections + items).
+local POOL_N = #ITEMS + #SECTIONS + 1
+GUI.bg = newDraw("Square", { Filled = true, Color = C_BG, Transparency = 0.08, ZIndex = 1, Visible = false })
+GUI.title = newDraw("Square", { Filled = true, Color = C_TITLE, Transparency = 0, ZIndex = 2, Visible = false })
+GUI.titleText = newDraw("Text", { Text = "SAO AFQ  (drag | Insert hides)", Size = 14, Outline = true, Color = C_TEXT, ZIndex = 3, Visible = false })
+for i = 1, POOL_N do
+    GUI.pool[i] = {
+        bg = newDraw("Square", { Filled = true, Color = C_HEAD, Transparency = 0, ZIndex = 2, Visible = false }),
+        label = newDraw("Text", { Size = 13, Outline = true, Color = C_TEXT, ZIndex = 3, Visible = false }),
+        value = newDraw("Text", { Size = 13, Outline = true, Color = C_VALUE, ZIndex = 3, Visible = false }),
+    }
+end
+for i = 1, 8 do
+    GUI.popPool[i] = {
+        bg = newDraw("Square", { Filled = true, Color = C_POP, Transparency = 0, ZIndex = 6, Visible = false }),
+        text = newDraw("Text", { Size = 13, Outline = true, Color = C_TEXT, ZIndex = 7, Visible = false }),
+    }
+end
+
+local function setVis(d, v) if d then pcall(function() d.Visible = v end) end end
+local function place(d, x, y) if d then pcall(function() d.Position = Vector2.new(x, y) end) end end
+local function size(d, w, h) if d then pcall(function() d.Size = Vector2.new(w, h) end) end end
+local function setText(d, s) if d then pcall(function() d.Text = s end) end end
+
+-- Build the visible row list for the current open sections.
+local function layout()
+    local rows, y = {}, GUI.y + TITLE_H
+    for _, sec in ipairs(SECTIONS) do
+        rows[#rows + 1] = { kind = "section", name = sec, y = y, h = HEAD_H }
+        y = y + HEAD_H
+        if GUI.open[sec] then
+            for _, it in ipairs(ITEMS) do
+                if it[1] == sec then
+                    rows[#rows + 1] = { kind = "item", item = it, y = y, h = ROW_H }
+                    y = y + ROW_H
+                end
+            end
+        end
+    end
+    GUI.rows, GUI.h = rows, y - GUI.y + 4
+end
+
+local function valueText(it)
+    local kind, get = it[3], it[4]
+    local ok, v = pcall(get)
+    if not ok then return "?" end
+    if kind == "toggle" then return onOff(v) end
+    if kind == "num" then return "- " .. fmtNum(v) .. " +" end
+    if kind == "button" then return "[ click ]" end
+    return tostring(v) .. " v"
+end
+
+local function render()
+    local show = GUI.visible and alive()
+    setVis(GUI.bg, show); setVis(GUI.title, show); setVis(GUI.titleText, show)
+    if show then
+        place(GUI.bg, GUI.x, GUI.y); size(GUI.bg, GUI.w, GUI.h)
+        place(GUI.title, GUI.x, GUI.y); size(GUI.title, GUI.w, TITLE_H)
+        place(GUI.titleText, GUI.x + 6, GUI.y + 4)
+    end
+    for i, slot in ipairs(GUI.pool) do
+        local row = GUI.rows[i]
+        local vis = show and row ~= nil
+        setVis(slot.bg, vis and row.kind == "section"); setVis(slot.label, vis); setVis(slot.value, vis)
+        if vis then
+            if row.kind == "section" then
+                place(slot.bg, GUI.x + 2, row.y + 1); size(slot.bg, GUI.w - 4, HEAD_H - 2)
+                setText(slot.label, (GUI.open[row.name] and "v  " or ">  ") .. row.name)
+                place(slot.label, GUI.x + 8, row.y + 3)
+                setText(slot.value, "")
+            else
+                setText(slot.label, row.item[2]); place(slot.label, GUI.x + 16, row.y + 2)
+                setText(slot.value, valueText(row.item)); place(slot.value, GUI.x + 150, row.y + 2)
+            end
+        end
+    end
+    local pop = GUI.popup
+    for i, slot in ipairs(GUI.popPool) do
+        local opt = pop and pop.options[i]
+        local vis = show and opt ~= nil
+        setVis(slot.bg, vis); setVis(slot.text, vis)
+        if vis then
+            local y = pop.y + (i - 1) * ROW_H
+            place(slot.bg, pop.x, y); size(slot.bg, pop.w, ROW_H)
+            setText(slot.text, ((opt == pop.current) and "> " or "  ") .. opt); place(slot.text, pop.x + 4, y + 2)
+        end
+    end
+end
+
+local function inside(mx, my, x, y, w, h) return mx >= x and mx <= x + w and my >= y and my <= y + h end
+
+-- Mouse over the menu (or its open dropdown): click-mode farm clicks skip it.
+local function menuHasMouse(mx, my)
+    if not GUI.visible then return false end
+    if inside(mx, my, GUI.x, GUI.y, GUI.w, GUI.h or 0) then return true end
+    local pop = GUI.popup
+    return pop ~= nil and inside(mx, my, pop.x, pop.y, pop.w, #pop.options * ROW_H)
+end
+
+local function click(mx, my)
+    local pop = GUI.popup
+    if pop then
+        GUI.popup = nil
+        if inside(mx, my, pop.x, pop.y, pop.w, #pop.options * ROW_H) then
+            local opt = pop.options[math.floor((my - pop.y) / ROW_H) + 1]
+            if opt then pcall(pop.item[5], opt); saveSettings() end
+            return
+        end
+    end
+    if not inside(mx, my, GUI.x, GUI.y + TITLE_H, GUI.w, GUI.h - TITLE_H) then return end
+    for _, row in ipairs(GUI.rows) do
+        if my >= row.y and my < row.y + row.h then
+            if row.kind == "section" then
+                GUI.open[row.name] = not GUI.open[row.name]
+                layout()
+            else
+                local it = row.item
+                local kind, get, set = it[3], it[4], it[5]
+                if kind == "toggle" then
+                    local ok, v = pcall(get); pcall(set, not (ok and v)); saveSettings()
+                elseif kind == "button" then
+                    pcall(set)
+                elseif kind == "num" then
+                    local ok, v = pcall(get)
+                    if ok and type(v) == "number" then
+                        local nv = (mx < GUI.x + 190) and v - it[7] or v + it[7]
+                        nv = math.clamp(nv, it[8], it[9])
+                        pcall(set, math.floor(nv * 100 + 0.5) / 100); saveSettings()
+                    end
+                elseif kind == "choice" then
+                    local ok, v = pcall(get)
+                    GUI.popup = { item = it, options = it[6], current = ok and v or nil,
+                        x = GUI.x + 146, y = row.y + ROW_H, w = GUI.w - 150 }
+                end
+            end
+            return
+        end
+    end
+end
+
+layout()
+task.spawn(function()
+    local mouse = nil
+    pcall(function() mouse = LocalPlayer:GetMouse() end)
+    local lastToggle, lastLayout = false, 0
+    while alive() do
+        local down = keyDown(CFG.keys.gui)
+        if down and not lastToggle then GUI.visible = not GUI.visible; GUI.popup = nil end
+        lastToggle = down
+        local okM, mx, my = pcall(function() return mouse.X, mouse.Y end)
+        local pressed = type(ismouse1pressed) == "function" and ismouse1pressed() == true
+        MENU_MOUSE.over = okM and mx ~= nil and menuHasMouse(mx, my)
+        if GUI.visible and okM and mx then
+            if pressed and not GUI.mouseWas then
+                if inside(mx, my, GUI.x, GUI.y, GUI.w, TITLE_H) then
+                    GUI.drag = { dx = mx - GUI.x, dy = my - GUI.y }
+                else
+                    click(mx, my)
+                end
+            elseif pressed and GUI.drag then
+                GUI.x, GUI.y = mx - GUI.drag.dx, my - GUI.drag.dy
+                layout()
+            elseif not pressed then
+                GUI.drag = nil
+            end
+        end
+        GUI.mouseWas = pressed
+        if clock() - lastLayout > 0.25 then lastLayout = clock(); layout() end
+        render()
+        task.wait(1 / 30)
+    end
+end)
+
 API.unload = function()
     STATE.running, STATE.farm = false, false
     if DASH.state == "on" then setDash(false) end
     patchParryCooldown(false)
     if SKILL.state == "on" then setSkillCooldowns(false) end
     if label then pcall(function() label:Remove() end); label = nil end
+    for _, d in ipairs({ GUI.bg, GUI.title, GUI.titleText }) do pcall(function() d:Remove() end) end
+    for _, s in ipairs(GUI.pool) do for _, d in pairs(s) do pcall(function() d:Remove() end) end end
+    for _, s in ipairs(GUI.popPool) do for _, d in pairs(s) do pcall(function() d:Remove() end) end end
     if _G.SAO_AFQ == API then _G.SAO_AFQ = nil end
 end
 API.state, API.config, API.dump, API.quests, API.setDash = STATE, CFG, dump, QUESTS, setDash

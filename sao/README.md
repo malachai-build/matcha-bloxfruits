@@ -6,7 +6,21 @@ A standalone Auto Farm Quest script for Sword Art Online: Eternity (place 108438
 loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/sao/sao_afq.lua"))()
 ```
 
-Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
+Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, **Insert** shows or hides the settings menu, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
+
+## Settings menu
+
+A Drawing-based box. Matcha can't create real Roblox GUI.
+
+- **Moving and hiding:** drag the blue title bar to move it. **Insert** shows or hides it.
+- **Sections:** click a section header (Farm, Travel, Combat, Skills, Parry, Survival) to open or close it.
+- **Values:** click a value to change it.
+  - on/off switches flip.
+  - dropdowns (`v`) open a list; pick one.
+  - numbers step down on the left half (`-`) and up on the right half (`+`).
+- **Skills:** pick a skill id for slots 1-4, and the script casts every filled slot remotely during fights (`slotSkills`; default slot 2 = Avalanche). The list has the Greatsword skills.
+- **Saving:** every change is saved to `sao_afq_settings.json` in the Matcha workspace and loaded on the next start.
+- **Mouse note:** clicks on the menu also reach the game underneath. In `attackMode = "click"` the script skips its own clicks while the mouse is over the menu.
 
 ## What it does
 
