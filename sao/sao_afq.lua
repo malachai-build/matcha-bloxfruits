@@ -251,10 +251,16 @@ local function walkToward(pos, keepGoing)
         if lastP and clock() - lastAt >= 2.5 then
             local now = partPos(myRoot())
             if now and flatDist(now, lastP) < 2 then
+                -- Live test Nov 1 2026: a Matcha WalkToPoint write does not start a walk, and
+                -- Workspace:Raycast always returns nil, so a step burst here could not follow
+                -- the ground. Stop instead of stepping blind.
                 stuckBursts = stuckBursts + 1
-                if stuckBursts > 20 then return false end
-                setStatus("travel: stuck, stepping " .. math.floor(d) .. " studs out")
-                stepToward(pos, keepGoing, 2)
+                if stuckBursts >= 2 then
+                    pcall(function() hum.WalkToPoint = now end)
+                    setStatus("travel: walk not moving (WalkToPoint unsupported) - stopped")
+                    STATE.farm = false
+                    return false
+                end
             end
             lastP, lastAt = partPos(myRoot()), clock()
         end
@@ -265,7 +271,16 @@ end
 -- keepGoing() false stops it.
 local function travelTo(pos, keepGoing)
     measureHip()
-    if CFG.travelMode == "step" then return stepToward(pos, keepGoing) end
+    if CFG.travelMode == "step" then
+        -- Grounded steps need a working raycast; without one they hold a constant height.
+        local cur = partPos(myRoot())
+        if cur and not groundY(cur.X, cur.Z, cur.Y) then
+            setStatus("travel: Raycast unavailable, step mode disabled - stopped")
+            STATE.farm = false
+            return false
+        end
+        return stepToward(pos, keepGoing)
+    end
     return walkToward(pos, keepGoing)
 end
 
