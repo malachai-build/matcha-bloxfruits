@@ -90,6 +90,8 @@ local CFG = {
     climbLift = 4,          -- max lift per step when terrain pushes us back (slopes, steps)
     nearRange = 12,         -- inside this a fight/giver adjust is one short placement
     talkPresses = 5,        -- E presses at a giver (opens the prompt, steps dialogue, confirms)
+    turnInTries = 6,        -- quest NPCs to try when the giver of a finished quest is unknown
+    questGivers = {},       -- learned: tracker quest title -> giver path (saved with settings)
     infiniteDash = true,    -- Ctrl dash with no stamina cost and no cooldown (F9 toggles)
     dashCooldown = 0,       -- game value 0.55; 0.3 = the dash duration, 0 = every press dashes
     autoParry = true,       -- tap F when a nearby mob telegraphs an attack (F10 toggles)
@@ -112,6 +114,8 @@ local CFG = {
     skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting in "keys" mode ({} = none)
     skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)
     zeroSkillCooldown = true, -- patch the client skill cooldowns to 0 (server still enforces its own)
+    avoidPlayers = true,    -- never target a mob with another player near it
+    playerRadius = 50,      -- studs
     crowdRadius = 15,       -- studs: other mobs this close to a target count as a crowd
     crowdPenalty = 40,      -- studs of distance each crowding mob adds to a target's cost
     retreatHp = 0.35,       -- below this HP fraction, leave the fight
@@ -505,6 +509,16 @@ local function readTracker()
             end
         end
     end
+    -- Live Nov 1 2026: a finished quest was not turned in and the script went to pick a new
+    -- one instead. Count a quest whose every step is full as complete too, whatever the
+    -- Status label says.
+    if not out.complete and #out.steps > 0 then
+        local allDone = true
+        for _, s in ipairs(out.steps) do
+            if s.have < s.need then allDone = false end
+        end
+        out.complete = allDone
+    end
     return out
 end
 
@@ -551,10 +565,37 @@ local function mobMatch(m, want)
     return 0
 end
 
+-- Other players' root positions (keyed by UserId; Matcha instances do not compare with ==).
+local function otherPlayerPositions()
+    local out = {}
+    local myId = LocalPlayer.UserId
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local okId, id = pcall(function() return pl.UserId end)
+        if okId and id ~= myId then
+            local char = pl.Character
+            local p = partPos(char and char:FindFirstChild("HumanoidRootPart"))
+            if p then out[#out + 1] = p end
+        end
+    end
+    return out
+end
+
+-- Live Nov 1 2026: the teleport landed on a boar another player was fighting and the user
+-- left. A mob with another player within playerRadius is never picked (and a fight stops
+-- when one walks up, see fight()).
+local function playerNear(p, players)
+    if not CFG.avoidPlayers or not p then return false end
+    for _, q in ipairs(players or otherPlayerPositions()) do
+        if flatDist(p, q) <= CFG.playerRadius then return true end
+    end
+    return false
+end
+
 local function bestMob(want)
     local folder = Workspace:FindFirstChild("Mobs")
     local here = partPos(myRoot())
     if not folder or not here then return nil end
+    local players = otherPlayerPositions()
     -- Live test Nov 1 2026: three Frenzy Boars at once overwhelmed auto-parry and killed
     -- the character, so every other live mob within crowdRadius costs crowdPenalty studs.
     local live = {}
@@ -567,7 +608,7 @@ local function bestMob(want)
     local best, bestScore = nil, -math.huge
     for _, e in ipairs(live) do
         local match = mobMatch(e.m, want)
-        if match > 0 then
+        if match > 0 and not playerNear(e.p, players) then
             local score = -(e.p - here).Magnitude
             for _, o in ipairs(live) do
                 if o ~= e and flatDist(o.p, e.p) <= CFG.crowdRadius then score = score - CFG.crowdPenalty end
@@ -651,6 +692,66 @@ local function talkTo(path)
     return true
 end
 
+-- Every quest NPC we know of (QUESTS givers plus the other QuestPrompt NPCs and the story
+-- NPCs), for turning in a quest whose giver is not known yet.
+local EXTRA_GIVERS = { "Tolbana.TolbanaQuestNPC", "Tolbana.TolbanaQuestNPC2", "Horunka.MedaiQuestNPC",
+    "ElfNPC.BeginningQuestNPC3", "StoryLine.Kirito", "StoryLine.Asuna", "StoryLine.Kayaba",
+    "Dungeon.BossRoom.MainDungeonQuestNPC1" }
+local function allGiversByDistance()
+    local seen, list = {}, {}
+    local function add(path)
+        if seen[path] then return end
+        seen[path] = true
+        local p = partPos(giverRoot(path))
+        if p then list[#list + 1] = { path = path, p = p } end
+    end
+    for _, q in ipairs(QUESTS) do for _, path in ipairs(q.npcs) do add(path) end end
+    for _, path in ipairs(EXTRA_GIVERS) do add(path) end
+    local here = partPos(myRoot())
+    if here then table.sort(list, function(a, b) return flatDist(a.p, here) < flatDist(b.p, here) end) end
+    local out = {}
+    for _, e in ipairs(list) do out[#out + 1] = e.path end
+    return out
+end
+
+-- Quest title (tracker) -> giver path, learned from accepts and successful turn-ins and
+-- saved with the settings, so a quest the script did not accept itself is turned in at
+-- the right NPC next time.
+local SETTINGS_HOOK = { save = nil }
+local function learnGiver(title, path)
+    if not title or not path or CFG.questGivers[title] == path then return end
+    CFG.questGivers[title] = path
+    if SETTINGS_HOOK.save then pcall(SETTINGS_HOOK.save) end
+end
+
+-- Turn in the tracker's finished quest: the learned giver for its title, then the giver
+-- we accepted from, then every known quest NPC nearest first, until the tracker moves on.
+local function turnIn(tr)
+    local title = tr and tr.title
+    -- Talking needs the E key, which only reaches a focused Roblox window; without focus
+    -- the search would teleport between NPCs for nothing.
+    if not focused() then setStatus("quest: '" .. tostring(title) .. "' done - focus Roblox to turn it in"); return false end
+    local tried, order = {}, {}
+    local function push(path) if path and not tried[path] then tried[path] = true; order[#order + 1] = path end end
+    push(title and CFG.questGivers[title])
+    push(STATE.giver)
+    for _, path in ipairs(allGiversByDistance()) do push(path) end
+    for i = 1, math.min(#order, CFG.turnInTries) do
+        if not farming() then return false end
+        setStatus(string.format("quest: turning in '%s' at %s (%d/%d)", tostring(title), order[i], i, math.min(#order, CFG.turnInTries)))
+        talkTo(order[i])
+        task.wait(1)
+        local now = readTracker()
+        if not now or now.title ~= title or not now.complete then
+            learnGiver(title, order[i])
+            STATE.giver = nil
+            return true
+        end
+    end
+    setStatus("quest: could not find where to turn in '" .. tostring(title) .. "'")
+    return false
+end
+
 -- ---------------------------------------------------------------------------
 -- Fight
 -- ---------------------------------------------------------------------------
@@ -706,6 +807,7 @@ local function fight(mob)
     local clickEvery = 1 / math.max(1, CFG.clickHz)
     local nextClick, startedAt = 0, clock()
     local nextSkill, skillIdx = 0, 0
+    local nextPlayerCheck = 0
     while farming() and mobAlive(mob) do
         if afkCheckOpen() then return end
         if hpFraction() < CFG.retreatHp then retreat(); return end
@@ -714,6 +816,10 @@ local function fight(mob)
         local here = partPos(myRoot())
         if not mp or not here then break end
         if clock() - startedAt > 60 then break end -- immune / unreachable target
+        if clock() >= nextPlayerCheck then
+            nextPlayerCheck = clock() + 0.5
+            if playerNear(mp) then setStatus("player near target, switching"); break end
+        end
         local okL, look = pcall(function() return col.CFrame.LookVector end)
         local back = (okL and look) and Vector3.new(-look.X, 0, -look.Z) or Vector3.new(0, 0, 1)
         if back.Magnitude < 0.01 then back = Vector3.new(0, 0, 1) end
@@ -805,12 +911,16 @@ task.spawn(function()
             local q = pickQuest()
             if STATE.quest and tr and tr.complete and clock() - lastTalk > 6 then
                 lastTalk = clock()
-                talkTo(STATE.giver or nearestGiver(q))
-            elseif STATE.quest and not target and clock() - lastTalk > 6 then
+                turnIn(tr)
+                target = trackerTarget(readTracker())
+            elseif STATE.quest and not target and clock() - lastTalk > 6 and focused() then
                 lastTalk = clock()
                 local giver = nearestGiver(q)
+                local before = tr and tr.title
                 if giver then talkTo(giver) else setStatus("quest: no giver loaded for " .. q.id); task.wait(1) end
-                target = trackerTarget(readTracker())
+                local after = readTracker()
+                if giver and after and after.title and after.title ~= before then learnGiver(after.title, giver) end
+                target = trackerTarget(after)
             end
             target = target or q.mob
             if STATE.farm and myRoot() then
@@ -1137,7 +1247,8 @@ local function saveSettings()
             travelMode = CFG.travelMode, attackMode = CFG.attackMode, skillMode = CFG.skillMode,
             slotSkills = CFG.slotSkills, skillRecast = CFG.skillRecast, parryMode = CFG.parryMode,
             retreatHp = CFG.retreatHp, mobName = CFG.mobName or false, infiniteDash = CFG.infiniteDash,
-            autoQuest = STATE.quest, autoParry = STATE.parry,
+            autoQuest = STATE.quest, autoParry = STATE.parry, questGivers = CFG.questGivers,
+            avoidPlayers = CFG.avoidPlayers,
         }
         writefile(SETTINGS_FILE, game:GetService("HttpService"):JSONEncode(data))
     end)
@@ -1155,12 +1266,19 @@ local function loadSettings()
             for i = 1, 4 do CFG.slotSkills[i] = d.slotSkills[i] or d.slotSkills[tostring(i)] or CFG.slotSkills[i] end
         end
         if d.mobName ~= nil then CFG.mobName = d.mobName or nil end
+        if type(d.questGivers) == "table" then
+            for title, path in pairs(d.questGivers) do
+                if type(title) == "string" and type(path) == "string" then CFG.questGivers[title] = path end
+            end
+        end
+        if d.avoidPlayers ~= nil then CFG.avoidPlayers = d.avoidPlayers end
         if d.autoQuest ~= nil then STATE.quest = d.autoQuest end
         if d.autoParry ~= nil then STATE.parry = d.autoParry end
     end)
     rebuildRemoteSkills()
 end
 loadSettings()
+SETTINGS_HOOK.save = saveSettings
 
 -- The menu is the same UE library (laced.club UI) the Blox Fruits script uses:
 -- src/10_ui.lua downloads it, runs it, and finds it through the UELibrary global
@@ -1247,6 +1365,12 @@ local function buildMenu()
     reg("mob", farm:AddDropdown("mob", { Text = "Target Mob", Values = MOB_OPTIONS, Default = CFG.mobName or "auto (quest)",
         Tooltip = "auto (quest) farms the mob your quest tracker names",
         Callback = function(v) CFG.mobName = (v and v ~= "auto (quest)") and v or nil; saveSettings() end }))
+    reg("avoidPlayers", farm:AddToggle("avoidPlayers", { Text = "Avoid Players", Default = CFG.avoidPlayers,
+        Tooltip = "Skip mobs with another player nearby; leave a fight when one walks up",
+        Callback = function(v) CFG.avoidPlayers = v == true; saveSettings() end }))
+    reg("playerRadius", farm:AddSlider("playerRadius", { Text = "Player Avoid Radius", Default = CFG.playerRadius,
+        Min = 10, Max = 200, Rounding = 0, Suffix = " studs",
+        Callback = function(v) CFG.playerRadius = tonumber(v) or 50 end }))
     farm:AddButton({ Text = "Print discovery dump (F8)", Func = function() task.spawn(dump) end })
 
     local travel = main:AddRightGroupbox("Travel")

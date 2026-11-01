@@ -27,7 +27,13 @@ The same UE library (laced.club UI) as the Blox Fruits script, downloaded at loa
 1. It reads your level from the HUD and picks the highest Floor 1 quest you meet the level for: boar (Lv1), wolf (Lv5), wasp (Lv10), nepenthes (Lv15) or kobold (Lv22).
 2. It travels to that quest's giver and presses E a few times, which opens the prompt, steps through the dialogue and confirms the accept box.
 3. It reads the quest tracker ("Defeat Frenzy Boar 1/3") and farms that mob from `Workspace.Mobs`, standing behind it and clicking.
-4. When the tracker says COMPLETE, it returns to the giver and presses E to turn the quest in.
+4. When the quest is done, it turns it in. "Done" means the tracker says COMPLETE, or every step's count is full. The giver it goes to is, in order:
+   - the giver learned for that quest title (saved with the settings),
+   - otherwise the giver it accepted the quest from,
+   - otherwise every known quest NPC, nearest first, including the story NPCs Kirito, Asuna and Kayaba, up to `turnInTries` (6).
+
+   It stops at the first NPC where the tracker moves on, and records that NPC. Talking needs Roblox focus (E key), so without focus it waits rather than searching.
+5. **Player avoidance:** it never targets a mob with another player within `playerRadius` (50 studs), and it leaves a fight when a player walks up (`avoidPlayers`; Farm groupbox in the menu).
 
 ## Crash rules (from the Blox Fruits findings)
 
