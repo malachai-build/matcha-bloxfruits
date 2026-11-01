@@ -81,7 +81,9 @@ local CFG = {
     parryLead = 0.2,        -- s before the hit to press F (server parry window is 0.4 s)
     parryCooldown = 0.25,   -- patches the client 0.9 s parry cooldown (several attackers); nil = leave it
     parryMinGap = 0.12,     -- s between auto-parry taps
-    parryMode = "key",      -- "key": tap F (needs Roblox focus); "remote": Combat:FireServer("Parry", t)
+    -- "remote": Combat:FireServer("Parry", t), no focus needed (live: 32 parries, 0 damage,
+    -- 28 of them unfocused); "key": tap F (needs Roblox focus)
+    parryMode = "remote",
     parryFace = true,       -- remote mode: turn toward the attacker first (enemy behind you)
     skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting ({} = none)
     skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)

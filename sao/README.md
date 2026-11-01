@@ -48,7 +48,7 @@ On by default (`autoParry = true`), toggled with F10.
   - It taps F so the press lands `parryLead` (0.2 s) before the expected hit.
   - It learns each mob type's windup from how long the highlight lasted.
   - Your weapon has to be drawn: a sheathed F press does nothing.
-- **Remote mode (`parryMode = "remote"`):** sends the game's own call, `Remotes.Combat:FireServer("Parry", serverTime)`, so it works without Roblox focus and without an F press. Matcha has no `GetServerTimeNow`, so the server time is rebuilt from `os.time()` (whole seconds, caught at the moment it ticks over) plus `os.clock()`. With `parryFace` on, the script turns you toward the attacker first, in case the server checks facing. It's one-way `FireServer`, not the `InvokeServer` that crashed the Blox Fruits script. Untested.
+- **Remote mode (`parryMode = "remote"`, the default):** sends the game's own call, `Remotes.Combat:FireServer("Parry", serverTime)`, so it works without Roblox focus and without an F press. Matcha has no `GetServerTimeNow`, so the server time is rebuilt from `os.time()` (whole seconds, caught at the moment it ticks over) plus `os.clock()`. With `parryFace` on, the script turns you toward the attacker first, in case the server checks facing. It's one-way `FireServer`, not the `InvokeServer` that crashed the Blox Fruits script. Live test (hands off, 90 s, one Frenzy Boar): 32 parries sent, 0 damage taken (HP stayed at 270), 28 of them with Roblox unfocused.
 - **Several attackers:** the client parry cooldown is patched from 0.9 to 0.25 s (`parryCooldown`), and taps can be as close as 0.12 s apart (`parryMinGap`). The server may still have its own cooldown.
 - **Crowds:** target choice adds 40 studs of cost for every other mob within 15 studs of a candidate (`crowdRadius`, `crowdPenalty`), so lone mobs win.
 - **Low HP:** below 35% HP (`retreatHp`) the script leaves the fight, moves 80 studs away from nearby mobs, and waits until 80% HP (`resumeHp`, at most 45 s).
@@ -89,7 +89,7 @@ _G.SAO_AFQ_CONFIG = {
     stepSpeed = 48, stepHz = 12, stepLift = 0.4, climbLift = 4,
     infiniteDash = true, dashCooldown = 0,
     skillSlots = { 1, 2 }, skillTapHz = 12, zeroSkillCooldown = true,
-    parryMode = "key", parryFace = true,
+    parryMode = "remote", parryFace = true,
     autoParry = true, parryRange = 25, parryLead = 0.2, parryCooldown = 0.25, parryMinGap = 0.12,
     crowdRadius = 15, crowdPenalty = 40, retreatHp = 0.35, resumeHp = 0.8,
     holdHz = 10, clickHz = 6,
