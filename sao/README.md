@@ -17,12 +17,17 @@ Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8*
 
 ## Crash rules (from the Blox Fruits findings)
 
-- No tweens. Travel uses 60-stud hops at 6 writes/s; a 1,200-stud trip was tested live with no rubberbanding. While fighting, the script places the character at 10 writes/s.
+- No tweens and no fast teleports. A 2,700-stud trip in 60-stud hops (about 360 studs/s, partly under the terrain) got the account kicked; the server caps movement at `MAX_MOVE_SPEED = 50`.
+  - `travelMode = "walk"` (default): the script sets `Humanoid.WalkToPoint` to ground-snapped waypoints 60 studs apart and the game walks you there at normal speed. The script writes no position. If you gain less than 2 studs in 2.5 s, it does a 2 s step burst to get unstuck.
+  - `travelMode = "step"`: grounded CFrame steps at 10 Hz, 40 studs/s at most.
+  - Close-range adjustments (behind a mob, in front of a giver) move at most 4 studs per write, which is the same 40 studs/s, and are snapped to the ground by raycast.
 - No remotes and no writes to mobs. Only your own root is moved, and the script re-reads it before every write.
 - No `Workspace:GetDescendants` (the game has about 230k instances).
 
 ## Not verified yet
 
+- Walking with `WalkToPoint`. The game's own character controller could override it, and walking is slow: about 16 studs/s, so roughly 2.5 minutes from the boar givers to the boar fields.
+- Whether 40 studs/s steps stay under the server's limit. The limit is 50, but the exact server check is unknown.
 - Quest accept and turn-in by pressing E. Matcha disconnected during that test.
 - Damage from clicks. The test ran with Roblox unfocused, so no clicks were sent.
 - The AFK check ("Are you still here?"). It needs a click on a circle in a 3D popup, so the script stops and shows a warning instead of answering it.
@@ -34,6 +39,7 @@ _G.SAO_AFQ_CONFIG = {
     mobName = "Dire Wolf",   -- farm this mob, ignore the tracker
     questId = "boarQuest",   -- force one quest giver
     autoQuest = false,       -- just farm, never talk to givers
-    hopDistance = 60, hopHz = 6, holdHz = 10, clickHz = 6,
+    travelMode = "walk",     -- or "step"
+    stepSpeed = 40, stepHz = 10, holdHz = 10, clickHz = 6,
 }
 ```

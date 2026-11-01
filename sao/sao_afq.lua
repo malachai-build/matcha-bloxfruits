@@ -17,7 +17,10 @@
                   reliably, so it stops and shows a warning instead.
 
     Crash rules carried over from the Blox Fruits script (CRASH_FINDINGS.md):
-      * no tweens: travel is a few long hops (hopHz writes/s), never a 60 Hz glide
+      * no tweens and no fast teleports: travel walks with Humanoid.WalkToPoint (no root
+        writes) or, in "step" mode, moves at most stepSpeed (40) studs/s in grounded
+        10 Hz steps. The server caps movement at 50 studs/s and kicked a 360 studs/s
+        hop trip that went under the terrain.
       * one fixed-rate root write while fighting (holdHz), nothing at frame rate
       * the local root is re-fetched before every write; nothing is written to a mob
       * no RemoteEvent/RemoteFunction calls: quests and attacks go through real input
@@ -60,11 +63,16 @@ local CFG = {
     questId = nil,          -- force one quest from QUESTS by id
     skipCorrupted = true,   -- prefer plain mobs over "Corrupted ..." (higher level)
     standOff = 4,           -- studs behind the mob
-    standHeight = 1,        -- studs above the mob collider
     clickHz = 6,            -- mouse clicks per second while fighting
     holdHz = 10,            -- root writes per second while fighting
-    hopDistance = 60,       -- studs per travel hop (tested: 1,200 studs in 60-stud hops, no rubberband)
-    hopHz = 6,              -- travel hops per second
+    -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
+    -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
+    travelMode = "walk",    -- "walk": Humanoid.WalkToPoint (game physics, no root writes)
+                            -- "step": grounded CFrame steps at stepSpeed
+    stepSpeed = 40,         -- studs/s for "step" mode and for unsticking a walk; keep below 50
+    stepHz = 10,            -- root writes per second in "step" mode
+    walkLeg = 60,           -- studs between walk waypoints
+    nearRange = 12,         -- inside this a fight/giver adjust is one short placement
     talkPresses = 5,        -- E presses at a giver (opens the prompt, steps dialogue, confirms)
     keys = { farm = 0x75, quest = 0x76, dump = 0x77, unload = 0x23 },
 }
@@ -156,25 +164,121 @@ local function placeAt(pos, lookAt)
     return true
 end
 
--- Travel in long hops at hopHz instead of a 60 Hz tween. keepGoing() false stops it.
-local function travelTo(pos, keepGoing)
-    local stepWait = 1 / math.max(1, CFG.hopHz)
-    for _ = 1, 600 do
-        if not alive() or (keepGoing and not keepGoing()) then return false end
+-- ---------------------------------------------------------------------------
+-- Grounded travel: never faster than stepSpeed, never below the terrain
+-- ---------------------------------------------------------------------------
+local rayParams = nil
+local function groundY(x, z, fromY)
+    local ok, hit = pcall(function()
+        if not rayParams then rayParams = RaycastParams.new() end
+        local skip = {}
+        if LocalPlayer.Character then skip[#skip + 1] = LocalPlayer.Character end
+        local mobs = Workspace:FindFirstChild("Mobs")
+        if mobs then skip[#skip + 1] = mobs end
+        rayParams.FilterDescendantsInstances = skip
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        -- Start a little above the current height so a tree canopy far overhead is not picked.
+        return Workspace:Raycast(Vector3.new(x, fromY + 40, z), Vector3.new(0, -400, 0), rayParams)
+    end)
+    if ok and hit and hit.Position then return hit.Position.Y end
+    return nil
+end
+
+-- Root height above the ground while standing (HipHeight is not readable in Matcha).
+local hipOffset = 3
+local function measureHip()
+    local p = partPos(myRoot())
+    if not p then return end
+    local g = groundY(p.X, p.Z, p.Y)
+    if g and p.Y - g > 1.5 and p.Y - g < 6 then hipOffset = p.Y - g end
+end
+
+local function grounded(pos, fromY)
+    local g = groundY(pos.X, pos.Z, fromY or pos.Y)
+    if not g then return pos end
+    return Vector3.new(pos.X, g + hipOffset, pos.Z)
+end
+
+local function flatDist(a, b)
+    return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+local function humanoid()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("Humanoid")
+end
+
+-- Stepped CFrame travel at stepSpeed, each step snapped to the ground. maxTime caps a burst.
+local function stepToward(pos, keepGoing, maxTime)
+    local stepWait = 1 / math.max(1, CFG.stepHz)
+    local stepLen = math.min(CFG.stepSpeed, 45) * stepWait
+    local untilT = clock() + (maxTime or 1e9)
+    while alive() and clock() < untilT do
+        if keepGoing and not keepGoing() then return false end
         local cur = partPos(myRoot())
         if not cur then return false end
-        local delta = pos - cur
-        local dist = delta.Magnitude
-        if dist < 3 then return true end
-        if CFG.hopDistance <= 0 or dist <= CFG.hopDistance then
-            placeAt(pos)
-            task.wait(stepWait)
-            return true
-        end
-        placeAt(cur + delta.Unit * CFG.hopDistance)
+        local d = flatDist(pos, cur)
+        if d < 3 then return true end
+        local dir = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z).Unit
+        local nextP = grounded(cur + dir * math.min(stepLen, d), cur.Y)
+        placeAt(nextP, nextP + dir)
         task.wait(stepWait)
     end
     return false
+end
+
+-- Walk with Humanoid.WalkToPoint: the game moves the character at its own speed, the
+-- script writes no position. Waypoints every walkLeg studs are snapped to the ground.
+-- A stuck walk (under 2 studs gained in 2.5 s) gets a 2 s grounded step burst, then walks on.
+local function walkToward(pos, keepGoing)
+    local startD = flatDist(pos, partPos(myRoot()) or pos)
+    local deadline = clock() + startD / 10 + 30 -- 16 studs/s walk, generous margin
+    local lastP, lastAt, stuckBursts = partPos(myRoot()), clock(), 0
+    while alive() and clock() < deadline do
+        if keepGoing and not keepGoing() then return false end
+        local cur = partPos(myRoot())
+        local hum = humanoid()
+        if not cur or not hum then return false end
+        local d = flatDist(pos, cur)
+        if d < 4 then
+            pcall(function() hum.WalkToPoint = cur end)
+            return true
+        end
+        local dir = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z).Unit
+        local wp = d <= CFG.walkLeg and grounded(pos, cur.Y) or grounded(cur + dir * CFG.walkLeg, cur.Y)
+        pcall(function() hum.WalkToPoint = wp end)
+        task.wait(0.5)
+        if lastP and clock() - lastAt >= 2.5 then
+            local now = partPos(myRoot())
+            if now and flatDist(now, lastP) < 2 then
+                stuckBursts = stuckBursts + 1
+                if stuckBursts > 20 then return false end
+                setStatus("travel: stuck, stepping " .. math.floor(d) .. " studs out")
+                stepToward(pos, keepGoing, 2)
+            end
+            lastP, lastAt = partPos(myRoot()), clock()
+        end
+    end
+    return false
+end
+
+-- keepGoing() false stops it.
+local function travelTo(pos, keepGoing)
+    measureHip()
+    if CFG.travelMode == "step" then return stepToward(pos, keepGoing) end
+    return walkToward(pos, keepGoing)
+end
+
+-- One short placement toward pos, at most stepSpeed / rateHz studs, snapped to the ground,
+-- so even the close-range adjustments never exceed the travel speed.
+local function nudgeToward(pos, lookAt, rateHz)
+    local cur = partPos(myRoot())
+    if not cur then return false end
+    local maxStep = math.min(CFG.stepSpeed, 45) / math.max(1, rateHz)
+    local delta = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z)
+    local target = pos
+    if delta.Magnitude > maxStep then target = cur + delta.Unit * maxStep end
+    return placeAt(grounded(target, cur.Y), lookAt)
 end
 
 -- ---------------------------------------------------------------------------
@@ -322,15 +426,18 @@ local function talkTo(path)
     local np = partPos(r)
     if not np then setStatus("quest: giver " .. path .. " not loaded"); return false end
     setStatus("quest: travelling to " .. path)
-    if not travelTo(np + Vector3.new(0, 1, 4), farming) then return false end
-    for _ = 1, 3 do
+    if not travelTo(np + Vector3.new(0, 0, 4), farming) then return false end
+    for _ = 1, 8 do
         np = partPos(r)
         if not np then return false end
         local okL, look = pcall(function() return r.CFrame.LookVector end)
         local front = (okL and look) and Vector3.new(look.X, 0, look.Z) or Vector3.new(0, 0, 1)
         if front.Magnitude < 0.01 then front = Vector3.new(0, 0, 1) end
-        placeAt(np + front.Unit * 4, np)
-        task.wait(0.3)
+        local spot = np + front.Unit * 4
+        local here = partPos(myRoot())
+        if here and flatDist(here, spot) < 1.5 then break end
+        if here and flatDist(here, spot) > CFG.nearRange then travelTo(spot, farming) else nudgeToward(spot, np, 4) end
+        task.wait(0.25)
     end
     if not focused() then setStatus("quest: waiting for Roblox focus"); return false end
     setStatus("quest: talking to " .. path)
@@ -360,11 +467,11 @@ local function fight(mob)
         local okL, look = pcall(function() return col.CFrame.LookVector end)
         local back = (okL and look) and Vector3.new(-look.X, 0, -look.Z) or Vector3.new(0, 0, 1)
         if back.Magnitude < 0.01 then back = Vector3.new(0, 0, 1) end
-        local stand = mp + back.Unit * CFG.standOff + Vector3.new(0, CFG.standHeight, 0)
-        if (here - stand).Magnitude > CFG.hopDistance then
+        local stand = mp + back.Unit * CFG.standOff
+        if flatDist(here, stand) > CFG.nearRange then
             travelTo(stand, farming)
-        else
-            placeAt(stand, mp)
+        elseif flatDist(here, stand) > 0.75 then
+            nudgeToward(stand, mp, CFG.holdHz)
         end
         if clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 then
             nextClick = clock() + clickEvery
