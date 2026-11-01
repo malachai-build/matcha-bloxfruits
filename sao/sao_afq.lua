@@ -17,8 +17,8 @@
                   reliably, so it stops and shows a warning instead.
 
     Crash rules carried over from the Blox Fruits script (CRASH_FINDINGS.md):
-      * no tweens and no fast teleports: travel is 3-stud CFrame steps at 12 Hz
-        (36 studs/s horizontal), height left to physics plus a small lift, lifting more
+      * no tweens and no fast teleports: travel is 4-stud CFrame steps at 12 Hz
+        (48 studs/s horizontal), height left to physics plus a small lift, lifting more
         only when terrain pushes back. The server caps movement at 50 studs/s and kicked
         a 360 studs/s hop trip that went under the terrain.
       * one fixed-rate root write while fighting (holdHz), nothing at frame rate
@@ -30,7 +30,8 @@
     Matcha notes: CFrame.new takes 3 numbers (not a Vector3), IsA is broken (compare
     ClassName), instances are not comparable with == (compare .Address).
 
-    Keys: F6 farm on/off, F7 quest pickup on/off, F8 dump to console, End unload.
+    Keys: F6 farm on/off, F7 quest pickup on/off, F8 dump to console, F9 infinite dash,
+          End unload.
     Override any CFG field before loading:
         _G.SAO_AFQ_CONFIG = { mobName = "Dire Wolf", autoQuest = false }
 ]]
@@ -67,19 +68,24 @@ local CFG = {
     holdHz = 10,            -- root writes per second while fighting
     -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
     -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
-    stepSpeed = 36,         -- horizontal studs/s while travelling; hard-capped at 45
+    stepSpeed = 48,         -- horizontal studs/s while travelling; hard-capped at MAX_STEP_SPEED (49)
     stepHz = 12,            -- root writes per second while travelling (3 studs per step)
     stepLift = 0.4,         -- studs above the current height per step; gravity takes it back
     climbLift = 4,          -- max lift per step when terrain pushes us back (slopes, steps)
     nearRange = 12,         -- inside this a fight/giver adjust is one short placement
     talkPresses = 5,        -- E presses at a giver (opens the prompt, steps dialogue, confirms)
-    keys = { farm = 0x75, quest = 0x76, dump = 0x77, unload = 0x23 },
+    infiniteDash = true,    -- Ctrl dash with no stamina cost and a short cooldown (F9 toggles)
+    dashCooldown = 0.3,     -- = the dash duration, so dashes chain back to back
+    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, unload = 0x23 },
 }
 if type(_G.SAO_AFQ_CONFIG) == "table" then
     for k, v in pairs(_G.SAO_AFQ_CONFIG) do CFG[k] = v end
 end
 
 local VK_E = 0x45
+-- Server movement cap is RemakeConfig.MAX_MOVE_SPEED = 50. A brief 57.6 studs/s spike
+-- (own dash on top of 36 studs/s steps) did not kick, but travel stays just under 50.
+local MAX_STEP_SPEED = 49
 local clock = (type(os) == "table" and type(os.clock) == "function") and os.clock or tick
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -189,8 +195,8 @@ end
 local function stepToward(pos, keepGoing)
     local hz = math.max(1, CFG.stepHz)
     local stepWait = 1 / hz
-    local stepLen = math.min(CFG.stepSpeed, 45) / hz
-    local deadline = clock() + flatDist(pos, partPos(myRoot()) or pos) / math.min(CFG.stepSpeed, 45) * 3 + 20
+    local stepLen = math.min(CFG.stepSpeed, MAX_STEP_SPEED) / hz
+    local deadline = clock() + flatDist(pos, partPos(myRoot()) or pos) / math.min(CFG.stepSpeed, MAX_STEP_SPEED) * 3 + 20
     local lift, blocked, falling = CFG.stepLift, 0, 0
     local wrote = nil
     while alive() and clock() < deadline do
@@ -248,7 +254,7 @@ end
 local function nudgeToward(pos, lookAt, rateHz)
     local cur = partPos(myRoot())
     if not cur then return false end
-    local maxStep = math.min(CFG.stepSpeed, 45) / math.max(1, rateHz)
+    local maxStep = math.min(CFG.stepSpeed, MAX_STEP_SPEED) / math.max(1, rateHz)
     local delta = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z)
     local tx, tz = pos.X, pos.Z
     if delta.Magnitude > maxStep then
@@ -536,6 +542,36 @@ end
 -- ---------------------------------------------------------------------------
 -- Status text + hotkeys
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- Infinite dash (Ctrl): patches the client dodge config in the Luau heap
+-- ---------------------------------------------------------------------------
+-- The CombatPlus dodge table holds { staminaCost = 10, speed = 50, duration = 0.3,
+-- cooldown = 0.55, invulnerable = 0.22 } (read live Nov 1 2026; the only table with a
+-- numeric staminaCost). staminaCost 0 + cooldown 0.3 let 33 dashes chain in 12 s at 0-5
+-- stamina with no kick. It is a client value: the server did not refuse the dashes.
+-- getgc/findgc are full heap scans (15-30 s), so this runs once in the background.
+local DASH_ORIGINAL = { staminaCost = 10, cooldown = 0.55 }
+local DASH = { state = "off", cache = nil }
+local function setDash(on)
+    if DASH.state == "patching" then return end
+    DASH.state = "patching"
+    task.spawn(function()
+        local ok = pcall(function()
+            if not DASH.cache then
+                DASH.cache = findgc("staminaCost", { speed = "number", duration = "number", cooldown = "number" })
+            end
+            if on then
+                setgc("staminaCost", 0, DASH_ORIGINAL.staminaCost)
+                applygc(DASH.cache, "cooldown", CFG.dashCooldown)
+            else
+                setgc("staminaCost", DASH_ORIGINAL.staminaCost, 0)
+                applygc(DASH.cache, "cooldown", DASH_ORIGINAL.cooldown)
+            end
+        end)
+        DASH.state = ok and (on and "on" or "off") or "failed"
+    end)
+end
+
 local label = nil
 pcall(function()
     label = Drawing.new("Text")
@@ -555,14 +591,15 @@ task.spawn(function()
                 if name == "farm" then STATE.farm = not STATE.farm
                 elseif name == "quest" then STATE.quest = not STATE.quest
                 elseif name == "dump" then task.spawn(dump)
+                elseif name == "dash" then setDash(DASH.state ~= "on")
                 elseif name == "unload" then API.unload() end
             end
             was[name] = down
         end
         if label then
             pcall(function()
-                label.Text = string.format("SAO AFQ  farm:%s  quest:%s  |  %s",
-                    STATE.farm and "ON" or "off", STATE.quest and "ON" or "off", STATE.status)
+                label.Text = string.format("SAO AFQ  farm:%s  quest:%s  dash:%s  |  %s",
+                    STATE.farm and "ON" or "off", STATE.quest and "ON" or "off", DASH.state, STATE.status)
             end)
         end
         task.wait(0.1)
@@ -571,9 +608,11 @@ end)
 
 API.unload = function()
     STATE.running, STATE.farm = false, false
+    if DASH.state == "on" then setDash(false) end
     if label then pcall(function() label:Remove() end); label = nil end
     if _G.SAO_AFQ == API then _G.SAO_AFQ = nil end
 end
-API.state, API.config, API.dump, API.quests = STATE, CFG, dump, QUESTS
+API.state, API.config, API.dump, API.quests, API.setDash = STATE, CFG, dump, QUESTS, setDash
 
-print("[SAO AFQ] loaded - F6 farm, F7 quest pickup, F8 dump, End unload")
+if CFG.infiniteDash then setDash(true) end
+print("[SAO AFQ] loaded - F6 farm, F7 quest pickup, F8 dump, F9 infinite dash, End unload")
