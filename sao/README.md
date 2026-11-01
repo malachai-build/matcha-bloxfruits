@@ -6,7 +6,7 @@ A standalone Auto Farm Quest script for Sword Art Online: Eternity (place 108438
 loadstring(httpget("https://raw.githubusercontent.com/malachai-build/matcha-bloxfruits/main/sao/sao_afq.lua"))()
 ```
 
-Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
+Keys: **F5** turns auto-mining on or off, **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8** prints a dump to the console, **F9** turns infinite dash on or off, **F10** turns auto-parry on or off, and **End** unloads the script. Roblox must be the focused window, because the script presses E and clicks the mouse.
 
 ## Settings menu
 
@@ -15,6 +15,8 @@ The same UE library (laced.club UI) as the Blox Fruits script, downloaded at loa
 - **Main tab:**
   - **Farm:** Auto Farm Quest (F6), Auto Quest Pickup (F7), Target Mob dropdown, dump button.
   - **Travel:** Travel Mode dropdown, Infinite Dash (F9), and the HP % slider for retreating to town.
+- **Gather tab:**
+  - **Mining:** Auto Mine (F5), an Ore Area dropdown (all, Area1 or Area2), and a "Re-learn pickaxe id" button.
 - **Combat tab:**
   - **Attacks:** Attack Mode and Skill Mode dropdowns, Skill Slot 1-4 dropdowns (every filled slot is cast remotely in fights), Skill Recast slider.
   - **Parry:** Auto Parry (F10), Parry Mode, Face Attacker.
@@ -148,6 +150,24 @@ On by default (`autoParry = true`), toggled with F10.
 - **Sprint stamina can't be removed from the client.** The client only sends `Sprint:FireServer(true/false)`; the server drains the stamina and turns `Sprinting` off at 0.
   - Setting the `BaseWalkSpeed` attribute to the sprint speed on the client didn't change your walking speed.
   - Moving faster with Matcha's own position/velocity tools got a kick, and walking at sprint speed without the server's sprint flag would likely be flagged the same way.
+
+## Auto-mining (F5, `autoMine`)
+
+Each round goes like this:
+
+1. Equip the pickaxe with `EquipItem(uid)`.
+2. Draw it with `ToggleTool(true)`.
+3. Visit every node that's up, nearest first. A node counts as up when it has an `Ore` child, `MinedOut` isn't true, and no other player is within 15 studs.
+4. At each node, stand 4 studs from its `OreCenter` and fire `MineSwing(node)` every 1.1s. Stop when the node disappears, or after 20 swings.
+5. Put the pickaxe away with `ToggleTool(false)` and `UnequipItem("pickaxe")`. The server puts the weapon back on its own. If it doesn't within 6s, the script re-equips the weapon by its learned uid.
+
+The script also remembers each node it mined for 47s, so it doesn't rely on `MinedOut` alone.
+
+With **Auto Farm** on as well, mining runs between fights whenever a node is up, and questing carries on while nodes respawn. With only mining on, it waits for the next node.
+
+**One-time setup:** item ids only reach the client through `DataSync`, which Matcha can't listen to. Equip the pickaxe once from Menu > Tools while Auto Mine is on. The script then scans memory for `equipment.pickaxe` (15–50s) and saves the uid to `sao_afq_settings.json`.
+
+Status: built and compiled on Nov 1 2026, but not yet run live.
 
 ## To do
 

@@ -30,8 +30,8 @@
     Matcha notes: CFrame.new takes 3 numbers (not a Vector3), IsA is broken (compare
     ClassName), instances are not comparable with == (compare .Address).
 
-    Keys: F6 farm on/off, F7 quest pickup on/off, F8 dump to console, F9 infinite dash,
-          F10 auto-parry, End unload.
+    Keys: F5 auto-mine on/off, F6 farm on/off, F7 quest pickup on/off, F8 dump to console,
+          F9 infinite dash, F10 auto-parry, End unload.
     Override any CFG field before loading:
         _G.SAO_AFQ_CONFIG = { mobName = "Dire Wolf", autoQuest = false }
 ]]
@@ -129,7 +129,18 @@ local CFG = {
     retreatMaxWait = 60,    -- s to wait for health before farming again anyway
     townPos = Vector3.new(45, 87, -3026), -- Town of Beginnings spawn area: HP regen (2%/s) works here
                                           -- only; nil = just back off retreatDistance studs
-    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, unload = 0x23 },
+    -- Mining (see the Mining section). The pickaxe id is learned once from a manual equip.
+    autoMine = false,       -- F5 toggles; with the farm on too, mining runs whenever nodes are up
+    mineArea = "all",       -- "all", "Area1" or "Area2" (folders under Workspace.OreNodes)
+    mineSwingGap = 1.1,     -- s between MineSwing calls (MiningConfig.SWING_TIME 1 / MiningSpeed)
+    mineMaxSwings = 20,     -- swings on one node before giving up on it until it respawns
+    mineRespawn = 47,       -- s a mined node stays gone (MiningConfig.RESPAWN 45 + margin)
+    mineMinReady = 1,       -- nodes up before a mining round starts
+    mineStand = 4,          -- studs from the ore centre to stand (server reach is 7.5)
+    minePlayerRadius = 15,  -- studs: skip a node another player is this close to (claim lock)
+    pickaxeUid = nil,       -- learned: inventory uniqueId of the pickaxe (saved with settings)
+    weaponUid = nil,        -- learned: weapon uniqueId, re-equipped if the server does not
+    keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, mine = 0x74, unload = 0x23 },
 }
 if type(_G.SAO_AFQ_CONFIG) == "table" then
     for k, v in pairs(_G.SAO_AFQ_CONFIG) do CFG[k] = v end
@@ -149,7 +160,8 @@ local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do task.wait(0.1); LocalPlayer = Players.LocalPlayer end
 local Workspace = game:GetService("Workspace")
 
-local STATE = { running = true, farm = false, quest = CFG.autoQuest, parry = CFG.autoParry, status = "idle", giver = nil }
+local STATE = { running = true, farm = false, quest = CFG.autoQuest, parry = CFG.autoParry, mine = CFG.autoMine,
+    status = "idle", giver = nil }
 -- Auto-parry state (see the Auto-parry section). holdClicksUntil pauses the fight
 -- clicks: the game ignores F while a light attack is mid-swing, and a live test with
 -- non-stop clicking landed 0 parries out of 3 telegraphs.
@@ -982,13 +994,233 @@ local function fight(mob)
 end
 
 -- ---------------------------------------------------------------------------
+-- Mining (Workspace.OreNodes, MineSwing remote)
+-- ---------------------------------------------------------------------------
+-- From the game's own scripts (Client.Systems.Mining, Shared.Config.MiningConfig, UI.Menu,
+-- UI.Accessories, Systems.CharacterController), Nov 1 2026:
+--   * a node is a Model with an "Ore" child and an OreCenter attribute (Matcha reads it as
+--     a table with lowercase x/y/z); MinedOut = true while it is gone, RESPAWN 45 s
+--   * a swing is MineSwing:FireServer(nodeModel), within REACH 7.5 studs flat and 8 up/down,
+--     once per SWING_TIME / MiningSpeed (1 s), with the pickaxe equipped and drawn
+--   * equip: EquipItem:FireServer(item.uniqueId); unequip: UnequipItem:FireServer("pickaxe");
+--     draw / stow: ToggleTool:FireServer(true / false). Equipping the pickaxe takes the weapon
+--     off (WeaponType clears); unequipping it put the weapon back about 2 s later (watched live).
+--   * item ids only reach the client through the DataSync event, which Matcha cannot listen
+--     to, so the pickaxe id is read from the heap (equipment.pickaxe) the first time the
+--     player equips it by hand, then saved.
+-- MinedOut was never seen set while mapping, so the script also remembers when it gave up on
+-- a node and leaves it alone for mineRespawn seconds.
+local MINE = { minedAt = {}, learning = false, nextReady = nil, active = false }
+local function mining() return STATE.running and STATE.mine end
+local function remote(name)
+    local rs = game:GetService("ReplicatedStorage")
+    return rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild(name)
+end
+local function fire(name, ...)
+    local r = remote(name)
+    if not r then return false end
+    local args = { ... }
+    return (pcall(function() r:FireServer((table.unpack or unpack)(args)) end))
+end
+local function charAttr(name)
+    local char = LocalPlayer.Character
+    return char and attr(char, name)
+end
+local function pickaxeOut() return charAttr("Tool") == "Pickaxe" end
+local function waitFor(cond, timeout)
+    local untilT = clock() + timeout
+    while alive() and clock() < untilT do
+        if cond() then return true end
+        task.wait(0.2)
+    end
+    return cond()
+end
+
+-- One heap scan for the equipment table's "pickaxe" and "weapon" uniqueIds (15-50 s).
+local function learnItemIds()
+    if MINE.learning then return end
+    MINE.learning = true
+    task.spawn(function()
+        setStatus("mine: reading the pickaxe id from memory (15-50 s)")
+        local ok, res = pcall(getgc, { "pickaxe", "weapon" })
+        if ok and type(res) == "table" then
+            for _, e in ipairs(res) do
+                local v = string.gsub(tostring(e.value), '"', "")
+                if string.match(v, "^%x+%-%x+%-%x+%-%x+%-%x+$") then
+                    if e.key == "pickaxe" then CFG.pickaxeUid = v
+                    elseif e.key == "weapon" and not CFG.weaponUid then CFG.weaponUid = v end
+                end
+            end
+        end
+        print("[SAO AFQ] mine: pickaxe id " .. tostring(CFG.pickaxeUid) .. ", weapon id " .. tostring(CFG.weaponUid))
+        if SETTINGS_HOOK.save then SETTINGS_HOOK.save() end
+        MINE.learning = false
+    end)
+end
+
+local function nodeKey(m)
+    local ok, n = pcall(function() return m:GetFullName() end)
+    return ok and n or tostring(m.Name)
+end
+local function nodeCenter(m)
+    local oc = attr(m, "OreCenter")
+    if type(oc) == "table" and tonumber(oc.x) then return Vector3.new(oc.x, oc.y, oc.z) end
+    if typeof and typeof(oc) == "Vector3" then return oc end
+    local ore = m:FindFirstChild("Ore")
+    return partPos(ore and ore:FindFirstChild("Ore"))
+end
+local function nodeUp(m)
+    if not m or m.Parent == nil or m:FindFirstChild("Ore") == nil then return false end
+    return attr(m, "MinedOut") ~= true
+end
+-- Nodes that are up, not recently mined by us and with no other player close, nearest first.
+local function readyNodes()
+    local root = Workspace:FindFirstChild("OreNodes")
+    if not root then return {} end
+    local out, soonest = {}, nil
+    local players = otherPlayerPositions()
+    local function scan(folder)
+        for _, c in ipairs(folder:GetChildren()) do
+            if c.ClassName == "Folder" then
+                if CFG.mineArea == "all" or c.Name == CFG.mineArea then scan(c) end
+            elseif c.ClassName == "Model" and nodeUp(c) then
+                local key = nodeKey(c)
+                local at = MINE.minedAt[key]
+                local left = at and (at + CFG.mineRespawn - clock()) or 0
+                local p = nodeCenter(c)
+                if left > 0 then
+                    soonest = math.min(soonest or left, left)
+                elseif p then
+                    local crowded = false
+                    for _, q in ipairs(players) do
+                        if flatDist(p, q) <= CFG.minePlayerRadius then crowded = true end
+                    end
+                    if not crowded then out[#out + 1] = { model = c, key = key, pos = p } end
+                end
+            end
+        end
+    end
+    scan(root)
+    MINE.nextReady = soonest
+    local here = partPos(myRoot())
+    if here then table.sort(out, function(a, b) return flatDist(a.pos, here) < flatDist(b.pos, here) end) end
+    return out
+end
+
+local function equipPickaxe()
+    if pickaxeOut() then return true end
+    if not CFG.pickaxeUid then return false end
+    setStatus("mine: equipping the pickaxe")
+    fire("EquipItem", CFG.pickaxeUid)
+    return waitFor(pickaxeOut, 5)
+end
+local function drawPickaxe()
+    if charAttr("ToolDrawn") == true then return true end
+    fire("ToggleTool", true)
+    return waitFor(function() return charAttr("ToolDrawn") == true end, 3)
+end
+-- Back to the weapon so the quest loop can fight.
+local function stowPickaxe()
+    if not pickaxeOut() then return true end
+    setStatus("mine: putting the pickaxe away")
+    if charAttr("ToolDrawn") == true then fire("ToggleTool", false); task.wait(0.5) end
+    fire("UnequipItem", "pickaxe")
+    local back = waitFor(function()
+        local w = charAttr("WeaponType")
+        return w ~= nil and w ~= ""
+    end, 6)
+    if not back and CFG.weaponUid then
+        fire("EquipItem", CFG.weaponUid)
+        back = waitFor(function() local w = charAttr("WeaponType"); return w ~= nil and w ~= "" end, 4)
+    end
+    return back
+end
+
+local function mineNode(n)
+    local here = partPos(myRoot())
+    if not here then return false end
+    local away = Vector3.new(here.X - n.pos.X, 0, here.Z - n.pos.Z)
+    local dir = away.Magnitude > 0.5 and away.Unit or Vector3.new(1, 0, 0)
+    local stand = n.pos + dir * CFG.mineStand + Vector3.new(0, 2, 0)
+    setStatus("mine: going to " .. n.model.Name)
+    travelTo(stand, mining)
+    local cur = partPos(myRoot())
+    if not cur or flatDist(cur, n.pos) > 8 or math.abs(cur.Y - n.pos.Y) > 8 then
+        setStatus("mine: could not reach " .. n.model.Name)
+        MINE.minedAt[n.key] = clock()
+        return false
+    end
+    placeStep(cur.X, cur.Y, cur.Z, Vector3.new(n.pos.X - cur.X, 0, n.pos.Z - cur.Z))
+    if not drawPickaxe() then setStatus("mine: the pickaxe did not come out"); return false end
+    local swings = 0
+    while mining() and swings < CFG.mineMaxSwings do
+        if afkCheckOpen() or hpFraction() < CFG.retreatHp then return false end
+        if not nodeUp(n.model) then break end
+        local p = partPos(myRoot())
+        if not p or flatDist(p, n.pos) > 8 then break end
+        fire("MineSwing", n.model)
+        swings = swings + 1
+        setStatus(string.format("mine: %s swing %d", n.model.Name, swings))
+        task.wait(CFG.mineSwingGap / math.max(0.25, tonumber(charAttr("MiningSpeed")) or 1))
+    end
+    MINE.minedAt[n.key] = clock()
+    return true
+end
+
+-- One round: equip, mine every ready node, put the pickaxe away. Returns true if it mined.
+local function mineRound()
+    if not CFG.pickaxeUid then
+        if pickaxeOut() then
+            learnItemIds()
+        else
+            setStatus("mine: equip the pickaxe once from Menu > Tools so the script learns its id")
+        end
+        return false
+    end
+    if hpFraction() < CFG.retreatHp then
+        if not STATE.farm then setStatus(string.format("mine: low HP (%d%%), waiting", math.floor(hpFraction() * 100))) end
+        return false
+    end
+    local nodes = readyNodes()
+    if #nodes < CFG.mineMinReady then
+        if pickaxeOut() then stowPickaxe() end
+        return false
+    end
+    MINE.active = true
+    if not equipPickaxe() then
+        setStatus("mine: EquipItem did not equip the pickaxe - re-learn its id from the menu")
+        MINE.active = false
+        return false
+    end
+    local mined = 0
+    while mining() do
+        local n = readyNodes()[1]
+        if not n then break end
+        if mineNode(n) then mined = mined + 1 end
+        if afkCheckOpen() or hpFraction() < CFG.retreatHp then break end
+    end
+    stowPickaxe()
+    MINE.active = false
+    return mined > 0
+end
+
+-- ---------------------------------------------------------------------------
 -- Main AFQ loop
 -- ---------------------------------------------------------------------------
 task.spawn(function()
     local lastTalk = -1e9
     while alive() do
+        if STATE.mine and myRoot() and not afkCheckOpen() then
+            mineRound()
+            if not STATE.farm then
+                if CFG.pickaxeUid then
+                    setStatus(MINE.nextReady and string.format("mine: next node in %.0fs", MINE.nextReady) or "mine: waiting for nodes")
+                end
+                task.wait(1)
+            end
+        end
         if not STATE.farm then
-            setStatus("off  (F6 to start)")
+            if not STATE.mine then setStatus("off  (F6 farm, F5 mine)") end
             task.wait(0.3)
         elseif not myRoot() then
             setStatus("waiting for character")
@@ -1305,14 +1537,15 @@ task.spawn(function()
                 elseif name == "dump" then task.spawn(dump)
                 elseif name == "dash" then setDash(DASH.state ~= "on")
                 elseif name == "parry" then STATE.parry = not STATE.parry
+                elseif name == "mine" then STATE.mine = not STATE.mine
                 elseif name == "unload" then API.unload() end
             end
             was[name] = down
         end
         if label then
             pcall(function()
-                label.Text = string.format("SAO AFQ  farm:%s  quest:%s  dash:%s  parry:%s(%d)  |  %s",
-                    STATE.farm and "ON" or "off", STATE.quest and "ON" or "off", DASH.state,
+                label.Text = string.format("SAO AFQ  farm:%s  quest:%s  mine:%s  dash:%s  parry:%s(%d)  |  %s",
+                    STATE.farm and "ON" or "off", STATE.quest and "ON" or "off", STATE.mine and "ON" or "off", DASH.state,
                     STATE.parry and "ON" or "off", PARRY.count, STATE.status)
             end)
         end
@@ -1348,7 +1581,8 @@ local function saveSettings()
             slotSkills = CFG.slotSkills, skillRecast = CFG.skillRecast, parryMode = CFG.parryMode,
             retreatHp = CFG.retreatHp, mobName = CFG.mobName or false, infiniteDash = CFG.infiniteDash,
             autoQuest = STATE.quest, autoParry = STATE.parry, questGivers = CFG.questGivers,
-            avoidPlayers = CFG.avoidPlayers,
+            avoidPlayers = CFG.avoidPlayers, autoMine = STATE.mine, mineArea = CFG.mineArea,
+            pickaxeUid = CFG.pickaxeUid or false, weaponUid = CFG.weaponUid or false,
         }
         writefile(SETTINGS_FILE, game:GetService("HttpService"):JSONEncode(data))
     end)
@@ -1372,6 +1606,10 @@ local function loadSettings()
             end
         end
         if d.avoidPlayers ~= nil then CFG.avoidPlayers = d.avoidPlayers end
+        if d.autoMine ~= nil then STATE.mine = d.autoMine end
+        if type(d.mineArea) == "string" then CFG.mineArea = d.mineArea end
+        if type(d.pickaxeUid) == "string" then CFG.pickaxeUid = d.pickaxeUid end
+        if type(d.weaponUid) == "string" then CFG.weaponUid = d.weaponUid end
         if d.autoQuest ~= nil then STATE.quest = d.autoQuest end
         if d.autoParry ~= nil then STATE.parry = d.autoParry end
     end)
@@ -1484,6 +1722,20 @@ local function buildMenu()
         Min = 10, Max = 90, Rounding = 0, Suffix = "%",
         Callback = function(v) CFG.retreatHp = (tonumber(v) or 35) / 100; saveSettings() end }))
 
+    local gather = win:AddTab("Gather")
+    local mineBox = gather:AddLeftGroupbox("Mining")
+    reg("mine", mineBox:AddToggle("mine", { Text = "Auto Mine (F5)", Default = STATE.mine,
+        Tooltip = "Mine every ore node that is up; with Auto Farm on, quests run while nodes respawn",
+        Callback = function(v) STATE.mine = v == true; saveSettings() end }))
+    reg("mineArea", mineBox:AddDropdown("mineArea", { Text = "Ore Area", Values = { "all", "Area1", "Area2" }, Default = CFG.mineArea,
+        Tooltip = "Folder under Workspace.OreNodes to mine",
+        Callback = function(v) if v then CFG.mineArea = v; saveSettings() end end }))
+    mineBox:AddButton({ Text = "Re-learn pickaxe id", Func = function()
+        CFG.pickaxeUid = nil
+        saveSettings()
+        if pickaxeOut() then learnItemIds() else setStatus("mine: equip the pickaxe from Menu > Tools, then press this again") end
+    end })
+
     local combat = win:AddTab("Combat")
     local attacks = combat:AddLeftGroupbox("Attacks")
     reg("attackMode", attacks:AddDropdown("attackMode", { Text = "Attack Mode", Values = { "remote", "click" }, Default = CFG.attackMode,
@@ -1553,6 +1805,7 @@ task.spawn(function()
         syncControl("farm", STATE.farm)
         syncControl("quest", STATE.quest)
         syncControl("parry", STATE.parry)
+        syncControl("mine", STATE.mine)
         if DASH.state == "on" or DASH.state == "off" then syncControl("dash", DASH.state == "on") end
         task.wait(0.3)
     end
@@ -1580,4 +1833,4 @@ task.spawn(function()
     task.wait(1)
     if alive() and CFG.zeroSkillCooldown then setSkillCooldowns(true) end
 end)
-print("[SAO AFQ] loaded - F6 farm, F7 quest pickup, F8 dump, F9 infinite dash, F10 auto-parry, End unload")
+print("[SAO AFQ] loaded - F5 mine, F6 farm, F7 quest pickup, F8 dump, F9 infinite dash, F10 auto-parry, End unload")

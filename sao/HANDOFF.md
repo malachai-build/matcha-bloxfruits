@@ -98,6 +98,16 @@ Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` t
 - A remote-only reply needs the `token`, which comes only through OnClientEvent, so Matcha can't do it.
 - Click fallback: `PlayerGui.AcceptModal` is a BillboardGui adorned to an `AcceptModalAnchor` part 1.6 studs in front of the camera. `AcceptButton` (the circle) moves to a random spot each time. Clicking it needs `WorldToScreen` on the anchor (inside a RenderStepped callback), the button's offset, then `mousemoveabs` and `mouse1click`. That needs Roblox focused, and it can only be tested while the popup is up.
 
+### Auto-mining built (Nov 1 2026, not run live yet)
+
+- The code is in the "Mining" section of `sao_afq.lua`, with F5 and a menu toggle on the Gather tab. The README has the full flow.
+- Things to check on the first live run:
+  1. The heap scan really finds `equipment.pickaxe`.
+  2. `EquipItem(uid)` puts the pickaxe in hand.
+  3. Swings mine the node. If `MinedOut` reads fine, a node is left alone after it breaks; otherwise the script swings the full 20 times.
+  4. The weapon comes back after the unequip.
+- Your sword's uid was read live as `bd8a692e-cace-486b-b390-bb19cca55c13` (`equipment.weapon`).
+
 ### Still unknown
 
 - The arguments for `ToggleTool` (in `Systems.CharacterController`) and `EquipItem` (in `UI.Accessories` and `UI.Menu`). Matcha's decompiler started returning nil for every uncached script after a sweep over all PlayerScripts, so don't sweep. Restart Matcha or rejoin, then decompile those two directly. Alternatively, equip a pickaxe by hand and watch how the `Tool`, `ToolDrawn` and `WeaponType` attributes change.
