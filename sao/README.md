@@ -173,7 +173,8 @@ Status: run live on Nov 1 2026.
 - `EquipItem(uid)` and `ToggleTool(true)` set `Tool=Pickaxe` and `ToolDrawn=true`.
 - The script mined IronOreSpot5, then IronOreSpot13. Each node broke well before the 20-swing cap.
 - Matcha reads `MinedOut = true` correctly, with 10–11 nodes showing it during the run.
-- Not yet checked: putting the pickaxe away at the end of a round and getting the weapon back, and mining combined with Auto Farm.
+- The weapon doesn't come back on its own after `UnequipItem("pickaxe")`. The script re-equips it by its uid, which it learns while the weapon is equipped, before the first swap. Verified live: the Greatsword came back and Auto Farm carried on.
+- Not yet checked: mining and Auto Farm both on at the same time.
 
 ## To do
 

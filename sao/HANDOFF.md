@@ -104,7 +104,7 @@ Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` t
 - The pickaxe uid was learned through `getgc({"pickaxe","weapon"})`. No weapon uid came back while the pickaxe was equipped.
 - Equip, draw and swings all worked, and nodes broke before the swing cap.
 - `MinedOut` reads true in Matcha.
-- At the end of the round the weapon did **not** come back on its own after `UnequipItem("pickaxe")`. `EquipItem(weaponUid)` restored it at once. The script now reads the weapon uid before the first swap (scanning while the weapon is equipped) and re-equips the weapon by uid 2s after unequipping. That fix is loaded but hasn't been through a full round yet.
+- At the end of the round the weapon did **not** come back on its own after `UnequipItem("pickaxe")`. `EquipItem(weaponUid)` restored it at once. The script now reads the weapon uid before the first swap (scanning while the weapon is equipped) and re-equips the weapon by uid 2s after unequipping. Verified live: after a round, `WeaponType=Greatsword` and the `Weapon` model came back, and Auto Farm took over.
 - Still to check: mining combined with Auto Farm.
 
 
