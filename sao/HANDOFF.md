@@ -83,6 +83,21 @@ Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` t
 - **Did not unequip:** firing `"Pickaxe"` again (twice), `()` and `("Pickaxe", false)` all left `Tool=Pickaxe`. So unequipping is still unknown.
 - **Matcha quirk:** a `task.spawn` thread inside `matcha_exec` only advances while an exec is running, and its prints show up late in `matcha_logs`. A plain `task.wait` in the main body makes the exec return early. To test timing, fire in one exec and read state in the next.
 
+### Equip remotes (from decompiles after the game restart, 2026-11-01)
+
+- `EquipItem:FireServer(item.uniqueId)`, used by both `UI.Menu` and `UI.Accessories`. Offhand uses `EquipItem:FireServer(uid, "weapon2")`, and offhand skins use `(uid, "offhandSkin")`.
+- `UnequipItem:FireServer(slot)`. The pickaxe's slot is `"pickaxe"` (`MiningConfig.PICKAXE_SLOT`) and the rod's is `"rod"`. After a pickaxe unequip, the server puts the weapon back about 2s later.
+- `ToggleTool:FireServer(bool)` draws (`true`) or stows (`false`) an equipped tool (`CharacterController`). For weapons, `ToggleSheathe:FireServer(bool)` does the same job.
+- Item uids live in `State.data.inventory[i].uniqueId`, a UUID string, and arrive only through the `DataSync` OnClientEvent. Matcha can't receive OnClientEvent. `getgc({"uniqueId","kind"})` finds the UUIDs but not their `kind`, and `readtbl` misaligns the fields, so the pickaxe uid hasn't been identified yet.
+- `getgc` / `findgc` take key names (`getgc("uniqueId")`), not `true`. A scan takes 15–55s and can time out the exec, but its results still land in `matcha_logs`.
+
+### AFK check ("Are you still here?")
+
+- Script `Client.Systems.AfkCheck`, remote `Remotes.AfkConfirm` (a RemoteEvent).
+- Server to client: `AfkConfirm.OnClientEvent(token)`. Client to server: `AfkConfirm:FireServer(token, true)` once the circle is clicked. There's a 60s window before the disconnect.
+- A remote-only reply needs the `token`, which comes only through OnClientEvent, so Matcha can't do it.
+- Click fallback: `PlayerGui.AcceptModal` is a BillboardGui adorned to an `AcceptModalAnchor` part 1.6 studs in front of the camera. `AcceptButton` (the circle) moves to a random spot each time. Clicking it needs `WorldToScreen` on the anchor (inside a RenderStepped callback), the button's offset, then `mousemoveabs` and `mouse1click`. That needs Roblox focused, and it can only be tested while the popup is up.
+
 ### Still unknown
 
 - The arguments for `ToggleTool` (in `Systems.CharacterController`) and `EquipItem` (in `UI.Accessories` and `UI.Menu`). Matcha's decompiler started returning nil for every uncached script after a sweep over all PlayerScripts, so don't sweep. Restart Matcha or rejoin, then decompile those two directly. Alternatively, equip a pickaxe by hand and watch how the `Tool`, `ToolDrawn` and `WeaponType` attributes change.
