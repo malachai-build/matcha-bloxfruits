@@ -79,7 +79,14 @@ local CFG = {
     autoParry = true,       -- tap F when a nearby mob telegraphs an attack (F10 toggles)
     parryRange = 25,        -- studs: mobs watched for telegraphs
     parryLead = 0.2,        -- s before the hit to press F (server parry window is 0.4 s)
-    parryCooldown = nil,    -- e.g. 0.3 to patch the client 0.9 s parry cooldown; nil = leave it
+    parryCooldown = 0.25,   -- patches the client 0.9 s parry cooldown (several attackers); nil = leave it
+    parryMinGap = 0.12,     -- s between auto-parry taps
+    crowdRadius = 15,       -- studs: other mobs this close to a target count as a crowd
+    crowdPenalty = 40,      -- studs of distance each crowding mob adds to a target's cost
+    retreatHp = 0.35,       -- below this HP fraction, leave the fight
+    resumeHp = 0.8,         -- go back to farming at this HP fraction
+    retreatDistance = 80,   -- studs to move away from nearby mobs
+    retreatMaxWait = 45,    -- s to wait for health before farming again anyway
     keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, unload = 0x23 },
 }
 if type(_G.SAO_AFQ_CONFIG) == "table" then
@@ -354,18 +361,25 @@ local function bestMob(want)
     local folder = Workspace:FindFirstChild("Mobs")
     local here = partPos(myRoot())
     if not folder or not here then return nil end
-    local best, bestScore = nil, -math.huge
+    -- Live test Nov 1 2026: three Frenzy Boars at once overwhelmed auto-parry and killed
+    -- the character, so every other live mob within crowdRadius costs crowdPenalty studs.
+    local live = {}
     for _, m in ipairs(folder:GetChildren()) do
         if mobAlive(m) then
-            local match = mobMatch(m, want)
-            if match > 0 then
-                local p = partPos(m:FindFirstChild("Collider") or m.PrimaryPart)
-                if p then
-                    local score = -(p - here).Magnitude
-                    if match == 2 or not CFG.skipCorrupted then score = score + 100000 end
-                    if score > bestScore then best, bestScore = m, score end
-                end
+            local p = partPos(m:FindFirstChild("Collider") or m.PrimaryPart)
+            if p then live[#live + 1] = { m = m, p = p } end
+        end
+    end
+    local best, bestScore = nil, -math.huge
+    for _, e in ipairs(live) do
+        local match = mobMatch(e.m, want)
+        if match > 0 then
+            local score = -(e.p - here).Magnitude
+            for _, o in ipairs(live) do
+                if o ~= e and flatDist(o.p, e.p) <= CFG.crowdRadius then score = score - CFG.crowdPenalty end
             end
+            if match == 2 or not CFG.skipCorrupted then score = score + 100000 end
+            if score > bestScore then best, bestScore = e.m, score end
         end
     end
     return best
@@ -446,12 +460,45 @@ end
 -- ---------------------------------------------------------------------------
 -- Fight
 -- ---------------------------------------------------------------------------
+local function hpFraction()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChild("Humanoid")
+    local ok, hp, maxHp = pcall(function() return hum.Health, hum.MaxHealth end)
+    if not ok or not hp or not maxHp or maxHp <= 0 then return 1 end
+    return hp / maxHp
+end
+
+-- Low HP: step away from the nearest mobs and wait for health to come back.
+local function retreat()
+    local here = partPos(myRoot())
+    local folder = Workspace:FindFirstChild("Mobs")
+    if not here or not folder then return end
+    local away, n = Vector3.new(0, 0, 0), 0
+    for _, m in ipairs(folder:GetChildren()) do
+        local p = mobAlive(m) and partPos(m:FindFirstChild("Collider") or m.PrimaryPart)
+        if p and flatDist(p, here) <= 40 then
+            away = away + Vector3.new(here.X - p.X, 0, here.Z - p.Z)
+            n = n + 1
+        end
+    end
+    if n > 0 and away.Magnitude > 0.01 then
+        setStatus(string.format("retreating at %d%% HP", math.floor(hpFraction() * 100)))
+        travelTo(here + away.Unit * CFG.retreatDistance, farming)
+    end
+    local untilT = clock() + CFG.retreatMaxWait
+    while farming() and clock() < untilT and hpFraction() < CFG.resumeHp do
+        setStatus(string.format("recovering %d%% HP", math.floor(hpFraction() * 100)))
+        task.wait(1)
+    end
+end
+
 local function fight(mob)
     local holdWait = 1 / math.max(1, CFG.holdHz)
     local clickEvery = 1 / math.max(1, CFG.clickHz)
     local nextClick, startedAt = 0, clock()
     while farming() and mobAlive(mob) do
         if afkCheckOpen() then return end
+        if hpFraction() < CFG.retreatHp then retreat(); return end
         local col = mob:FindFirstChild("Collider") or mob.PrimaryPart
         local mp = partPos(col)
         local here = partPos(myRoot())
@@ -646,7 +693,9 @@ task.spawn(function()
                         -- task.delay callbacks never ran in Matcha (live test Nov 1 2026); spawn + wait does.
                         task.spawn(function()
                             task.wait(delay)
-                            if alive() and STATE.parry and clock() - PARRY.pressedAt > 0.25 then tapParry() end
+                            -- 0.12 s spacing: one tap can cover attacks that land together
+                            -- (parry window 0.4 s), but a later attacker still gets its own.
+                            if alive() and STATE.parry and clock() - PARRY.pressedAt > CFG.parryMinGap then tapParry() end
                         end)
                     end
                 elseif entry and entry.h and not entry.done then

@@ -48,13 +48,15 @@ On by default (`autoParry = true`), toggled with F10.
   - It taps F so the press lands `parryLead` (0.2 s) before the expected hit.
   - It learns each mob type's windup from how long the highlight lasted.
   - Your weapon has to be drawn: a sheathed F press does nothing.
-- **Optional:** set `parryCooldown = 0.3` to shorten the client cooldown. The server may still have its own.
+- **Several attackers:** the client parry cooldown is patched from 0.9 to 0.25 s (`parryCooldown`), and taps can be as close as 0.12 s apart (`parryMinGap`). The server may still have its own cooldown.
+- **Crowds:** target choice adds 40 studs of cost for every other mob within 15 studs of a candidate (`crowdRadius`, `crowdPenalty`), so lone mobs win.
+- **Low HP:** below 35% HP (`retreatHp`) the script leaves the fight, moves 80 studs away from nearby mobs, and waits until 80% HP (`resumeHp`, at most 45 s).
 - **Click pause:** the game ignores F while a light attack is mid-swing, so the fight loop stops clicking from the moment a telegraph appears until 0.35 s after the planned F tap.
 - **Live tests:**
   - Detection works: Frenzy Boar windup measured 0.47 s, and the highlight lasted 0.57 s.
   - With you clicking non-stop and the script tapping F, 0 of 3 attacks were parried.
-  - Your own manual F presses did stagger the boar.
-  - The click pause is not tested yet.
+  - Hands-off test, with three boars attacking for most of it: the script parried most hits (HP stayed flat across many attacks), but the overlapping attacks eventually killed the character. That's what the cooldown patch, crowd avoidance and retreat are for. None of those three are tested yet.
+  - The mob's `Staggered` attribute is not a reliable success signal. Damage taken is.
 
 ## To do
 
@@ -76,7 +78,8 @@ _G.SAO_AFQ_CONFIG = {
     autoQuest = false,       -- just farm, never talk to givers
     stepSpeed = 48, stepHz = 12, stepLift = 0.4, climbLift = 4,
     infiniteDash = true, dashCooldown = 0,
-    autoParry = true, parryRange = 25, parryLead = 0.2, parryCooldown = nil,
+    autoParry = true, parryRange = 25, parryLead = 0.2, parryCooldown = 0.25, parryMinGap = 0.12,
+    crowdRadius = 15, crowdPenalty = 40, retreatHp = 0.35, resumeHp = 0.8,
     holdHz = 10, clickHz = 6,
 }
 ```
