@@ -639,7 +639,9 @@ task.spawn(function()
                         PARRY.seen[mobKey] = { h = hKey, at = now, kind = kind }
                         local windup = PARRY.windup[kind] or 0.4
                         local delay = math.max(0, windup - CFG.parryLead)
-                        task.delay(delay, function()
+                        -- task.delay callbacks never ran in Matcha (live test Nov 1 2026); spawn + wait does.
+                        task.spawn(function()
+                            task.wait(delay)
                             if alive() and STATE.parry and clock() - PARRY.pressedAt > 0.25 then tapParry() end
                         end)
                     end
