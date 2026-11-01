@@ -78,7 +78,8 @@ Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` t
 
 ### Live test (2026-11-01, approved by the user)
 
-- **Confirmed:** `Remotes.ToggleTool:FireServer("Pickaxe")` equips the pickaxe. It sets `Tool=Pickaxe`, clears `WeaponType` and adds `PickaxeBack`.
+- **Not confirmed:** after `Remotes.ToggleTool:FireServer("Pickaxe")`, the character's attributes read `Tool=Pickaxe`, `WeaponType=""` and `PickaxeBack`, but the user saw no pickaxe equipped in game. Treat this call as unknown.
+- **Don't guess remote arguments.** The user rejected guess-and-fire testing. Get the real arguments from a working decompile first.
 - **Did not unequip:** firing `"Pickaxe"` again (twice), `()` and `("Pickaxe", false)` all left `Tool=Pickaxe`. So unequipping is still unknown.
 - **Matcha quirk:** a `task.spawn` thread inside `matcha_exec` only advances while an exec is running, and its prints show up late in `matcha_logs`. A plain `task.wait` in the main body makes the exec return early. To test timing, fire in one exec and read state in the next.
 
