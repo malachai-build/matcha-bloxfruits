@@ -76,6 +76,12 @@ The settings menu uses the UE library and saves to `sao_afq_settings.json`.
 
 Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` the whole time, so drawing a tool sets `ToolDrawn` rather than `Sheathed`.
 
+### Live test (2026-11-01, approved by the user)
+
+- **Confirmed:** `Remotes.ToggleTool:FireServer("Pickaxe")` equips the pickaxe. It sets `Tool=Pickaxe`, clears `WeaponType` and adds `PickaxeBack`.
+- **Did not unequip:** firing `"Pickaxe"` again (twice), `()` and `("Pickaxe", false)` all left `Tool=Pickaxe`. So unequipping is still unknown.
+- **Matcha quirk:** a `task.spawn` thread inside `matcha_exec` only advances while an exec is running, and its prints show up late in `matcha_logs`. A plain `task.wait` in the main body makes the exec return early. To test timing, fire in one exec and read state in the next.
+
 ### Still unknown
 
 - The arguments for `ToggleTool` (in `Systems.CharacterController`) and `EquipItem` (in `UI.Accessories` and `UI.Menu`). Matcha's decompiler started returning nil for every uncached script after a sweep over all PlayerScripts, so don't sweep. Restart Matcha or rejoin, then decompile those two directly. Alternatively, equip a pickaxe by hand and watch how the `Tool`, `ToolDrawn` and `WeaponType` attributes change.
