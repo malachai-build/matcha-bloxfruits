@@ -95,7 +95,8 @@ local CFG = {
     autoParry = true,       -- tap F when a nearby mob telegraphs an attack (F10 toggles)
     parryRange = 25,        -- studs: mobs watched for telegraphs
     parryLead = 0.2,        -- s before the hit to press F (server parry window is 0.4 s)
-    parryCooldown = 0.25,   -- patches the client 0.9 s parry cooldown (several attackers); nil = leave it
+    parryCooldown = nil,    -- key mode only: e.g. 0.25 patches the client 0.9 s parry cooldown (heap scan);
+                            -- remote mode does not use it, so nil skips the scan on load/unload
     parryMinGap = 0.12,     -- s between auto-parry taps
     -- "remote": Combat:FireServer("Parry", t), no focus needed (live: 32 parries, 0 damage,
     -- 28 of them unfocused); "key": tap F (needs Roblox focus)
@@ -1215,11 +1216,24 @@ local function buildMenu()
         return
     end
     UI.lib = ue
-    local accent = Color3.fromRGB(255, 111, 0)
-    ue.AccentColor = accent
-    ue.StaticAccentColor = accent
-    local win = ue:CreateWindow({ Title = "laced.club | SAO: Eternity", Width = 540, Height = 470, AutoShow = true, Center = true })
+    -- Own look (SAO system-menu blue on dark navy, gradient) and own UE files, so nothing
+    -- is shared with the Blox Fruits menu's settings or configs.
+    local accent = Color3.fromRGB(90, 200, 255)
+    ue.AccentColor, ue.StaticAccentColor = accent, accent
+    ue.BackgroundColor = Color3.fromRGB(10, 14, 24)
+    ue.MainColor = Color3.fromRGB(18, 26, 42)
+    ue.OutlineColor = Color3.fromRGB(44, 70, 108)
+    ue.FontColor = Color3.fromRGB(226, 238, 255)
+    ue.GradientEnabled = true
+    ue.GradientTopColor = Color3.fromRGB(22, 44, 78)
+    ue.GradientBottomColor = Color3.fromRGB(8, 10, 20)
+    ue.SettingsFile = "sao_afq.ui.json"
+    ue.ConfigFolder = "sao_afq_configs"
+    local win = ue:CreateWindow({ Title = "Aincrad Assist  |  SAO: Eternity", Width = 540, Height = 470, AutoShow = true, Center = true })
     UI.window = win
+    -- UE draws each control the moment it is added, so building on a visible window showed
+    -- every tab's text on top of each other until the next refresh. Build hidden, show once.
+    pcall(function() win:Hide() end)
     local function reg(id, c) UI.controls[id] = c; return c end
 
     local main = win:AddTab("Main")
@@ -1277,6 +1291,10 @@ local function buildMenu()
     if type(ue.OnUnload) == "function" then
         pcall(function() ue:OnUnload(function() if not UI.unloading then API.unload() end end) end)
     end
+    pcall(function()
+        win:Show()
+        win._visibilityDirty = true
+    end)
 end
 
 -- Mouse over a visible UE window: click-mode attacks wait (the menu reads the real button).
