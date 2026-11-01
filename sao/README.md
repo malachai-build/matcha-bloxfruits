@@ -60,6 +60,12 @@ The dash's i-frames (`invulnerable = 0.22`) can't be changed from the client. Th
 - **No focus needed:** with remote attack, remote parry and teleport travel, farming runs without Roblox focus. Quest dialogue (E) and skill-key taps still need focus.
 - **Town retreat:** HP only regenerates in town (`TOWN_REGEN_PER_SECOND = 0.02`; field healing needs vitality 5), so the low-HP retreat now teleports to `townPos` (Town of Beginnings, about 45, 87, -3026) and waits there.
 
+## Remote sword skills (default, `skillMode = "remote"`)
+
+- **How it works:** a cast is one call, `SwordSkillCast:FireServer(skillId, aimDir, rootPos, castId)`. The server runs the skill and its damage. The script casts each id in `remoteSkills` (default `{ "Avalanche" }`) whenever a mob is in range and `skillRecast` (9 s) has passed. No keys or focus needed.
+- **Skill ids:** Greatsword skills are `Avalanche`, `Cyclone`, `TitansVerdict` and `ExecutionersCross`, from `Shared.SwordSkills.ArsenalSkills`.
+- **Live test:** one remote Avalanche took a Lv1 Frenzy Boar from 78 to 7 HP (about 20 stamina), and the next cast 9 s later killed it.
+
 ## Auto-parry (F)
 
 On by default (`autoParry = true`), toggled with F10.

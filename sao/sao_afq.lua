@@ -103,7 +103,11 @@ local CFG = {
     parryFace = true,       -- remote mode: turn toward the attacker first (enemy behind you)
     parryServerCooldown = 0.9, -- remote mode: inside this since the last parry, block instead
     blockHold = 0.45,       -- s to hold that block before releasing it
-    skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting ({} = none)
+    skillMode = "remote",   -- "remote": SwordSkillCast remote (no focus); "keys": tap skillSlots
+    remoteSkills = { "Avalanche" }, -- equipped skill ids (Greatsword: Avalanche, Cyclone,
+                                    -- TitansVerdict, ExecutionersCross)
+    skillRecast = 9,        -- s between casts of one skill (server cooldown measured ~8.5 s)
+    skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting in "keys" mode ({} = none)
     skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)
     zeroSkillCooldown = true, -- patch the client skill cooldowns to 0 (server still enforces its own)
     crowdRadius = 15,       -- studs: other mobs this close to a target count as a crowd
@@ -140,6 +144,8 @@ local STATE = { running = true, farm = false, quest = CFG.autoQuest, parry = CFG
 -- non-stop clicking landed 0 parries out of 3 telegraphs.
 local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0, holdClicksUntil = -1e9,
     lastRemoteParry = -1e9, blockSeq = 0 }
+-- Remote sword skill casts: next allowed time per skill id, and our own cast counter.
+local SKILLCAST = { nextAt = {}, castId = 5000 }
 local API = { unload = function() end }
 _G.SAO_AFQ = API
 
@@ -737,7 +743,28 @@ local function fight(mob)
         -- (Duration lock while the animation plays, server-synced cooldown after a reject),
         -- so the first tap it lets through goes out right as the animation ends, which is
         -- the user's rapid-recast window.
-        if #CFG.skillSlots > 0 and clock() >= nextSkill and (here - mp).Magnitude <= CFG.standOff + 6
+        if CFG.skillMode == "remote" then
+            -- SwordSkillCast:FireServer(skillId, aimDir, rootPos, castId) is the whole cast
+            -- (SwordSkills.Controller); the server runs the skill and its damage. Live: one
+            -- remote Avalanche took a Lv1 Frenzy Boar from 78 to 7 HP, the next killed it.
+            if (here - mp).Magnitude <= CFG.standOff + 6 and clock() >= PARRY.holdClicksUntil then
+                for _, id in ipairs(CFG.remoteSkills) do
+                    if clock() >= (SKILLCAST.nextAt[id] or 0) then
+                        SKILLCAST.nextAt[id] = clock() + CFG.skillRecast
+                        SKILLCAST.castId = SKILLCAST.castId + 1
+                        local aim = Vector3.new(mp.X - here.X, 0, mp.Z - here.Z)
+                        aim = aim.Magnitude > 0.1 and aim.Unit or Vector3.new(0, 0, -1)
+                        local castId = SKILLCAST.castId
+                        task.spawn(function()
+                            local rs = game:GetService("ReplicatedStorage")
+                            local remote = rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild("SwordSkillCast")
+                            if remote then pcall(function() remote:FireServer(id, aim, here, castId) end) end
+                        end)
+                        break
+                    end
+                end
+            end
+        elseif #CFG.skillSlots > 0 and clock() >= nextSkill and (here - mp).Magnitude <= CFG.standOff + 6
             and focused() and clock() >= PARRY.holdClicksUntil then
             nextSkill = clock() + 1 / math.max(1, CFG.skillTapHz)
             skillIdx = skillIdx % #CFG.skillSlots + 1
