@@ -1119,20 +1119,24 @@ local function drawPickaxe()
     fire("ToggleTool", true)
     return waitFor(function() return charAttr("ToolDrawn") == true end, 3)
 end
--- Back to the weapon so the quest loop can fight.
+local function weaponOn()
+    local w = charAttr("WeaponType")
+    return w ~= nil and w ~= ""
+end
+-- Back to the weapon so the quest loop can fight. Live Nov 1 2026: after the script's
+-- UnequipItem("pickaxe") the weapon did not come back on its own (it had when the player
+-- unequipped from the menu), and EquipItem(weaponUid) put it back at once.
 local function stowPickaxe()
     if not pickaxeOut() then return true end
     setStatus("mine: putting the pickaxe away")
     if charAttr("ToolDrawn") == true then fire("ToggleTool", false); task.wait(0.5) end
     fire("UnequipItem", "pickaxe")
-    local back = waitFor(function()
-        local w = charAttr("WeaponType")
-        return w ~= nil and w ~= ""
-    end, 6)
+    local back = waitFor(weaponOn, 2)
     if not back and CFG.weaponUid then
         fire("EquipItem", CFG.weaponUid)
-        back = waitFor(function() local w = charAttr("WeaponType"); return w ~= nil and w ~= "" end, 4)
+        back = waitFor(weaponOn, 4)
     end
+    if not back then setStatus("mine: weapon did not come back - equip it from the menu") end
     return back
 end
 
@@ -1184,6 +1188,13 @@ local function mineRound()
     local nodes = readyNodes()
     if #nodes < CFG.mineMinReady then
         if pickaxeOut() then stowPickaxe() end
+        return false
+    end
+    -- The weapon id can only be read while the weapon is equipped, so learn it before the
+    -- first swap; without it the weapon cannot be put back after mining.
+    if not CFG.weaponUid then
+        if weaponOn() then learnItemIds() end
+        setStatus("mine: reading the weapon id first (15-50 s)")
         return false
     end
     MINE.active = true

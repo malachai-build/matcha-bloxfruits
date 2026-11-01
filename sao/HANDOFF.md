@@ -104,7 +104,8 @@ Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` t
 - The pickaxe uid was learned through `getgc({"pickaxe","weapon"})`. No weapon uid came back while the pickaxe was equipped.
 - Equip, draw and swings all worked, and nodes broke before the swing cap.
 - `MinedOut` reads true in Matcha.
-- Still to check: stowing the pickaxe at the end of a round and the weapon coming back, and mining combined with Auto Farm.
+- At the end of the round the weapon did **not** come back on its own after `UnequipItem("pickaxe")`. `EquipItem(weaponUid)` restored it at once. The script now reads the weapon uid before the first swap (scanning while the weapon is equipped) and re-equips the weapon by uid 2s after unequipping. That fix is loaded but hasn't been through a full round yet.
+- Still to check: mining combined with Auto Farm.
 
 
 - The code is in the "Mining" section of `sao_afq.lua`, with F5 and a menu toggle on the Gather tab. The README has the full flow.
