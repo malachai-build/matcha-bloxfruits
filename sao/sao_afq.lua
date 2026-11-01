@@ -68,6 +68,12 @@ local CFG = {
     holdHz = 10,            -- root writes per second while fighting
     -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
     -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
+    travelMode = "dash",    -- "dash": hold W + tap Ctrl, mouse steers the camera (needs focus,
+                            -- ~50 studs/s); falls back to "step" (CFrame steps) without focus
+    dashGap = 0.15,         -- s between Ctrl taps (0.15 = 52 studs/s live)
+    dashArrive = 12,        -- studs: stop dashing this close and finish with steps
+    dashBurst = 10,         -- s of continuous dashing before a short rest
+    dashRest = 1,           -- s rest between dash bursts
     stepSpeed = 24,         -- horizontal studs/s while travelling; hard-capped at MAX_STEP_SPEED (26)
     stepHz = 12,            -- root writes per second while travelling (3 studs per step)
     stepLift = 0.4,         -- studs above the current height per step; gravity takes it back
@@ -120,7 +126,8 @@ local STATE = { running = true, farm = false, quest = CFG.autoQuest, parry = CFG
 -- Auto-parry state (see the Auto-parry section). holdClicksUntil pauses the fight
 -- clicks: the game ignores F while a light attack is mid-swing, and a live test with
 -- non-stop clicking landed 0 parries out of 3 telegraphs.
-local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0, holdClicksUntil = -1e9 }
+local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0, holdClicksUntil = -1e9,
+    lastRemoteParry = -1e9, blockSeq = 0 }
 local API = { unload = function() end }
 _G.SAO_AFQ = API
 
@@ -273,7 +280,102 @@ local function stepToward(pos, keepGoing)
     return false
 end
 
+-- Dash travel: hold W and tap Ctrl while the mouse turns the camera toward the target.
+-- Live tests Nov 1 2026: W + Ctrl every 0.15 s = 52 studs/s (dash is 50 studs/s for
+-- 0.3 s, so faster taps only overlap), no kick; with no move key the dash goes backward,
+-- and the game turns the character to the camera, so steering has to move the camera.
+-- 100 px of mousemoverel turned the camera 10 deg; the proportional steer held <1 deg.
+-- A wall stopped one run dead, so a stalled dash jumps, then sidesteps, then gives up.
+local VK_W, VK_D, VK_SPACE, VK_LCTRL = 0x57, 0x44, 0x20, 0xA2
+local DASHNAV = { radPerPx = nil }
+local function camYaw()
+    local cam = Workspace.CurrentCamera
+    local ok, lv = pcall(function() return cam.CFrame.LookVector end)
+    if not ok or not lv then return nil end
+    return math.atan2(-lv.X, -lv.Z)
+end
+local function wrapAngle(a)
+    while a > math.pi do a = a - 2 * math.pi end
+    while a < -math.pi do a = a + 2 * math.pi end
+    return a
+end
+local function calibrateMouse()
+    if DASHNAV.radPerPx then return DASHNAV.radPerPx end
+    local before = camYaw()
+    pcall(mousemoverel, 100, 0)
+    task.wait(0.15)
+    local after = camYaw()
+    if before and after then
+        local r = wrapAngle(after - before) / 100
+        if math.abs(r) > 1e-5 then DASHNAV.radPerPx = r end
+    end
+    return DASHNAV.radPerPx
+end
+local function holdKey(vk, down)
+    pcall(function() if down then keypress(vk) else keyrelease(vk) end end)
+end
+
+local function dashToward(pos, keepGoing)
+    if not focused() or type(mousemoverel) ~= "function" then return false end
+    local radPerPx = calibrateMouse()
+    if not radPerPx then setStatus("travel: mouse does not turn the camera, using steps"); return false end
+    holdKey(VK_W, true)
+    local nextDash, burstStart = 0, clock()
+    local checkAt, checkPos, stuck = clock() + 1, partPos(myRoot()), 0
+    local result = false
+    while alive() do
+        if keepGoing and not keepGoing() then break end
+        if not focused() then setStatus("travel: lost Roblox focus, using steps"); break end
+        local here = partPos(myRoot())
+        if not here then break end
+        local to = Vector3.new(pos.X - here.X, 0, pos.Z - here.Z)
+        if to.Magnitude <= CFG.dashArrive then
+            result = true
+            break
+        end
+        local yaw = camYaw()
+        local err = yaw and wrapAngle(math.atan2(-to.X, -to.Z) - yaw) or 0
+        local px = math.clamp(err / radPerPx * 0.5, -80, 80)
+        if math.abs(px) >= 1 then pcall(mousemoverel, math.floor(px + 0.5), 0) end
+        if clock() >= nextDash and math.abs(err) < math.rad(30) then
+            nextDash = clock() + CFG.dashGap
+            pcall(function() keypress(VK_LCTRL); task.wait(0.03); keyrelease(VK_LCTRL) end)
+        end
+        if clock() >= checkAt then
+            if checkPos and flatDist(here, checkPos) < 3 then
+                stuck = stuck + 1
+                setStatus(string.format("travel: blocked (%d), %s", stuck, stuck % 3 == 0 and "sidestepping" or "jumping"))
+                if stuck >= 8 then break end
+                if stuck % 3 == 0 then
+                    holdKey(VK_D, true); task.wait(0.6); holdKey(VK_D, false)
+                else
+                    pcall(function() keypress(VK_SPACE); task.wait(0.05); keyrelease(VK_SPACE) end)
+                end
+            else
+                stuck = 0
+                setStatus(string.format("travel: dashing, %d studs left", math.floor(to.Magnitude)))
+            end
+            checkAt, checkPos = clock() + 1, partPos(myRoot())
+        end
+        -- Rest between bursts: the server flags long stretches of high speed.
+        if clock() - burstStart >= CFG.dashBurst then
+            holdKey(VK_W, false)
+            task.wait(CFG.dashRest)
+            holdKey(VK_W, true)
+            burstStart = clock()
+            checkAt, checkPos = clock() + 1, partPos(myRoot())
+        end
+        task.wait(1 / 30)
+    end
+    holdKey(VK_W, false)
+    return result
+end
+
 local function travelTo(pos, keepGoing)
+    local here = partPos(myRoot())
+    if CFG.travelMode == "dash" and here and flatDist(here, pos) > 30 then
+        dashToward(pos, keepGoing)
+    end
     return stepToward(pos, keepGoing)
 end
 

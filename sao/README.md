@@ -26,6 +26,19 @@ Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8*
 - No remotes and no writes to mobs. Only your own root is moved, and the script re-reads it before every write.
 - No `Workspace:GetDescendants` (the game has about 230k instances).
 
+## Dash travel (default, `travelMode = "dash"`)
+
+- **How it works:** for trips over 30 studs with Roblox focused, the script holds W and taps Ctrl every `dashGap` (0.15 s), while `mousemoverel` turns the camera toward the target. With W held the dash follows the camera. With no move key it goes backward, and the game turns the character to the camera, so the camera is what has to be steered.
+- **Live tests:**
+  - W + Ctrl ran at 52 studs/s at 0.15 s gaps and 45 studs/s at 0.2-0.3 s. The dash itself is 50 studs/s for 0.3 s, so faster taps only overlap. No kick in 2 s bursts.
+  - Mouse steering: 100 px turned the camera 10°, and the error stayed under 1° after 0.3 s.
+- **Obstacles:** if a run stalls (under 3 studs gained in 1 s), the script jumps. Every third stall it sidesteps with D for 0.6 s instead. After 8 stalls it falls back to ground steps.
+- **Rests:** it pauses for `dashRest` (1 s) after every `dashBurst` (10 s) of dashing.
+- **Finish:** within `dashArrive` (12 studs) it finishes with ground steps.
+- **Without focus** it uses the slower ground steps instead.
+- **Stamina:** the server still takes about 10 per dash, but with the infinite-dash patch the dash keeps working at 0.
+- **Not tested yet:** whole quest trips with the full script.
+
 ## Infinite dash (Ctrl)
 
 On by default (`infiniteDash = true`), toggled with F9, and undone on unload. The CombatPlus dodge config is a client table, `{ staminaCost = 10, speed = 50, duration = 0.3, cooldown = 0.55, invulnerable = 0.22 }`. The script finds it in the Luau heap (`findgc`) and sets `staminaCost` to 0 and `cooldown` to 0 (`dashCooldown`), so every Ctrl press dashes. The heap scan takes 15-30 s after load; the status line shows `dash:patching` until it's done.
@@ -74,7 +87,6 @@ On by default (`autoParry = true`), toggled with F10.
 
 ## To do
 
-- **Dash travel.** Use the infinite dash for travel instead of CFrame steps: face the target and press Ctrl, about 15 studs per dash at the game's own 50 studs/s dash speed.
 
 ## Not verified yet
 
