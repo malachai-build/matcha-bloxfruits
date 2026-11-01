@@ -49,7 +49,12 @@ On by default (`autoParry = true`), toggled with F10.
   - It learns each mob type's windup from how long the highlight lasted.
   - Your weapon has to be drawn: a sheathed F press does nothing.
 - **Optional:** set `parryCooldown = 0.3` to shorten the client cooldown. The server may still have its own.
-- **Not verified yet:** whether the presses actually parry. During the first live watcher (60 s), no telegraph was seen.
+- **Click pause:** the game ignores F while a light attack is mid-swing, so the fight loop stops clicking from the moment a telegraph appears until 0.35 s after the planned F tap.
+- **Live tests:**
+  - Detection works: Frenzy Boar windup measured 0.47 s, and the highlight lasted 0.57 s.
+  - With you clicking non-stop and the script tapping F, 0 of 3 attacks were parried.
+  - Your own manual F presses did stagger the boar.
+  - The click pause is not tested yet.
 
 ## To do
 

@@ -98,6 +98,10 @@ while not LocalPlayer do task.wait(0.1); LocalPlayer = Players.LocalPlayer end
 local Workspace = game:GetService("Workspace")
 
 local STATE = { running = true, farm = false, quest = CFG.autoQuest, parry = CFG.autoParry, status = "idle", giver = nil }
+-- Auto-parry state (see the Auto-parry section). holdClicksUntil pauses the fight
+-- clicks: the game ignores F while a light attack is mid-swing, and a live test with
+-- non-stop clicking landed 0 parries out of 3 telegraphs.
+local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0, holdClicksUntil = -1e9 }
 local API = { unload = function() end }
 _G.SAO_AFQ = API
 
@@ -464,7 +468,7 @@ local function fight(mob)
         end
         if clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 then
             nextClick = clock() + clickEvery
-            if focused() then pcall(mouse1click) end
+            if focused() and clock() >= PARRY.holdClicksUntil then pcall(mouse1click) end
         end
         task.wait(holdWait)
     end
@@ -590,7 +594,6 @@ end
 -- So: watch nearby mobs for a new "Highlight" child, tap F so the press lands about
 -- parryLead s before the hit, and learn each MobKind's windup from how long its
 -- highlight lived. Highlights named CombatPlusFlash / CombatPlusBlade are hit effects.
-local PARRY = { near = {}, seen = {}, windup = {}, pressedAt = -1e9, count = 0 }
 
 local function tapParry()
     if not focused() then return false end
@@ -639,6 +642,7 @@ task.spawn(function()
                         PARRY.seen[mobKey] = { h = hKey, at = now, kind = kind }
                         local windup = PARRY.windup[kind] or 0.4
                         local delay = math.max(0, windup - CFG.parryLead)
+                        PARRY.holdClicksUntil = math.max(PARRY.holdClicksUntil, now + delay + 0.35)
                         -- task.delay callbacks never ran in Matcha (live test Nov 1 2026); spawn + wait does.
                         task.spawn(function()
                             task.wait(delay)
