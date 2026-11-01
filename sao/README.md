@@ -18,11 +18,11 @@ Keys: **F6** turns farming on or off, **F7** turns quest pickup on or off, **F8*
 ## Crash rules (from the Blox Fruits findings)
 
 - No tweens and no fast teleports. A 2,700-stud trip in 60-stud hops (about 360 studs/s, partly under the terrain) got the account kicked; the server caps movement at `MAX_MOVE_SPEED = 50`.
-  - Travel is 4-stud CFrame steps at 12 Hz, 48 studs/s horizontal (hard cap 49). A brief 57.6 studs/s spike (your own dash on top of the steps) did not kick, so faster may be possible later. Each step keeps your current height plus 0.4 studs and leaves falling to gravity, so you stay just above the ground. If the terrain pushes you back (a slope or wall), the next steps lift up to 4 studs to climb over it. If something else moves you forward, such as your own walking, the next step is shortened by that much.
+  - Travel is 2-stud CFrame steps at 12 Hz, 24 studs/s horizontal (hard cap 26), just under your 26.5 sprint speed. The server flags *sustained* speed: a brief 57.6 studs/s spike and 36 studs/s for 2.5 s were fine, but Matcha's own movement at 47 studs/s got a kick for "unusual movement" after about 10 s. Each step keeps your current height plus 0.4 studs and leaves falling to gravity, so you stay just above the ground. If the terrain pushes you back (a slope or wall), the next steps lift up to 4 studs to climb over it. If something else moves you forward, such as your own walking, the next step is shortened by that much.
   - It stops instead of guessing: after 30 blocked steps in a row, or 2 s of falling faster than 120 studs/s.
   - Close-range adjustments (behind a mob, in front of a giver) use the same steps at your own height.
   - Matcha can't help find the ground: `Workspace:Raycast` returned nil in every live test, and writing `Humanoid.WalkToPoint` doesn't start a walk.
-  - Live test at the old 36 studs/s (flat ground, 120 studs): 32-36 studs/s, height stayed within 2 studs of the ground, no kick. 48 studs/s is untested.
+  - Live test at 36 studs/s (flat ground, 120 studs, about 2.5 s): height stayed within 2 studs of the ground, no kick. 24 studs/s over a long trip is untested.
 - No remotes and no writes to mobs. Only your own root is moved, and the script re-reads it before every write.
 - No `Workspace:GetDescendants` (the game has about 230k instances).
 
@@ -67,7 +67,10 @@ On by default (`autoParry = true`), toggled with F10.
 - **Rapid-recast window:** right after a skill's animation ends there's a short window where a recast is accepted without starting the cooldown (found by hand; inconsistent).
 - **Auto-casting:** while fighting, the script taps the keys in `skillSlots` (default 1 and 2) 12 times a second. The client refuses taps during the animation by itself, so the first tap it lets through goes out right as the animation ends. Taps pause around auto-parry, like clicks do.
 - **Not verified yet:** whether auto-casting hits the window more often than casting by hand. Exact press timings couldn't be logged, because the game's input handling consumes 1-4 before `UserInputService.InputBegan` sees them.
-- **Stamina:** skills still cost it on the server, and so does each dash, about 10 (logged live). Sprint drain is server-side too: the client only sends `Sprint:FireServer(true/false)`.
+- **Stamina:** skills still cost it on the server, and so does each dash, about 10 (logged live).
+- **Sprint stamina can't be removed from the client.** The client only sends `Sprint:FireServer(true/false)`; the server drains the stamina and turns `Sprinting` off at 0.
+  - Setting the `BaseWalkSpeed` attribute to the sprint speed on the client didn't change your walking speed.
+  - Moving faster with Matcha's own position/velocity tools got a kick, and walking at sprint speed without the server's sprint flag would likely be flagged the same way.
 
 ## To do
 

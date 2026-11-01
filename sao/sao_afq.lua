@@ -17,8 +17,8 @@
                   reliably, so it stops and shows a warning instead.
 
     Crash rules carried over from the Blox Fruits script (CRASH_FINDINGS.md):
-      * no tweens and no fast teleports: travel is 4-stud CFrame steps at 12 Hz
-        (48 studs/s horizontal), height left to physics plus a small lift, lifting more
+      * no tweens and no fast teleports: travel is 2-stud CFrame steps at 12 Hz
+        (24 studs/s horizontal, under the 26.5 sprint speed), height left to physics plus a small lift, lifting more
         only when terrain pushes back. The server caps movement at 50 studs/s and kicked
         a 360 studs/s hop trip that went under the terrain.
       * one fixed-rate root write while fighting (holdHz), nothing at frame rate
@@ -68,7 +68,7 @@ local CFG = {
     holdHz = 10,            -- root writes per second while fighting
     -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
     -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
-    stepSpeed = 48,         -- horizontal studs/s while travelling; hard-capped at MAX_STEP_SPEED (49)
+    stepSpeed = 24,         -- horizontal studs/s while travelling; hard-capped at MAX_STEP_SPEED (26)
     stepHz = 12,            -- root writes per second while travelling (3 studs per step)
     stepLift = 0.4,         -- studs above the current height per step; gravity takes it back
     climbLift = 4,          -- max lift per step when terrain pushes us back (slopes, steps)
@@ -104,9 +104,12 @@ end
 
 local VK_E = 0x45
 local VK_F = 0x46
--- Server movement cap is RemakeConfig.MAX_MOVE_SPEED = 50. A brief 57.6 studs/s spike
--- (own dash on top of 36 studs/s steps) did not kick, but travel stays just under 50.
-local MAX_STEP_SPEED = 49
+-- The server flags sustained speed, not just RemakeConfig.MAX_MOVE_SPEED = 50: a brief
+-- 57.6 studs/s spike and 36 studs/s for 2.5 s did not kick, but Matcha's own movement at
+-- 47 studs/s kicked for "unusual movement" after about 10 s (Nov 1 2026). Legit speeds are
+-- BaseWalkSpeed 16.3 / BaseSprintSpeed 26.5 (dash 50 only for 0.3 s), so sustained
+-- travel stays under the sprint speed.
+local MAX_STEP_SPEED = 26
 local clock = (type(os) == "table" and type(os.clock) == "function") and os.clock or tick
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
