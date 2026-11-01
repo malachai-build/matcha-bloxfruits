@@ -98,7 +98,14 @@ Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` t
 - A remote-only reply needs the `token`, which comes only through OnClientEvent, so Matcha can't do it.
 - Click fallback: `PlayerGui.AcceptModal` is a BillboardGui adorned to an `AcceptModalAnchor` part 1.6 studs in front of the camera. `AcceptButton` (the circle) moves to a random spot each time. Clicking it needs `WorldToScreen` on the anchor (inside a RenderStepped callback), the button's offset, then `mousemoveabs` and `mouse1click`. That needs Roblox focused, and it can only be tested while the popup is up.
 
-### Auto-mining built (Nov 1 2026, not run live yet)
+### Auto-mining built (Nov 1 2026)
+
+**First live run worked.**
+- The pickaxe uid was learned through `getgc({"pickaxe","weapon"})`. No weapon uid came back while the pickaxe was equipped.
+- Equip, draw and swings all worked, and nodes broke before the swing cap.
+- `MinedOut` reads true in Matcha.
+- Still to check: stowing the pickaxe at the end of a round and the weapon coming back, and mining combined with Auto Farm.
+
 
 - The code is in the "Mining" section of `sao_afq.lua`, with F5 and a menu toggle on the Gather tab. The README has the full flow.
 - Things to check on the first live run:

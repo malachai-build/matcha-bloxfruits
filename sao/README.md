@@ -167,7 +167,13 @@ With **Auto Farm** on as well, mining runs between fights whenever a node is up,
 
 **One-time setup:** item ids only reach the client through `DataSync`, which Matcha can't listen to. Equip the pickaxe once from Menu > Tools while Auto Mine is on. The script then scans memory for `equipment.pickaxe` (15–50s) and saves the uid to `sao_afq_settings.json`.
 
-Status: built and compiled on Nov 1 2026, but not yet run live.
+Status: run live on Nov 1 2026.
+
+- The ID scan found the pickaxe's uid (`3aa86302-…`).
+- `EquipItem(uid)` and `ToggleTool(true)` set `Tool=Pickaxe` and `ToolDrawn=true`.
+- The script mined IronOreSpot5, then IronOreSpot13. Each node broke well before the 20-swing cap.
+- Matcha reads `MinedOut = true` correctly, with 10–11 nodes showing it during the run.
+- Not yet checked: putting the pickaxe away at the end of a round and getting the weapon back, and mining combined with Auto Farm.
 
 ## To do
 
