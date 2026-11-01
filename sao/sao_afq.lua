@@ -68,12 +68,19 @@ local CFG = {
     holdHz = 10,            -- root writes per second while fighting
     -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
     -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
-    travelMode = "dash",    -- "dash": hold W + tap Ctrl, mouse steers the camera (needs focus,
-                            -- ~50 studs/s); falls back to "step" (CFrame steps) without focus
+    travelMode = "teleport", -- "teleport": one long CFrame write, then steps (live: 1,142 studs, no kick)
+                            -- "dash": hold W + tap Ctrl, mouse steers the camera (needs focus)
+                            -- "step": CFrame steps at stepSpeed only
+    teleportMinGap = 8,     -- s between long teleports (a fast chain of hops got a kick)
     dashGap = 0.15,         -- s between Ctrl taps (0.15 = 52 studs/s live)
     dashArrive = 12,        -- studs: stop dashing this close and finish with steps
     dashBurst = 10,         -- s of continuous dashing before a short rest
     dashRest = 1,           -- s rest between dash bursts
+    hopMinGap = 1.5,        -- s between short teleports (unstuck and boost)
+    hopMaxLen = 26,         -- studs: longest single short teleport (up + forward)
+    hopMaxTries = 6,        -- stalled checks before dash travel gives up (1 jump, then hops)
+    boostHop = 6,           -- studs of forward hop while dashing (0 = off)
+    boostEvery = 3,         -- s between boost hops
     stepSpeed = 24,         -- horizontal studs/s while travelling; hard-capped at MAX_STEP_SPEED (26)
     stepHz = 12,            -- root writes per second while travelling (3 studs per step)
     stepLift = 0.4,         -- studs above the current height per step; gravity takes it back
@@ -286,7 +293,7 @@ end
 -- and the game turns the character to the camera, so steering has to move the camera.
 -- 100 px of mousemoverel turned the camera 10 deg; the proportional steer held <1 deg.
 -- A wall stopped one run dead, so a stalled dash jumps, then sidesteps, then gives up.
-local VK_W, VK_D, VK_SPACE, VK_LCTRL = 0x57, 0x44, 0x20, 0xA2
+local VK_W, VK_SPACE, VK_LCTRL = 0x57, 0x20, 0xA2
 local DASHNAV = { radPerPx = nil }
 local function camYaw()
     local cam = Workspace.CurrentCamera
@@ -313,6 +320,28 @@ local function calibrateMouse()
 end
 local function holdKey(vk, down)
     pcall(function() if down then keypress(vk) else keyrelease(vk) end end)
+end
+
+-- One short teleport: up and toward the target in a single write, gravity brings us down.
+-- Live Nov 1 2026: a town wall stopped dash travel dead and jump + sidestep did not get past
+-- it. Hops are short (<= hopMaxLen) and at least hopMinGap apart so they never add up to the
+-- sustained speed the server kicks for.
+local lastHop = -1e9
+local function hopToward(pos, up, forward)
+    if clock() - lastHop < CFG.hopMinGap then return false end
+    local root = myRoot()
+    local here = partPos(root)
+    if not here then return false end
+    local dir = Vector3.new(pos.X - here.X, 0, pos.Z - here.Z)
+    if dir.Magnitude < 0.1 then return false end
+    forward = math.min(forward, dir.Magnitude)
+    if up + forward > CFG.hopMaxLen then forward = math.max(0, CFG.hopMaxLen - up) end
+    local p = here + dir.Unit * forward + Vector3.new(0, up, 0)
+    lastHop = clock()
+    return (pcall(function()
+        root.CFrame = CFrame.lookAt(p, p + dir.Unit)
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    end))
 end
 
 local function dashToward(pos, keepGoing)
@@ -344,16 +373,23 @@ local function dashToward(pos, keepGoing)
         if clock() >= checkAt then
             if checkPos and flatDist(here, checkPos) < 3 then
                 stuck = stuck + 1
-                setStatus(string.format("travel: blocked (%d), %s", stuck, stuck % 3 == 0 and "sidestepping" or "jumping"))
-                if stuck >= 8 then break end
-                if stuck % 3 == 0 then
-                    holdKey(VK_D, true); task.wait(0.6); holdKey(VK_D, false)
-                else
+                if stuck >= CFG.hopMaxTries + 1 then break end
+                if stuck == 1 then
+                    setStatus("travel: blocked, jumping")
                     pcall(function() keypress(VK_SPACE); task.wait(0.05); keyrelease(VK_SPACE) end)
+                else
+                    -- Each further stall hops higher: 10, 14, 18, 22 studs up.
+                    local up = math.min(10 + (stuck - 2) * 4, 22)
+                    setStatus(string.format("travel: blocked (%d), hopping %d up", stuck, up))
+                    hopToward(pos, up, 6)
                 end
             else
                 stuck = 0
                 setStatus(string.format("travel: dashing, %d studs left", math.floor(to.Magnitude)))
+                -- Small forward boost hop now and then while the run is clear.
+                if CFG.boostHop > 0 and clock() - lastHop >= CFG.boostEvery then
+                    hopToward(pos, 1, CFG.boostHop)
+                end
             end
             checkAt, checkPos = clock() + 1, partPos(myRoot())
         end
@@ -371,9 +407,38 @@ local function dashToward(pos, keepGoing)
     return result
 end
 
+-- One long teleport straight to the destination. Live Nov 1 2026: a single 1,142-stud
+-- CFrame write next to a Frenzy Boar landed (3.8 studs off after 0.5 s), no pull-back and
+-- no kick. The earlier kick came from a fast chain of 60-stud hops under the terrain, so
+-- long teleports are kept at least teleportMinGap apart.
+local lastLongTp = -1e9
+local function teleportTo(pos, keepGoing)
+    while alive() and clock() - lastLongTp < CFG.teleportMinGap do
+        if keepGoing and not keepGoing() then return false end
+        setStatus(string.format("travel: next teleport in %.0fs", CFG.teleportMinGap - (clock() - lastLongTp)))
+        task.wait(0.25)
+    end
+    local root = myRoot()
+    local here = partPos(root)
+    if not here then return false end
+    local dest = pos + Vector3.new(0, 3, 0)
+    local face = Vector3.new(pos.X - here.X, 0, pos.Z - here.Z)
+    lastLongTp = clock()
+    setStatus(string.format("travel: teleporting %d studs", math.floor(flatDist(here, pos))))
+    local ok = pcall(function()
+        if face.Magnitude > 0.1 then root.CFrame = CFrame.lookAt(dest, dest + face.Unit) else root.CFrame = CFrame.new(dest.X, dest.Y, dest.Z) end
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    end)
+    task.wait(0.3)
+    return ok
+end
+
 local function travelTo(pos, keepGoing)
     local here = partPos(myRoot())
-    if CFG.travelMode == "dash" and here and flatDist(here, pos) > 30 then
+    local far = here and flatDist(here, pos) > 30
+    if far and CFG.travelMode == "teleport" then
+        teleportTo(pos, keepGoing)
+    elseif far and CFG.travelMode == "dash" then
         dashToward(pos, keepGoing)
     end
     return stepToward(pos, keepGoing)
