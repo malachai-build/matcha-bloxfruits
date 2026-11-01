@@ -75,6 +75,8 @@ local CFG = {
                             -- "dash": hold W + tap Ctrl, mouse steers the camera (needs focus)
                             -- "step": CFrame steps at stepSpeed only
     teleportMinGap = 8,     -- s between long teleports (a fast chain of hops got a kick)
+    longTeleport = 300,     -- studs: teleports longer than this wait teleportMinGap
+    shortTeleportGap = 1.5, -- s between shorter teleports (next mob after a kill)
     dashGap = 0.15,         -- s between Ctrl taps (0.15 = 52 studs/s live)
     dashArrive = 12,        -- studs: stop dashing this close and finish with steps
     dashBurst = 10,         -- s of continuous dashing before a short rest
@@ -435,9 +437,13 @@ end
 -- long teleports are kept at least teleportMinGap apart.
 local lastLongTp = -1e9
 local function teleportTo(pos, keepGoing)
-    while alive() and clock() - lastLongTp < CFG.teleportMinGap do
+    -- Long jumps (> longTeleport studs) wait teleportMinGap; the short hop to the next mob
+    -- after a kill only waits shortTeleportGap (live: 74-111 stud hops sat out the full 8 s).
+    local here0 = partPos(myRoot())
+    local gap = (here0 and flatDist(here0, pos) > CFG.longTeleport) and CFG.teleportMinGap or CFG.shortTeleportGap
+    while alive() and clock() - lastLongTp < gap do
         if keepGoing and not keepGoing() then return false end
-        setStatus(string.format("travel: next teleport in %.0fs", CFG.teleportMinGap - (clock() - lastLongTp)))
+        setStatus(string.format("travel: next teleport in %.0fs", gap - (clock() - lastLongTp)))
         task.wait(0.25)
     end
     local root = myRoot()
@@ -892,7 +898,7 @@ local function fight(mob)
     local clickEvery = 1 / math.max(1, CFG.clickHz)
     local nextClick, startedAt = 0, clock()
     local nextSkill, skillIdx = 0, 0
-    local nextPlayerCheck = 0
+    local nextPlayerCheck, nextStatus = 0, 0
     while farming() and mobAlive(mob) do
         if afkCheckOpen() then return end
         if hpFraction() < CFG.retreatHp then retreat(); return end
@@ -913,6 +919,11 @@ local function fight(mob)
             travelTo(stand, farming)
         elseif flatDist(here, stand) > 0.75 then
             nudgeToward(stand, mp, CFG.holdHz)
+        end
+        -- travelTo overwrites the status; show the fight again once we are on the mob.
+        if clock() >= nextStatus then
+            nextStatus = clock() + 0.5
+            setStatus(string.format("fighting %s (%s HP)", tostring(attr(mob, "DisplayName") or mob.Name), tostring(attr(mob, "Health") or "?")))
         end
         if CFG.attackMode == "remote" then
             -- The game's light attack is Combat:FireServer("Swing", "Light", combo) and, at the

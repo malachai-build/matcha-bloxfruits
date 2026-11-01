@@ -48,7 +48,7 @@ The same UE library (laced.club UI) as the Blox Fruits script, downloaded at loa
 
 ## Teleport travel (default, `travelMode = "teleport"`)
 
-- **How it works:** for trips over 30 studs, one CFrame write to 3 studs above the target, then ground steps for the rest of the way. Long teleports are at least `teleportMinGap` (8 s) apart.
+- **How it works:** for trips over 30 studs, one CFrame write to 3 studs above the target, then ground steps for the rest of the way. Teleports over `longTeleport` (300 studs) are at least `teleportMinGap` (8 s) apart. Shorter hops, like the next mob after a kill, wait `shortTeleportGap` (1.5 s).
 - **Live test:** a single 1,142-stud teleport next to a Frenzy Boar landed 3.8 studs off after 0.5 s, with no pull-back and no kick (still in the same server afterwards). The first kick came from a fast chain of 60-stud hops through the terrain.
 - **Not tested yet:** whether repeated long teleports over a farming session stay kick-free.
 
@@ -72,6 +72,15 @@ On by default (`infiniteDash = true`), toggled with F9, and undone on unload. Th
 Live test with cooldown 0.3: 33 dashes in 12 s with stamina at 0-5, up to 89 studs/s while sprinting, and no kick. The server didn't refuse any of them. Cooldown 0 is applied but untested.
 
 The dash's i-frames (`invulnerable = 0.22`) can't be changed from the client. The client only sends `Combat:FireServer("Dash")` and never reads `invulnerable`, so the server grants i-frames from its own copy of the config. Constant invulnerability would mean spamming that remote. The script doesn't do this, because remote calls are what crashed the Blox Fruits script.
+
+## Full unfocused run (Nov 1 2026)
+
+Remote quests, teleport travel, remote attacks, Avalanche and remote parry, with Roblox unfocused. Lv1 character.
+
+- **Quest:** it tried boarQuest at the town giver. The quest was already done, so it was skipped and the script farmed Frenzy Boars without a quest.
+- **Fighting:** each Lv1 boar died in about 2 s.
+- **HP:** below 35% it teleported to the Town of Beginnings and healed at about 2%/s back to 80%, then teleported out again. Three round trips ran with no kick.
+- **Slow spots:** short hops between kills used to wait the full 8 s teleport gap. That's fixed with `shortTeleportGap`.
 
 ## Remote quests (default, `questMode = "remote"`)
 
