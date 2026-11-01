@@ -17,10 +17,10 @@
                   reliably, so it stops and shows a warning instead.
 
     Crash rules carried over from the Blox Fruits script (CRASH_FINDINGS.md):
-      * no tweens and no fast teleports: travel walks with Humanoid.WalkToPoint (no root
-        writes) or, in "step" mode, moves at most stepSpeed (40) studs/s in grounded
-        10 Hz steps. The server caps movement at 50 studs/s and kicked a 360 studs/s
-        hop trip that went under the terrain.
+      * no tweens and no fast teleports: travel is 3-stud CFrame steps at 12 Hz
+        (36 studs/s horizontal), height left to physics plus a small lift, lifting more
+        only when terrain pushes back. The server caps movement at 50 studs/s and kicked
+        a 360 studs/s hop trip that went under the terrain.
       * one fixed-rate root write while fighting (holdHz), nothing at frame rate
       * the local root is re-fetched before every write; nothing is written to a mob
       * no RemoteEvent/RemoteFunction calls: quests and attacks go through real input
@@ -67,11 +67,10 @@ local CFG = {
     holdHz = 10,            -- root writes per second while fighting
     -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
     -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
-    travelMode = "walk",    -- "walk": Humanoid.WalkToPoint (game physics, no root writes)
-                            -- "step": grounded CFrame steps at stepSpeed
-    stepSpeed = 40,         -- studs/s for "step" mode and for unsticking a walk; keep below 50
-    stepHz = 10,            -- root writes per second in "step" mode
-    walkLeg = 60,           -- studs between walk waypoints
+    stepSpeed = 36,         -- horizontal studs/s while travelling; hard-capped at 45
+    stepHz = 12,            -- root writes per second while travelling (3 studs per step)
+    stepLift = 0.4,         -- studs above the current height per step; gravity takes it back
+    climbLift = 4,          -- max lift per step when terrain pushes us back (slopes, steps)
     nearRange = 12,         -- inside this a fight/giver adjust is one short placement
     talkPresses = 5,        -- E presses at a giver (opens the prompt, steps dialogue, confirms)
     keys = { farm = 0x75, quest = 0x76, dump = 0x77, unload = 0x23 },
@@ -147,155 +146,117 @@ local function myRoot()
     return root
 end
 
--- One root write, velocity zeroed so gravity cannot build up between writes.
--- CFrame.new takes 3 numbers in Matcha; CFrame.lookAt takes two Vector3s.
-local function placeAt(pos, lookAt)
-    local root = myRoot()
-    if not root or not pos then return false end
-    local ok = pcall(function()
-        if lookAt then
-            root.CFrame = CFrame.lookAt(pos, Vector3.new(lookAt.X, pos.Y, lookAt.Z))
-        else
-            root.CFrame = CFrame.new(pos.X, pos.Y, pos.Z)
-        end
-    end)
-    if not ok and not pcall(function() root.Position = pos end) then return false end
-    pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
-    return true
-end
-
 -- ---------------------------------------------------------------------------
--- Grounded travel: never faster than stepSpeed, never below the terrain
+-- Travel: short CFrame steps along the ground, horizontal speed under 50 studs/s
 -- ---------------------------------------------------------------------------
-local rayParams = nil
-local function groundY(x, z, fromY)
-    local ok, hit = pcall(function()
-        if not rayParams then rayParams = RaycastParams.new() end
-        local skip = {}
-        if LocalPlayer.Character then skip[#skip + 1] = LocalPlayer.Character end
-        local mobs = Workspace:FindFirstChild("Mobs")
-        if mobs then skip[#skip + 1] = mobs end
-        rayParams.FilterDescendantsInstances = skip
-        rayParams.FilterType = Enum.RaycastFilterType.Exclude
-        -- Start a little above the current height so a tree canopy far overhead is not picked.
-        return Workspace:Raycast(Vector3.new(x, fromY + 40, z), Vector3.new(0, -400, 0), rayParams)
-    end)
-    if ok and hit and hit.Position then return hit.Position.Y end
-    return nil
-end
-
--- Root height above the ground while standing (HipHeight is not readable in Matcha).
-local hipOffset = 3
-local function measureHip()
-    local p = partPos(myRoot())
-    if not p then return end
-    local g = groundY(p.X, p.Z, p.Y)
-    if g and p.Y - g > 1.5 and p.Y - g < 6 then hipOffset = p.Y - g end
-end
-
-local function grounded(pos, fromY)
-    local g = groundY(pos.X, pos.Z, fromY or pos.Y)
-    -- No raycast hit (Matcha's Raycast returned nil in every live test): keep our own height
-    -- instead of dropping to a mob collider's centre, which can sit below the ground.
-    if not g then return Vector3.new(pos.X, fromY or pos.Y, pos.Z) end
-    return Vector3.new(pos.X, g + hipOffset, pos.Z)
-end
-
+-- Matcha cannot find the ground for us (Workspace:Raycast returned nil in every live
+-- test and a WalkToPoint write does not start a walk), so the game's physics keeps the
+-- character on the ground instead:
+--   * each step moves only X/Z and keeps the root's current height plus a small lift,
+--     so the character is always slightly above the ground and gravity settles it
+--   * horizontal and upward velocity are cleared, downward velocity is kept, so going
+--     downhill the character falls onto the slope instead of floating
+--   * a step that the terrain pushed back (we end up short of the spot we wrote) means
+--     a slope or wall: the next step lifts higher, up to climbLift, so we go over it,
+--     never through it
 local function flatDist(a, b)
     return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
 end
 
-local function humanoid()
-    local char = LocalPlayer.Character
-    return char and char:FindFirstChild("Humanoid")
+-- CFrame.new takes 3 numbers in Matcha; CFrame.lookAt takes two Vector3s.
+local function placeStep(x, y, z, dir)
+    local root = myRoot()
+    if not root then return false end
+    local okParent, parent = pcall(function() return root.Parent end)
+    if not okParent or parent == nil then return false end
+    local p = Vector3.new(x, y, z)
+    local ok = pcall(function()
+        if dir and dir.Magnitude > 0.01 then
+            root.CFrame = CFrame.lookAt(p, p + dir)
+        else
+            root.CFrame = CFrame.new(x, y, z)
+        end
+    end)
+    if not ok and not pcall(function() root.Position = p end) then return false end
+    pcall(function()
+        local v = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(0, math.min(v.Y, 0), 0)
+    end)
+    return true
 end
 
--- Stepped CFrame travel at stepSpeed, each step snapped to the ground. maxTime caps a burst.
-local function stepToward(pos, keepGoing, maxTime)
-    local stepWait = 1 / math.max(1, CFG.stepHz)
-    local stepLen = math.min(CFG.stepSpeed, 45) * stepWait
-    local untilT = clock() + (maxTime or 1e9)
-    while alive() and clock() < untilT do
+-- Steps toward pos until within 3 studs. keepGoing() false stops it.
+local function stepToward(pos, keepGoing)
+    local hz = math.max(1, CFG.stepHz)
+    local stepWait = 1 / hz
+    local stepLen = math.min(CFG.stepSpeed, 45) / hz
+    local deadline = clock() + flatDist(pos, partPos(myRoot()) or pos) / math.min(CFG.stepSpeed, 45) * 3 + 20
+    local lift, blocked, falling = CFG.stepLift, 0, 0
+    local wrote = nil
+    while alive() and clock() < deadline do
         if keepGoing and not keepGoing() then return false end
-        local cur = partPos(myRoot())
+        local root = myRoot()
+        local cur = partPos(root)
         if not cur then return false end
         local d = flatDist(pos, cur)
         if d < 3 then return true end
+
         local dir = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z).Unit
-        local nextP = grounded(cur + dir * math.min(stepLen, d), cur.Y)
-        placeAt(nextP, nextP + dir)
+        -- Where physics left us relative to the spot we wrote, along the travel direction:
+        -- behind = terrain pushed us back (climb a little more); ahead = something else moved
+        -- us forward (player input, a slope), so the next step is shortened by that much and
+        -- the combined speed stays under the cap. Live test Nov 1 2026: own walking on top of
+        -- the 36 studs/s steps measured 57.6 studs/s before this.
+        local ahead = 0
+        if wrote then
+            local off = Vector3.new(cur.X - wrote.X, 0, cur.Z - wrote.Z)
+            local along = off.X * dir.X + off.Z * dir.Z
+            if along < -stepLen * 0.5 then
+                blocked = blocked + 1
+                lift = math.min(lift + 1, CFG.climbLift)
+                if blocked > 30 then setStatus("travel: blocked by terrain - stopped"); STATE.farm = false; return false end
+            else
+                blocked = math.max(0, blocked - 1)
+                if blocked == 0 then lift = CFG.stepLift end
+                ahead = math.max(0, along)
+            end
+        end
+
+        -- A long free fall means the ground is gone under us: stop rather than follow it down.
+        local okV, v = pcall(function() return root.AssemblyLinearVelocity end)
+        if okV and v and v.Y < -120 then falling = falling + 1 else falling = 0 end
+        if falling > hz * 2 then setStatus("travel: falling - stopped"); STATE.farm = false; return false end
+
+        local s = math.min(math.max(0, stepLen - ahead), d)
+        local nx, nz = cur.X + dir.X * s, cur.Z + dir.Z * s
+        local ny = cur.Y + lift
+        -- Arriving: never end higher than the target spot plus the lift.
+        if d <= stepLen then ny = math.max(math.min(ny, pos.Y + CFG.stepLift), cur.Y) end
+        placeStep(nx, ny, nz, dir)
+        wrote = Vector3.new(nx, ny, nz)
         task.wait(stepWait)
     end
     return false
 end
 
--- Walk with Humanoid.WalkToPoint: the game moves the character at its own speed, the
--- script writes no position. Waypoints every walkLeg studs are snapped to the ground.
--- A stuck walk (under 2 studs gained in 2.5 s) gets a 2 s grounded step burst, then walks on.
-local function walkToward(pos, keepGoing)
-    local startD = flatDist(pos, partPos(myRoot()) or pos)
-    local deadline = clock() + startD / 10 + 30 -- 16 studs/s walk, generous margin
-    local lastP, lastAt, stuckBursts = partPos(myRoot()), clock(), 0
-    while alive() and clock() < deadline do
-        if keepGoing and not keepGoing() then return false end
-        local cur = partPos(myRoot())
-        local hum = humanoid()
-        if not cur or not hum then return false end
-        local d = flatDist(pos, cur)
-        if d < 4 then
-            pcall(function() hum.WalkToPoint = cur end)
-            return true
-        end
-        local dir = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z).Unit
-        local wp = d <= CFG.walkLeg and grounded(pos, cur.Y) or grounded(cur + dir * CFG.walkLeg, cur.Y)
-        pcall(function() hum.WalkToPoint = wp end)
-        task.wait(0.5)
-        if lastP and clock() - lastAt >= 2.5 then
-            local now = partPos(myRoot())
-            if now and flatDist(now, lastP) < 2 then
-                -- Live test Nov 1 2026: a Matcha WalkToPoint write does not start a walk, and
-                -- Workspace:Raycast always returns nil, so a step burst here could not follow
-                -- the ground. Stop instead of stepping blind.
-                stuckBursts = stuckBursts + 1
-                if stuckBursts >= 2 then
-                    pcall(function() hum.WalkToPoint = now end)
-                    setStatus("travel: walk not moving (WalkToPoint unsupported) - stopped")
-                    STATE.farm = false
-                    return false
-                end
-            end
-            lastP, lastAt = partPos(myRoot()), clock()
-        end
-    end
-    return false
-end
-
--- keepGoing() false stops it.
 local function travelTo(pos, keepGoing)
-    measureHip()
-    if CFG.travelMode == "step" then
-        -- Grounded steps need a working raycast; without one they hold a constant height.
-        local cur = partPos(myRoot())
-        if cur and not groundY(cur.X, cur.Z, cur.Y) then
-            setStatus("travel: Raycast unavailable, step mode disabled - stopped")
-            STATE.farm = false
-            return false
-        end
-        return stepToward(pos, keepGoing)
-    end
-    return walkToward(pos, keepGoing)
+    return stepToward(pos, keepGoing)
 end
 
--- One short placement toward pos, at most stepSpeed / rateHz studs, snapped to the ground,
--- so even the close-range adjustments never exceed the travel speed.
+-- One short placement toward pos, at most stepSpeed / rateHz studs, at our own height
+-- (physics keeps us on the ground), so close-range adjustments stay under the speed cap.
 local function nudgeToward(pos, lookAt, rateHz)
     local cur = partPos(myRoot())
     if not cur then return false end
     local maxStep = math.min(CFG.stepSpeed, 45) / math.max(1, rateHz)
     local delta = Vector3.new(pos.X - cur.X, 0, pos.Z - cur.Z)
-    local target = pos
-    if delta.Magnitude > maxStep then target = cur + delta.Unit * maxStep end
-    return placeAt(grounded(target, cur.Y), lookAt)
+    local tx, tz = pos.X, pos.Z
+    if delta.Magnitude > maxStep then
+        local u = delta.Unit
+        tx, tz = cur.X + u.X * maxStep, cur.Z + u.Z * maxStep
+    end
+    local face = lookAt and Vector3.new(lookAt.X - tx, 0, lookAt.Z - tz) or nil
+    return placeStep(tx, cur.Y + 0.2, tz, face)
 end
 
 -- ---------------------------------------------------------------------------
