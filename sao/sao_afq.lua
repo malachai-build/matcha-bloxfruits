@@ -85,6 +85,8 @@ local CFG = {
     -- 28 of them unfocused); "key": tap F (needs Roblox focus)
     parryMode = "remote",
     parryFace = true,       -- remote mode: turn toward the attacker first (enemy behind you)
+    parryServerCooldown = 0.9, -- remote mode: inside this since the last parry, block instead
+    blockHold = 0.45,       -- s to hold that block before releasing it
     skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting ({} = none)
     skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)
     zeroSkillCooldown = true, -- patch the client skill cooldowns to 0 (server still enforces its own)
@@ -709,6 +711,21 @@ local function tapParry(attacker)
             combatRemote = rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild("Combat")
         end
         if not combatRemote then return false end
+        -- The server keeps its own parry cooldown (block.parryCooldown 0.9 s). Live test vs
+        -- two boars (attacks ~0.25-0.5 s apart): 53/61 attacks did no damage, the 4 full
+        -- 33-damage hits came while a parry was still cooling down. Inside that cooldown send
+        -- a block instead (damageReduction 0.8: those hits measured 6), released after the hit.
+        if clock() - (PARRY.lastRemoteParry or -1e9) < CFG.parryServerCooldown then
+            local ok = pcall(function() combatRemote:FireServer("Block", true) end)
+            PARRY.blockSeq = (PARRY.blockSeq or 0) + 1
+            local seq = PARRY.blockSeq
+            task.spawn(function()
+                task.wait(CFG.blockHold)
+                if PARRY.blockSeq == seq then pcall(function() combatRemote:FireServer("Block", false) end) end
+            end)
+            return ok
+        end
+        PARRY.lastRemoteParry = clock()
         return (pcall(function() combatRemote:FireServer("Parry", serverTimeNow()) end))
     end
     if not focused() then return false end
