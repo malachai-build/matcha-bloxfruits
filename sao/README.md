@@ -58,6 +58,15 @@ On by default (`autoParry = true`), toggled with F10.
   - Hands-off test, with three boars attacking for most of it: the script parried most hits (HP stayed flat across many attacks), but the overlapping attacks eventually killed the character. That's what the cooldown patch, crowd avoidance and retreat are for. None of those three are tested yet.
   - The mob's `Staggered` attribute is not a reliable success signal. Damage taken is.
 
+## Sword skills (1-4)
+
+- **Client patch:** the 42 skill definitions (`Name`, `Cooldown` 4-30 s, `Duration`, `Stamina`) get `Cooldown = 0` (`zeroSkillCooldown`), and the originals are restored on unload.
+- **The server still enforces cooldowns:** it rejects an early cast and sends back its remaining cooldown, which the client then waits out.
+- **Rapid-recast window:** right after a skill's animation ends there's a short window where a recast is accepted without starting the cooldown (found by hand; inconsistent).
+- **Auto-casting:** while fighting, the script taps the keys in `skillSlots` (default 1 and 2) 12 times a second. The client refuses taps during the animation by itself, so the first tap it lets through goes out right as the animation ends. Taps pause around auto-parry, like clicks do.
+- **Not verified yet:** whether auto-casting hits the window more often than casting by hand. Exact press timings couldn't be logged, because the game's input handling consumes 1-4 before `UserInputService.InputBegan` sees them.
+- **Stamina:** skills still cost it on the server, and so does each dash, about 10 (logged live). Sprint drain is server-side too: the client only sends `Sprint:FireServer(true/false)`.
+
 ## To do
 
 - **Dash travel.** Use the infinite dash for travel instead of CFrame steps: face the target and press Ctrl, about 15 studs per dash at the game's own 50 studs/s dash speed.
@@ -78,6 +87,7 @@ _G.SAO_AFQ_CONFIG = {
     autoQuest = false,       -- just farm, never talk to givers
     stepSpeed = 48, stepHz = 12, stepLift = 0.4, climbLift = 4,
     infiniteDash = true, dashCooldown = 0,
+    skillSlots = { 1, 2 }, skillTapHz = 12, zeroSkillCooldown = true,
     autoParry = true, parryRange = 25, parryLead = 0.2, parryCooldown = 0.25, parryMinGap = 0.12,
     crowdRadius = 15, crowdPenalty = 40, retreatHp = 0.35, resumeHp = 0.8,
     holdHz = 10, clickHz = 6,

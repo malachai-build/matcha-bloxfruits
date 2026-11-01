@@ -81,6 +81,9 @@ local CFG = {
     parryLead = 0.2,        -- s before the hit to press F (server parry window is 0.4 s)
     parryCooldown = 0.25,   -- patches the client 0.9 s parry cooldown (several attackers); nil = leave it
     parryMinGap = 0.12,     -- s between auto-parry taps
+    skillSlots = { 1, 2 },  -- sword skill keys to tap while fighting ({} = none)
+    skillTapHz = 12,        -- skill key taps per second (the client drops taps it is not ready for)
+    zeroSkillCooldown = true, -- patch the client skill cooldowns to 0 (server still enforces its own)
     crowdRadius = 15,       -- studs: other mobs this close to a target count as a crowd
     crowdPenalty = 40,      -- studs of distance each crowding mob adds to a target's cost
     retreatHp = 0.35,       -- below this HP fraction, leave the fight
@@ -496,6 +499,7 @@ local function fight(mob)
     local holdWait = 1 / math.max(1, CFG.holdHz)
     local clickEvery = 1 / math.max(1, CFG.clickHz)
     local nextClick, startedAt = 0, clock()
+    local nextSkill, skillIdx = 0, 0
     while farming() and mobAlive(mob) do
         if afkCheckOpen() then return end
         if hpFraction() < CFG.retreatHp then retreat(); return end
@@ -516,6 +520,17 @@ local function fight(mob)
         if clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 then
             nextClick = clock() + clickEvery
             if focused() and clock() >= PARRY.holdClicksUntil then pcall(mouse1click) end
+        end
+        -- Sword skills: tap the slot keys often. The client refuses early taps by itself
+        -- (Duration lock while the animation plays, server-synced cooldown after a reject),
+        -- so the first tap it lets through goes out right as the animation ends, which is
+        -- the user's rapid-recast window.
+        if #CFG.skillSlots > 0 and clock() >= nextSkill and (here - mp).Magnitude <= CFG.standOff + 6
+            and focused() and clock() >= PARRY.holdClicksUntil then
+            nextSkill = clock() + 1 / math.max(1, CFG.skillTapHz)
+            skillIdx = skillIdx % #CFG.skillSlots + 1
+            local vk = 0x30 + CFG.skillSlots[skillIdx]
+            pcall(function() keypress(vk); task.wait(0.02); keyrelease(vk) end)
         end
         task.wait(holdWait)
     end
@@ -713,6 +728,35 @@ task.spawn(function()
     end
 end)
 
+-- Sword skill cooldowns (client side only). The skill definitions are tables with
+-- Name / Cooldown / Duration / Stamina (42 found live, cooldowns 4-30 s). Zeroing
+-- Cooldown removes the client's own wait; the server still rejects early casts and
+-- sends back its remaining cooldown (SwordSkills.Controller), so this only makes the
+-- client send each cast at the earliest moment, which is what the rapid-recast
+-- window needs.
+local SKILL = { state = "off", saved = nil, cache = nil }
+local function setSkillCooldowns(on)
+    if SKILL.state == "patching" then return end
+    SKILL.state = "patching"
+    task.spawn(function()
+        local ok = pcall(function()
+            if not SKILL.cache then
+                SKILL.cache = findgc("Name", { Cooldown = "number", Duration = "number", Stamina = "number" })
+                SKILL.saved = {}
+                for _, e in ipairs(SKILL.cache) do
+                    if e.key == "Cooldown" then SKILL.saved[#SKILL.saved + 1] = { e = e, v = e.value } end
+                end
+            end
+            if on then
+                applygc(SKILL.cache, "Cooldown", 0)
+            else
+                for _, s in ipairs(SKILL.saved) do pcall(applygc, { s.e }, "Cooldown", s.v) end
+            end
+        end)
+        SKILL.state = ok and (on and "on" or "off") or "failed"
+    end)
+end
+
 -- Optional: shorten the client parry cooldown (0.9 s) so back-to-back attacks can both be
 -- parried. The server may keep its own cooldown; nil leaves the game value alone.
 local PARRY_ORIGINAL_COOLDOWN = 0.9
@@ -767,11 +811,20 @@ API.unload = function()
     STATE.running, STATE.farm = false, false
     if DASH.state == "on" then setDash(false) end
     patchParryCooldown(false)
+    if SKILL.state == "on" then setSkillCooldowns(false) end
     if label then pcall(function() label:Remove() end); label = nil end
     if _G.SAO_AFQ == API then _G.SAO_AFQ = nil end
 end
 API.state, API.config, API.dump, API.quests, API.setDash = STATE, CFG, dump, QUESTS, setDash
 
-if CFG.infiniteDash then setDash(true) end
-patchParryCooldown(true)
+-- Heap patches one after another: each scan takes 15-30 s and they are heavy together.
+task.spawn(function()
+    if CFG.infiniteDash then
+        setDash(true)
+        while alive() and DASH.state == "patching" do task.wait(0.5) end
+    end
+    patchParryCooldown(true)
+    task.wait(1)
+    if alive() and CFG.zeroSkillCooldown then setSkillCooldowns(true) end
+end)
 print("[SAO AFQ] loaded - F6 farm, F7 quest pickup, F8 dump, F9 infinite dash, F10 auto-parry, End unload")
