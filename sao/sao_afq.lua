@@ -64,7 +64,10 @@ local CFG = {
     questId = nil,          -- force one quest from QUESTS by id
     skipCorrupted = true,   -- prefer plain mobs over "Corrupted ..." (higher level)
     standOff = 4,           -- studs behind the mob
-    clickHz = 6,            -- mouse clicks per second while fighting
+    attackMode = "remote",  -- "remote": Combat Swing + Hit remotes (no focus); "click": mouse1click
+    swingInterval = 0.65,   -- s between remote swings
+    hitDelay = 0.25,        -- s from Swing to Hit (the animation's hit frame)
+    clickHz = 6,            -- mouse clicks per second while fighting (attackMode "click")
     holdHz = 10,            -- root writes per second while fighting
     -- Travel (the server caps movement at RemakeConfig.MAX_MOVE_SPEED = 50 studs/s; 60-stud
     -- hops at 6/s through the terrain got the user kicked on Nov 1 2026).
@@ -108,7 +111,9 @@ local CFG = {
     retreatHp = 0.35,       -- below this HP fraction, leave the fight
     resumeHp = 0.8,         -- go back to farming at this HP fraction
     retreatDistance = 80,   -- studs to move away from nearby mobs
-    retreatMaxWait = 45,    -- s to wait for health before farming again anyway
+    retreatMaxWait = 60,    -- s to wait for health before farming again anyway
+    townPos = Vector3.new(45, 87, -3026), -- Town of Beginnings spawn area: HP regen (2%/s) works here
+                                          -- only; nil = just back off retreatDistance studs
     keys = { farm = 0x75, quest = 0x76, dump = 0x77, dash = 0x78, parry = 0x79, unload = 0x23 },
 }
 if type(_G.SAO_AFQ_CONFIG) == "table" then
@@ -639,6 +644,16 @@ end
 -- ---------------------------------------------------------------------------
 -- Fight
 -- ---------------------------------------------------------------------------
+-- ReplicatedStorage.Remotes.Combat (RemoteEvent): Swing / Hit / Parry / Block / Dash.
+local combatRemote = nil
+local function getCombatRemote()
+    if not combatRemote then
+        local rs = game:GetService("ReplicatedStorage")
+        combatRemote = rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild("Combat")
+    end
+    return combatRemote
+end
+
 local function hpFraction()
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChild("Humanoid")
@@ -660,7 +675,12 @@ local function retreat()
             n = n + 1
         end
     end
-    if n > 0 and away.Magnitude > 0.01 then
+    -- HP only regenerates in town (RemakeConfig.TOWN_REGEN_PER_SECOND = 0.02 of max HP);
+    -- field healing (BATTLE_HEALING) needs vitality 5, so at low level the field never heals.
+    if CFG.townPos then
+        setStatus(string.format("retreating to town at %d%% HP", math.floor(hpFraction() * 100)))
+        travelTo(CFG.townPos, farming)
+    elseif n > 0 and away.Magnitude > 0.01 then
         setStatus(string.format("retreating at %d%% HP", math.floor(hpFraction() * 100)))
         travelTo(here + away.Unit * CFG.retreatDistance, farming)
     end
@@ -693,7 +713,23 @@ local function fight(mob)
         elseif flatDist(here, stand) > 0.75 then
             nudgeToward(stand, mp, CFG.holdHz)
         end
-        if clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 then
+        if CFG.attackMode == "remote" then
+            -- The game's light attack is Combat:FireServer("Swing", "Light", combo) and, at the
+            -- hit frame, FireServer("Hit", "Light", combo, { mobModel }) (Systems.Combat). Live:
+            -- Swing + Hit 0.25 s later every 0.65 s killed a Lv1 Frenzy Boar in 7 swings, 4.6 s,
+            -- with no click and no focus.
+            if clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 and clock() >= PARRY.holdClicksUntil then
+                nextClick = clock() + CFG.swingInterval
+                local target = mob
+                task.spawn(function()
+                    local remote = getCombatRemote()
+                    if not remote then return end
+                    pcall(function() remote:FireServer("Swing", "Light", 1) end)
+                    task.wait(CFG.hitDelay)
+                    if mobAlive(target) then pcall(function() remote:FireServer("Hit", "Light", 1, { target }) end) end
+                end)
+            end
+        elseif clock() >= nextClick and (here - mp).Magnitude <= CFG.standOff + 6 then
             nextClick = clock() + clickEvery
             if focused() and clock() >= PARRY.holdClicksUntil then pcall(mouse1click) end
         end
@@ -727,7 +763,9 @@ task.spawn(function()
         elseif afkCheckOpen() then
             setStatus("AFK CHECK - click the circle in Roblox now")
             task.wait(0.5)
-        elseif not focused() then
+        elseif not focused() and CFG.attackMode ~= "remote" then
+            -- Remote attacks, remote parry and teleport travel need no focus; quest dialogue
+            -- (E) and skill keys still check focus themselves.
             setStatus("waiting for Roblox focus (keys and clicks go to the focused window)")
             task.wait(0.5)
         else
@@ -866,7 +904,6 @@ local function faceToward(p)
     pcall(function() root.CFrame = CFrame.lookAt(here, here + dir) end)
 end
 
-local combatRemote = nil
 local function tapParry(attacker)
     PARRY.pressedAt = clock()
     PARRY.count = PARRY.count + 1
@@ -876,10 +913,7 @@ local function tapParry(attacker)
         if CFG.parryFace and attacker then
             faceToward(partPos(attacker:FindFirstChild("Collider") or attacker.PrimaryPart))
         end
-        if not combatRemote then
-            local rs = game:GetService("ReplicatedStorage")
-            combatRemote = rs:FindFirstChild("Remotes") and rs.Remotes:FindFirstChild("Combat")
-        end
+        local combatRemote = getCombatRemote()
         if not combatRemote then return false end
         -- The server keeps its own parry cooldown (block.parryCooldown 0.9 s). Live test vs
         -- two boars (attacks ~0.25-0.5 s apart): 53/61 attacks did no damage, the 4 full

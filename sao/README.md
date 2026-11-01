@@ -53,6 +53,13 @@ Live test with cooldown 0.3: 33 dashes in 12 s with stamina at 0-5, up to 89 stu
 
 The dash's i-frames (`invulnerable = 0.22`) can't be changed from the client. The client only sends `Combat:FireServer("Dash")` and never reads `invulnerable`, so the server grants i-frames from its own copy of the config. Constant invulnerability would mean spamming that remote. The script doesn't do this, because remote calls are what crashed the Blox Fruits script.
 
+## Remote attack (default, `attackMode = "remote"`)
+
+- **How it works:** the game's light attack is `Combat:FireServer("Swing", "Light", combo)`, then at the hit frame `FireServer("Hit", "Light", combo, { mobModel })`. The script sends both itself, `hitDelay` (0.25 s) apart, every `swingInterval` (0.65 s), always combo 1, facing the mob from 4 studs.
+- **Live test:** it killed a Lv1 Frenzy Boar (78 HP) in 7 swings over 4.6 s, with no click and no focus. Two of the swings did no damage.
+- **No focus needed:** with remote attack, remote parry and teleport travel, farming runs without Roblox focus. Quest dialogue (E) and skill-key taps still need focus.
+- **Town retreat:** HP only regenerates in town (`TOWN_REGEN_PER_SECOND = 0.02`; field healing needs vitality 5), so the low-HP retreat now teleports to `townPos` (Town of Beginnings, about 45, 87, -3026) and waits there.
+
 ## Auto-parry (F)
 
 On by default (`autoParry = true`), toggled with F10.
