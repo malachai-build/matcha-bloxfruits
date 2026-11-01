@@ -64,6 +64,18 @@ The settings menu uses the UE library and saves to `sao_afq_settings.json`.
 - Character gates: `Tool == "Pickaxe"`, `ToolDrawn == true`, `WeaponType == nil`, and not `Stunned` or `Paralyzed`. So the pickaxe **does** replace the weapon. Right now the character shows `WeaponType=Greatsword`, `Tool=""` and `Sheathed=true`.
 - Ore types: Iron, Steel, Kobold, Crystallite, Obsidian, Verdite. Pickaxe tiers: Iron, Crystallite, Obsidian, Verdite.
 
+### Observed pickaxe equip (attribute watcher, manual equip from Menu > Tools)
+
+| t | Change | Likely action |
+|---|---|---|
+| 28.8s | `Tool=Pickaxe`, `WeaponType=""`, sword model `Weapon` replaced by `PickaxeBack` | Tools-menu click (`ToggleTool`?) |
+| 31.6s | `ToolDrawn=true` | draw (probably `ToggleSheathe`) |
+| 34.6s | `ToolDrawn=false` | stow |
+| 38.3s | `Tool=""`, `PickaxeBack` removed | Tools-menu click again |
+| 40.4s | `WeaponType=Greatsword`, `Weapon` model back, `ToolDrawn=nil` | server restores sword about 2s later |
+
+Equipping the tool and drawing it are separate steps. `Sheathed` stayed `true` the whole time, so drawing a tool sets `ToolDrawn` rather than `Sheathed`.
+
 ### Still unknown
 
 - The arguments for `ToggleTool` (in `Systems.CharacterController`) and `EquipItem` (in `UI.Accessories` and `UI.Menu`). Matcha's decompiler started returning nil for every uncached script after a sweep over all PlayerScripts, so don't sweep. Restart Matcha or rejoin, then decompile those two directly. Alternatively, equip a pickaxe by hand and watch how the `Tool`, `ToolDrawn` and `WeaponType` attributes change.
